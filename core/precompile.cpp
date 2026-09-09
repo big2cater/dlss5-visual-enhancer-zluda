@@ -135,8 +135,26 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
     if (modules.empty()) return false;
 
     // Zero means "as many as the machine turns out to allow", which is decided
-    // again every time one finishes rather than once at the start.
-    const unsigned ceiling = jobs ? jobs : logical_processors();
+    // again every time one finishes rather than once at the start. The
+    // DLSSNR_PRECOMPILE_JOBS environment variable forces a fixed parallelism:
+    // 16 concurrent translation processes all write ZLUDA's cache database at
+    // once, and that contention is suspected to corrupt entries and cause the
+    // intermittent all-black evaluations -- so serial (1) is worth an A/B run.
+    unsigned ceiling = jobs;
+    if (ceiling == 0) {
+        char forced[16] = {};
+        if (GetEnvironmentVariableA("DLSSNR_PRECOMPILE_JOBS", forced, sizeof forced) > 0 &&
+            atoi(forced) > 0)
+            ceiling = (unsigned)atoi(forced);
+    }
+    if (ceiling == 0) {
+        ceiling = logical_processors();
+        // A 16-process simultaneous HIP/driver bring-up on one GPU is what
+        // made translation children hang for minutes with zero CPU progress
+        // (they park in driver/cache locks). Cap the default; serial stays
+        // reachable via DLSSNR_PRECOMPILE_JOBS=1.
+        if (ceiling > 4) ceiling = 4;
+    }
     const bool adaptive = jobs == 0;
 
     Progress progress;
@@ -183,6 +201,8 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
 
     const std::wstring self = own_path();
     std::vector<HANDLE> running;
+    std::vector<ULONGLONG> cpu;     // last observed CPU time per child
+    std::vector<int> stalled;       // consecutive 60s slices without CPU progress
     size_t next = 0;
     int failures = 0;
 
@@ -198,6 +218,8 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
                                nullptr, nullptr, &startup, &process)) {
                 CloseHandle(process.hThread);
                 running.push_back(process.hProcess);
+                cpu.push_back(0);
+                stalled.push_back(0);
             } else {
                 ++failures;
                 ++progress.done;
@@ -206,8 +228,44 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
         }
         if (running.empty()) break;
 
+        // Wait in 60 s slices: a translation that makes no CPU progress at
+        // all for three slices is a hung child, and killing it beats letting
+        // it stall the whole pipeline (and the GUI) forever.
         const DWORD which = WaitForMultipleObjects((DWORD)running.size(), running.data(), FALSE,
-                                                   INFINITE);
+                                                   60000);
+        if (which == WAIT_TIMEOUT) {
+            for (size_t j = 0; j < running.size(); ++j) {
+                FILETIME created{}, exited{}, kernel{}, user{};
+                if (GetProcessTimes(running[j], &created, &exited, &kernel, &user)) {
+                    ULONGLONG cur = (((ULONGLONG)kernel.dwHighDateTime << 32) | kernel.dwLowDateTime) +
+                                    (((ULONGLONG)user.dwHighDateTime << 32) | user.dwLowDateTime);
+                    if (cur == cpu[j]) {
+                        if (++stalled[j] >= 3) {
+                            TerminateProcess(running[j], 1);
+                            ++failures;
+                            ++progress.done;
+                            CloseHandle(running[j]);
+                            running.erase(running.begin() + j);
+                            cpu.erase(cpu.begin() + j);
+                            stalled.erase(stalled.begin() + j);
+                            --j; // vector shrank under us
+                        }
+                    } else {
+                        cpu[j] = cur;
+                        stalled[j] = 0;
+                    }
+                } else {
+                    // Process vanished: treat as done.
+                    ++progress.done;
+                    CloseHandle(running[j]);
+                    running.erase(running.begin() + j);
+                    cpu.erase(cpu.begin() + j);
+                    stalled.erase(stalled.begin() + j);
+                    --j;
+                }
+            }
+            continue; // keep waiting on the survivors
+        }
         const size_t index = (size_t)(which - WAIT_OBJECT_0);
         if (index >= running.size()) break;
         DWORD code = 1;
@@ -215,6 +273,8 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
         if (code != 0) ++failures;
         CloseHandle(running[index]);
         running.erase(running.begin() + index);
+        cpu.erase(cpu.begin() + index);
+        stalled.erase(stalled.begin() + index);
 
         ++progress.done;
         {

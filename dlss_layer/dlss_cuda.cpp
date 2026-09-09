@@ -903,7 +903,12 @@ bool create_feature(const FeatureDesc &desc) {
     {
         char buf[16];
         if (GetEnvironmentVariableA("DLSS_PRESET", buf, sizeof buf) > 0) {
-            unsigned preset = (unsigned)atoi(buf);
+            unsigned preset = 0;
+            if (!_stricmp(buf, "J")) preset = 10;
+            else if (!_stricmp(buf, "K")) preset = 11;
+            else if (!_stricmp(buf, "L")) preset = 12;
+            else if (!_stricmp(buf, "M")) preset = 13;
+            else preset = (unsigned)atoi(buf);
             for (const char *name : {"DLSS.Hint.Render.Preset.DLAA",
                                      "DLSS.Hint.Render.Preset.Quality",
                                      "DLSS.Hint.Render.Preset.Balanced",

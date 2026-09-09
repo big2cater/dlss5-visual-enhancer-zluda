@@ -10,7 +10,7 @@ I also forked Zluda's version of LLVM and made a small change which should, in t
 ## How to use
 Download the zip from the [Release section](https://github.com/RedDukeDev/dlss5-image-enhancer-zluda/releases), and run dlss5-image-enhancer.exe
 On the top-right side, you have to select the required DLLs. 
-For AMD, nvcuda.dll and nvapi64.dll are already included. they aren't the official nvidia libraries, those are actually from the Zluda project.
+For AMD, nvcuda.dll and nvapi64.dll are already included inside the "zluda" directory. they aren't the official nvidia libraries, those are actually from the Zluda project.
 
 nvngx.dll is included too, this isn't the official dll, it's a custom re-implmentation, the source is included in the project under the "ngx_runtime" directory
 
@@ -27,6 +27,48 @@ It will take A LOT of time, but it's only needed once.
 I also made a "nvidia mode", which tries to run the dlss using the official drivers. you still need to provide the nvngx_dlssnr.dll library.
 
 NOTE: This feature isn't tested yet, since i don't have an nvidia gpu to test with at the moment.
+
+## Video mode (video_filter)
+
+`video_filter` is a console tool that runs the same DLSS path over a video,
+frame by frame, with ffmpeg doing the decoding and encoding. It builds without
+Qt, so a fork with no Qt installed can still use it.
+
+```
+video_filter input.mp4 output.mp4 <nvngx_dlssnr.dll> <ZLUDA nvcuda.dll> [nvngx.dll] [nvapi64.dll] [options]
+```
+
+Requires: ffmpeg on PATH (or `FFMPEG_PATH`), the network DLL, and the ZLUDA
+DLLs from the release zip next to the program. Audio is passed through from
+the source by default.
+
+The network keeps an accumulation history between frames; by default it is
+reset on the first frame and on detected scene cuts (`--reset auto`, cut
+threshold 0.30). Without depth or motion vectors (absent for a plain video),
+moving content may swim — `--reset always` trades quality for stability,
+`--reset never` keeps one session for the whole clip.
+
+Two settings decide whether the result flickers, and both default to the
+stable end: `--passes 1` (evaluating a frame more than once stacks the effect
+and amplifies the differences between neighbouring frames). With `--flow 1`,
+the tool prefers a D3D12 compute motion guide: quarter-resolution block
+matching runs on the GPU, then the small vector field is filtered/upscaled
+for DLSS. If D3D12 setup fails, it automatically falls back to the CPU
+estimator so conversion still completes. This is a compute-based guide, not
+the proprietary NVIDIA Optical Flow SDK. `--flow 0` remains the most stable
+choice when a clip has little motion. Raising either
+buys a stronger effect at the cost of temporal stability.
+
+Options: `--passes N`, `--reset auto|always|never|every=N`, `--cut-threshold F`,
+`--flow 0|1`, `--intensity F`, `--global-tone F`, `--local-tone F`,
+`--local-structure F`,
+`--skin-structure F`, `--style N`, `--preset N`, `--no-auto-mask`,
+`--crf N`, `--fps N`, `--no-audio`, `--max-frames N`, `--dump-frames DIR`.
+
+Internal modes used by the parallel first-run translation:
+`--compile-one <module> <driver>` and `--precompile <snippet> <driver> [jobs]`.
+The first run of any mode translates the network's code and can take tens of
+minutes; later runs reuse the cache.
 
 # Known Issues
 The program can sometimes fail to generate the picture, and you'll get a blank picture in output. if it does that, try loading a different picture or re-open the program. i'm currently trying to figure out what causes this.

@@ -17,6 +17,9 @@
 class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
+class QDragEnterEvent;
+class QDropEvent;
+class QEvent;
 class QLabel;
 class QLineEdit;
 class QPushButton;
@@ -44,6 +47,8 @@ signals:
 
 private:
     Processor processor_;
+    Paths paths_;
+    bool have_paths_ = false;
 };
 
 // Runs the same path the window runs -- file in, conversion, processor,
@@ -66,6 +71,12 @@ protected:
     // The picture is scaled to whatever room the window currently has, so
     // resizing has to redraw it.
     void resizeEvent(QResizeEvent *event) override;
+    // The scale factor can change underneath a window that has not moved --
+    // dragging it to a display set to a different percentage, or changing the
+    // display's scaling while it is open. The window keeps its size in logical
+    // pixels, so no resize arrives and the picture would otherwise stay at the
+    // old resolution.
+    bool event(QEvent *event) override;
 
 private slots:
     void choose_image();
@@ -110,9 +121,9 @@ private:
     QLineEdit *runtime_path_ = nullptr;
     QLineEdit *nvapi_path_ = nullptr;
     // The driver/nvapi rows, hidden as a whole in NVIDIA mode -- the NGX
-    // runtime row is never hidden, see set_nvidia_mode. Each is the field
-    // widget passed to QFormLayout::addRow, which is also the key
-    // QFormLayout::labelForField needs to reach the row's other half.
+    // runtime row is never hidden, see set_nvidia_mode. Each row carries its
+    // own caption, so hiding the row hides the caption with it and there is no
+    // second half to reach for.
     QWidget *driver_row_ = nullptr;
     QWidget *nvapi_row_ = nullptr;
 

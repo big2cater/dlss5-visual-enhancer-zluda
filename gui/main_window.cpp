@@ -10,12 +10,17 @@
 #include <QDoubleSpinBox>
 #include <QDragEnterEvent>
 #include <QDropEvent>
+#include <QApplication>
 #include <QCoreApplication>
 #include <QDir>
+#include <QEvent>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFontMetrics>
 #include <QFormLayout>
+#include <QFrame>
 #include <QGroupBox>
+#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QImage>
 #include <QLabel>
@@ -26,8 +31,12 @@
 #include <QPushButton>
 #include <QPlainTextEdit>
 #include <QResizeEvent>
+#include <QScreen>
+#include <QScrollArea>
+#include <QScrollBar>
 #include <QSettings>
 #include <QSpinBox>
+#include <QSplitter>
 #include <QStatusBar>
 #include <QVBoxLayout>
 
@@ -68,24 +77,53 @@ QImage to_qimage(const Image &image) {
     return out;
 }
 
-QLineEdit *path_row(QFormLayout *form, const QString &label, const QString &filter,
-                    QWidget *parent, QWidget **row_out = nullptr) {
-    auto *edit = new QLineEdit(parent);
-    auto *browse = new QPushButton(QObject::tr("Browse..."), parent);
+// One library path: its caption, then the path itself beside a browse button.
+//
+// The caption sits above the field rather than beside it. These paths are
+// absolute and long, and a form that puts the caption in its own column gave
+// the field the width that was left over -- a third of the panel, most of
+// which the path then spent as an ellipsis. Above it, the path gets the whole
+// width and only the button is taken out of it.
+struct PathRow {
+    QWidget *row = nullptr;
+    QLineEdit *edit = nullptr;
+};
+
+PathRow path_row(QVBoxLayout *box, const QString &label, const QString &filter, QWidget *parent) {
     auto *row = new QWidget(parent);
-    auto *layout = new QHBoxLayout(row);
+    auto *layout = new QVBoxLayout(row);
     layout->setContentsMargins(0, 0, 0, 0);
-    layout->addWidget(edit, 1);
-    layout->addWidget(browse);
+    layout->setSpacing(2);
+
+    auto *caption = new QLabel(label, row);
+    caption->setToolTip(label);
+
+    auto *edit = new QLineEdit(row);
+    edit->setClearButtonEnabled(true);
+    edit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    edit->setToolTip(label);
+
+    auto *browse = new QPushButton(QObject::tr("Browse..."), row);
+    browse->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+
+    auto *field = new QWidget(row);
+    auto *field_layout = new QHBoxLayout(field);
+    field_layout->setContentsMargins(0, 0, 0, 0);
+    field_layout->addWidget(edit, 1);
+    field_layout->addWidget(browse);
+
+    layout->addWidget(caption);
+    layout->addWidget(field);
+
     QObject::connect(browse, &QPushButton::clicked, parent, [edit, filter, parent] {
         const QString chosen =
             QFileDialog::getOpenFileName(parent, QObject::tr("Select a library"), edit->text(),
                                          filter);
         if (!chosen.isEmpty()) edit->setText(chosen);
     });
-    form->addRow(label, row);
-    if (row_out) *row_out = row;
-    return edit;
+
+    box->addWidget(row);
+    return {row, edit};
 }
 
 QDoubleSpinBox *strength_row(QFormLayout *form, const QString &label, double value,
@@ -133,8 +171,24 @@ int run_self_test(const QStringList &arguments) {
     }
     Image output;
     if (!processor.process(input, output, Settings{}, error)) {
-        fprintf(stderr, "process: %s\n", error.c_str());
-        return 1;
+        if (error.find("blank image") != std::string::npos) {
+            fprintf(stderr, "process returned blank; restarting the DLSS session once\n");
+            processor.stop();
+            std::string restart_error;
+            if (processor.start(paths, restart_error, [](const std::string &line) {
+                    fprintf(stderr, "%s\n", line.c_str());
+                })) {
+                output = Image{};
+                error.clear();
+                processor.process(input, output, Settings{}, error);
+            } else {
+                error = restart_error;
+            }
+        }
+        if (output.empty()) {
+            fprintf(stderr, "process: %s\n", error.c_str());
+            return 1;
+        }
     }
     fprintf(stderr, "processed in %.0f ms\n", processor.last_ms());
     if (!to_qimage(output).save(arguments[2])) {
@@ -153,6 +207,8 @@ void log_to_window(const char *line);
 } // namespace
 
 void Worker::start(const Paths &paths) {
+    paths_ = paths;
+    have_paths_ = true;
     std::string error;
     const bool ok = processor_.start(
         paths, error, [](const std::string &line) { log_to_window(line.c_str()); });
@@ -162,7 +218,22 @@ void Worker::start(const Paths &paths) {
 void Worker::process(const Image &input, const Settings &settings) {
     Image output;
     std::string error;
-    const bool ok = processor_.process(input, output, settings, error);
+    bool ok = processor_.process(input, output, settings, error);
+    if (!ok && error.find("blank image") != std::string::npos && have_paths_) {
+        // A blank result is sticky inside one DLSS session. Recreate the
+        // session once so a failed HIP/ZLUDA launch cannot be saved as output.
+        processor_.stop();
+        std::string restart_error;
+        if (processor_.start(paths_, restart_error,
+                             [](const std::string &line) { log_to_window(line.c_str()); })) {
+            output = Image{};
+            error.clear();
+            ok = processor_.process(input, output, settings, error);
+        } else {
+            error = "the DLSS session could not be restarted after a blank result: " +
+                    restart_error;
+        }
+    }
     emit finished(ok, output, processor_.last_ms(), QString::fromStdString(error));
 }
 
@@ -183,7 +254,6 @@ void log_to_window(const char *line) {
 MainWindow::MainWindow() {
     setWindowTitle(tr("DLSS 5 Image Enhancer"));
     setAcceptDrops(true);
-    resize(1280, 800);
 
     view_ = new QLabel(tr("Drop an image here, or use Open image"));
     view_->setAlignment(Qt::AlignCenter);
@@ -194,11 +264,43 @@ MainWindow::MainWindow() {
     view_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
     view_->setStyleSheet("QLabel { background: #202020; color: #a0a0a0; }");
 
-    auto *central = new QWidget;
-    auto *layout = new QHBoxLayout(central);
-    layout->addWidget(view_, 1);
-    layout->addWidget(build_controls());
-    setCentralWidget(central);
+    auto *panel = build_controls();
+
+    // The control column is scrolled rather than sized to fit. What it holds
+    // is a fixed set of rows, and on a short window, a large system font or a
+    // scaled display their combined height is more than the window has -- a
+    // plain layout then places the last ones past the bottom edge, where they
+    // are not drawn at all. That read as controls having gone missing rather
+    // than as anything being scrolled off.
+    auto *scroll = new QScrollArea;
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setWidget(panel);
+    scroll->setMinimumWidth(panel->minimumWidth() +
+                            scroll->verticalScrollBar()->sizeHint().width() + 4);
+
+    // A splitter rather than a fixed-width column: how much room the controls
+    // want depends on the font and on the scale factor, and both are known
+    // only when the program runs. The picture takes whatever is left.
+    auto *splitter = new QSplitter(Qt::Horizontal);
+    splitter->setChildrenCollapsible(false);
+    splitter->addWidget(view_);
+    splitter->addWidget(scroll);
+    splitter->setStretchFactor(0, 1);
+    splitter->setStretchFactor(1, 0);
+    setCentralWidget(splitter);
+
+    // The size is in logical pixels, and so is the screen it has to fit on,
+    // but a fixed 1280x800 is bigger than the whole desktop once the display
+    // is scaled -- at 150 % a 1920x1080 screen is 1280x720 logical. Asking the
+    // screen and taking the smaller of the two keeps the window on it.
+    QSize size(1280, 800);
+    if (const QScreen *screen = QGuiApplication::primaryScreen())
+        size = size.boundedTo(screen->availableSize());
+    resize(size);
+    splitter->setSizes({qMax(view_->minimumWidth(), size.width() - scroll->minimumWidth()),
+                        scroll->minimumWidth()});
 
     status_ = new QLabel(tr("Idle"));
     statusBar()->addWidget(status_);
@@ -240,13 +342,21 @@ MainWindow::~MainWindow() {
 
 QWidget *MainWindow::build_controls() {
     auto *panel = new QWidget;
-    panel->setFixedWidth(420);
     auto *layout = new QVBoxLayout(panel);
 
     layout->addWidget(build_paths());
 
     auto *network = new QGroupBox(tr("Network"));
     auto *form = new QFormLayout(network);
+    // Left alone, a form keeps its captions in one column sized to the longest
+    // of them, and anything wider than the panel gets squeezed out of the
+    // editor beside it -- "Character / Skin Structure" is long enough to do
+    // that on its own. Growing the fields into the room that is left, and
+    // wrapping a row that still does not fit, is what keeps both halves
+    // readable at whatever width the panel ends up with.
+    form->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
+    form->setRowWrapPolicy(QFormLayout::WrapLongRows);
+    form->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
     intensity_ = strength_row(form, tr("Overall Intensity"), 1.0, {}, panel);
     global_tone_ = strength_row(
@@ -308,6 +418,9 @@ QWidget *MainWindow::build_controls() {
     log_->setReadOnly(true);
     log_->setMaximumBlockCount(500);
     log_->setPlaceholderText(tr("Messages from the DLSS layer appear here"));
+    // The log is the only item here allowed to give up room, so a short window
+    // would leave it a single line without a floor.
+    log_->setMinimumHeight(fontMetrics().lineSpacing() * 6);
     layout->addWidget(log_, 1);
 
     connect(open, &QPushButton::clicked, this, &MainWindow::choose_image);
@@ -315,13 +428,23 @@ QWidget *MainWindow::build_controls() {
     connect(save_button_, &QPushButton::clicked, this, &MainWindow::save_result);
     connect(compare_button_, &QPushButton::pressed, this, [this] { show_original(true); });
     connect(compare_button_, &QPushButton::released, this, [this] { show_original(false); });
+
+    // The layout itself knows how wide the panel has to be before anything in
+    // it is squeezed, and it measures with the font this machine actually
+    // uses. That beats a written-down pixel width, which fitted one font at
+    // one scale and clipped everything else. The floor is only there so a very
+    // small font cannot leave the column unusably narrow, and the ceiling so a
+    // very large one cannot take the picture's room away.
+    const int em = fontMetrics().horizontalAdvance(QLatin1Char('0'));
+    const int wanted = qMax(panel->minimumSizeHint().width(), em * 52);
+    panel->setMinimumWidth(qMin(wanted, 760));
     return panel;
 }
 
 namespace {
 // Defined further down, next to the search it does.
 void fill_in_defaults(QLineEdit *snippet, QLineEdit *driver, QLineEdit *runtime,
-                      QLineEdit *nvapi);
+                      QLineEdit *nvapi, bool nvidia);
 } // namespace
 
 QWidget *MainWindow::build_paths() {
@@ -335,19 +458,21 @@ QWidget *MainWindow::build_paths() {
     mode_button_->setCheckable(true);
     layout->addWidget(mode_button_);
 
-    auto *form_widget = new QWidget(box);
-    auto *form = new QFormLayout(form_widget);
-    form->setContentsMargins(0, 0, 0, 0);
-    layout->addWidget(form_widget);
-
     const QString dll = tr("Libraries (*.dll)");
-    snippet_path_ = path_row(form, tr("Network (nvngx_dlssnr.dll)"), dll, this);
-    driver_path_ = path_row(form, tr("CUDA driver (nvcuda.dll)"), dll, this, &driver_row_);
-    // No row pointer taken here: unlike driver/nvapi, this row is never hidden
-    // by the mode toggle (see set_nvidia_mode), so nothing needs to find it
-    // again afterward.
-    runtime_path_ = path_row(form, tr("NGX runtime (nvngx.dll)"), dll, this);
-    nvapi_path_ = path_row(form, tr("NVAPI (nvapi64.dll)"), dll, this, &nvapi_row_);
+    const PathRow snippet = path_row(layout, tr("Network (nvngx_dlssnr.dll)"), dll, box);
+    const PathRow driver = path_row(layout, tr("CUDA driver (nvcuda.dll)"), dll, box);
+    // No row kept here: unlike driver/nvapi, this row is never hidden by the
+    // mode toggle (see set_nvidia_mode), so nothing needs to find it again
+    // afterward.
+    const PathRow runtime = path_row(layout, tr("NGX runtime (nvngx.dll)"), dll, box);
+    const PathRow nvapi = path_row(layout, tr("NVAPI (nvapi64.dll)"), dll, box);
+
+    snippet_path_ = snippet.edit;
+    driver_path_ = driver.edit;
+    driver_row_ = driver.row;
+    runtime_path_ = runtime.edit;
+    nvapi_path_ = nvapi.edit;
+    nvapi_row_ = nvapi.row;
 
     connect(mode_button_, &QPushButton::toggled, this, &MainWindow::set_nvidia_mode);
     return box;
@@ -375,11 +500,7 @@ void MainWindow::set_nvidia_mode(bool nvidia) {
     nvidia_mode_ = nvidia;
     mode_button_->setText(nvidia ? tr("Mode: NVIDIA") : tr("Mode: AMD (ZLUDA)"));
 
-    auto *form = qobject_cast<QFormLayout *>(driver_row_->parentWidget()->layout());
-    for (QWidget *row : {driver_row_, nvapi_row_}) {
-        row->setVisible(!nvidia);
-        if (QWidget *label = form ? form->labelForField(row) : nullptr) label->setVisible(!nvidia);
-    }
+    for (QWidget *row : {driver_row_, nvapi_row_}) row->setVisible(!nvidia);
 
     if (nvidia) {
         driver_path_->clear();
@@ -389,7 +510,7 @@ void MainWindow::set_nvidia_mode(bool nvidia) {
     // field -- so on AMD this just brings back what switching away hid, and
     // on NVIDIA it fills the runtime in from beside the executable without
     // touching the driver/NVAPI fields just cleared above.
-    fill_in_defaults(snippet_path_, driver_path_, runtime_path_, nvapi_path_);
+    fill_in_defaults(snippet_path_, driver_path_, runtime_path_, nvapi_path_, nvidia);
 }
 
 namespace {
@@ -405,30 +526,27 @@ namespace {
 // system directory, and the network itself ships in the driver store, where the
 // folder name changes with every release and so has to be searched for.
 void fill_in_defaults(QLineEdit *snippet, QLineEdit *driver, QLineEdit *runtime,
-                      QLineEdit *nvapi) {
+                      QLineEdit *nvapi, bool nvidia) {
     const QDir beside(QCoreApplication::applicationDirPath());
     const auto local = [&beside](const char *name) -> QString {
         const QString path = beside.filePath(QLatin1String(name));
         return QFileInfo::exists(path) ? path : QString();
     };
-    const auto system32 = [](const char *name) -> QString {
-        const QString path = QLatin1String("C:/Windows/System32/") + QLatin1String(name);
-        return QFileInfo::exists(path) ? path : QString();
-    };
-
     // The runtime is ours or nothing; never the driver's.
     if (runtime->text().isEmpty()) runtime->setText(local("nvngx.dll"));
 
-    if (driver->text().isEmpty()) {
-        QString found = local("nvcuda.dll");
-        if (found.isEmpty()) found = system32("nvcuda.dll");
-        driver->setText(found);
+    if (!nvidia) {
+        if (driver->text().isEmpty()) {
+            QString found = local("nvcuda.dll");
+            if (found.isEmpty()) found = local("zluda/nvcuda.dll");
+            driver->setText(found);
+        }
+        if (nvapi->text().isEmpty()) {
+            QString found = local("nvapi64.dll");
+            if (found.isEmpty()) found = local("zluda/nvapi64.dll");
+            nvapi->setText(found);
+        }
     }
-
-    // Only on a machine without an NVIDIA driver: on one with it, the real NVAPI
-    // describes the hardware truthfully and the stand-in would only lie.
-    if (nvapi->text().isEmpty() && system32("nvapi64.dll").isEmpty())
-        nvapi->setText(local("nvapi64.dll"));
 
     if (snippet->text().isEmpty()) {
         QString found = local("nvngx_dlssnr.dll");
@@ -535,13 +653,28 @@ void MainWindow::display(const Image &image) {
 
 void MainWindow::rescale() {
     if (shown_.isNull()) return;
-    view_->setPixmap(shown_.scaled(view_->size(), Qt::KeepAspectRatio,
-                                   Qt::SmoothTransformation));
+    // The label is measured in logical pixels and the pixmap in device ones.
+    // Scaling to the label's size alone renders the picture at 96 dpi, and on
+    // a scaled display Windows then stretches that up -- which is what made
+    // the preview soft even while the rest of the window was sharp.
+    const qreal ratio = devicePixelRatioF();
+    const QSize device(qRound(view_->width() * ratio), qRound(view_->height() * ratio));
+    QPixmap scaled = shown_.scaled(device, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    scaled.setDevicePixelRatio(ratio);
+    view_->setPixmap(scaled);
 }
 
 void MainWindow::resizeEvent(QResizeEvent *event) {
     QMainWindow::resizeEvent(event);
     rescale();
+}
+
+bool MainWindow::event(QEvent *event) {
+    // Moving the window to a display set to a different scaling changes the
+    // ratio without changing its size in logical pixels, so no resize arrives
+    // and the picture would keep the resolution of the display it came from.
+    if (event->type() == QEvent::DevicePixelRatioChange) rescale();
+    return QMainWindow::event(event);
 }
 
 void MainWindow::append_log(const QString &line) {

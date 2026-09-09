@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QGuiApplication>
 
 #include "main_window.h"
 #include "../core/precompile.h"
@@ -42,6 +43,16 @@ void kill_children_when_this_process_ends() {
 
 int main(int argc, char **argv) {
     kill_children_when_this_process_ends();
+
+    // Windows reports fractional scaling -- 125 %, 150 % -- and Qt rounds
+    // those to whole numbers unless told otherwise. Rounded, the window is
+    // laid out at one scale and drawn at another: the text turns soft and the
+    // edges of the layout end up outside the window. Passing the factor
+    // through keeps one scale for both. It has to be set before the
+    // application object exists, which is why it is out here rather than in
+    // the window.
+    QGuiApplication::setHighDpiScaleFactorRoundingPolicy(
+        Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
 
     QApplication application(argc, argv);
     QApplication::setApplicationName("DLSS 5 Image Enhancer");
