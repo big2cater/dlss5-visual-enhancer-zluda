@@ -40,11 +40,24 @@
 #include <QStatusBar>
 #include <QVBoxLayout>
 
+#include <cmath>
+
 namespace enhancer {
 namespace {
 
-// An image file arrives as eight bits a channel; the network reads half-floats.
-// Nothing is scaled on the way in: what the file says is what the network sees.
+inline float srgb_to_linear(float c) {
+    c = c < 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
+    return (c <= 0.04045f) ? (c / 12.92f) : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
+inline float linear_to_srgb(float c) {
+    c = c < 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
+    return (c <= 0.0031308f) ? (c * 12.92f) : (1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f);
+}
+
+// An image file arrives as eight bits a channel sRGB; the network reads half-floats
+// in linear radiance space. Converting sRGB to linear ensures tone mapping and
+// bilateral filtering operate on physical light levels.
 Image from_qimage(const QImage &source) {
     const QImage rgba = source.convertToFormat(QImage::Format_RGBA8888);
     Image image;
@@ -54,24 +67,34 @@ Image from_qimage(const QImage &source) {
     for (unsigned y = 0; y < image.height; ++y) {
         const uchar *row = rgba.constScanLine((int)y);
         uint16_t *out = image.pixels.data() + (size_t)y * image.width * 4;
-        for (unsigned x = 0; x < image.width * 4; ++x)
-            out[x] = float_to_half(row[x] / 255.0f);
+        for (unsigned x = 0; x < image.width * 4; x += 4) {
+            out[x + 0] = float_to_half(srgb_to_linear(row[x + 0] / 255.0f));
+            out[x + 1] = float_to_half(srgb_to_linear(row[x + 1] / 255.0f));
+            out[x + 2] = float_to_half(srgb_to_linear(row[x + 2] / 255.0f));
+            out[x + 3] = float_to_half(row[x + 3] / 255.0f);
+        }
     }
     return image;
 }
 
-// Back to eight bits for the screen and for a file. Values above one clamp:
-// without a tone mapper to guess with, that is the honest thing to do.
+// Back to eight bits sRGB for the screen and for a file. Linear half-floats
+// are converted to sRGB via IEC 61966-2-1.
 QImage to_qimage(const Image &image) {
     if (image.empty()) return {};
     QImage out((int)image.width, (int)image.height, QImage::Format_RGBA8888);
     for (unsigned y = 0; y < image.height; ++y) {
         uchar *row = out.scanLine((int)y);
         const uint16_t *in = image.pixels.data() + (size_t)y * image.width * 4;
-        for (unsigned x = 0; x < image.width * 4; ++x) {
-            float v = half_to_float(in[x]);
-            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-            row[x] = (uchar)(v * 255.0f + 0.5f);
+        for (unsigned x = 0; x < image.width * 4; x += 4) {
+            float r = linear_to_srgb(half_to_float(in[x + 0]));
+            float g = linear_to_srgb(half_to_float(in[x + 1]));
+            float b = linear_to_srgb(half_to_float(in[x + 2]));
+            float a = half_to_float(in[x + 3]);
+            a = a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
+            row[x + 0] = (uchar)(r * 255.0f + 0.5f);
+            row[x + 1] = (uchar)(g * 255.0f + 0.5f);
+            row[x + 2] = (uchar)(b * 255.0f + 0.5f);
+            row[x + 3] = (uchar)(a * 255.0f + 0.5f);
         }
     }
     return out;

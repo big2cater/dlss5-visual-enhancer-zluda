@@ -120,7 +120,7 @@ struct State {
     // Whether the driver underneath is NVIDIA's own. Several things here
     // are workarounds for the stand-in and are wrong against a real one.
     bool nvidia_driver = false;
-    SharedTexture color, depth, motion, output;
+    SharedTexture color, depth, motion, output, backbuffer;
     dlss_cuda::FeatureDesc current{};
     bool initialized = false;
 };
@@ -940,13 +940,21 @@ void set_create_params_nr(const FeatureDesc &desc) {
 void set_frame_params_nr(const FeatureDesc &create, const NeuralRenderingDesc &nr,
                          const FrameDesc &frame) {
     g.params->Set(nr_param::Color, resource_handle(g.color));
-    g.params->Set(nr_param::Depth, resource_handle(g.depth));
-    g.params->Set(nr_param::MVec, resource_handle(g.motion));
+
+    char omit_guides_env[8];
+    const bool omit_empty_guides =
+        (GetEnvironmentVariableA("DLSS_OMIT_EMPTY_GUIDES", omit_guides_env, sizeof omit_guides_env) > 0 &&
+         omit_guides_env[0] == '1');
+
+    if (!omit_empty_guides || frame.depth != nullptr)
+        g.params->Set(nr_param::Depth, resource_handle(g.depth));
+    if (!omit_empty_guides || frame.motion_vectors != nullptr)
+        g.params->Set(nr_param::MVec, resource_handle(g.motion));
     g.params->Set(nr_param::Output, resource_handle(g.output));
-    // The network alters the finished image, so it also asks for the buffer that
-    // image lives in. Here that is the same texture it writes to; a caller with
-    // a real frame would pass the swapchain's.
-    g.params->Set(nr_param::Backbuffer, resource_handle(g.output));
+    // The network alters the finished image, referencing the original un-enhanced
+    // input frame. Pointing Backbuffer to g.backbuffer decouples it from g.output,
+    // eliminating recursive feedback artifacts across multiple passes.
+    g.params->Set(nr_param::Backbuffer, resource_handle(g.backbuffer));
 
     g.params->Set(nr_param::MVecScaleX, frame.mv_scale_x * nr.mv_scale_multiplier_x);
     g.params->Set(nr_param::MVecScaleY, frame.mv_scale_y * nr.mv_scale_multiplier_y);
@@ -1052,6 +1060,8 @@ bool create_feature(const FeatureDesc &desc) {
     // unordered access view of its own; a swapchain buffer cannot be copied
     // into it directly, the formats differ.
     if (!make_shared(g.color, desc.render_width, desc.render_height,
+                     DXGI_FORMAT_R16G16B16A16_FLOAT, true) ||
+        !make_shared(g.backbuffer, desc.output_width, desc.output_height,
                      DXGI_FORMAT_R16G16B16A16_FLOAT, true) ||
         !make_shared(g.depth, desc.render_width, desc.render_height, DXGI_FORMAT_R32_FLOAT, false) ||
         !make_shared(g.motion, desc.render_width, desc.render_height, DXGI_FORMAT_R16G16_FLOAT,
@@ -1324,7 +1334,16 @@ bool evaluate_backbuffer(void *back_buffer, unsigned width, unsigned height, int
     transition(back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(g.color.resource, D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (g.backbuffer.resource) {
+        transition(g.backbuffer.resource, D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
     const bool staged = frame_blit::to_shared(g.cmd, back, g.color.resource, width, height);
+    if (g.backbuffer.resource) {
+        frame_blit::to_shared(g.cmd, back, g.backbuffer.resource, width, height);
+        transition(g.backbuffer.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_COMMON);
+    }
     transition(g.color.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COMMON);
     transition(back, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT);
@@ -1384,6 +1403,12 @@ bool evaluate(const FrameDesc &frame, bool copy_output) {
             transition(g.color.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
             g.cmd->CopyResource(g.color.resource, frame.color);
             transition(g.color.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+
+            if (g.backbuffer.resource && frame.pass_index == 0) {
+                transition(g.backbuffer.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                g.cmd->CopyResource(g.backbuffer.resource, frame.color);
+                transition(g.backbuffer.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+            }
         }
         // Depth and motion vectors are optional. A caller that has them supplies
         // them; a caller that does not leaves the staging textures as they are,
@@ -1464,7 +1489,14 @@ bool upload_shared_colour(const void *src, size_t src_pitch, unsigned rows) {
     copy.dstArray = g.color.level0;
     copy.WidthInBytes = row_bytes;
     copy.Height = rows;
-    return cu_ok(g.cu.cuMemcpy2D(&copy), "cuMemcpy2D (colour upload)");
+    if (!cu_ok(g.cu.cuMemcpy2D(&copy), "cuMemcpy2D (colour upload)"))
+        return false;
+
+    if (g.backbuffer.level0) {
+        copy.dstArray = g.backbuffer.level0;
+        cu_ok(g.cu.cuMemcpy2D(&copy), "cuMemcpy2D (backbuffer upload)");
+    }
+    return true;
 }
 
 bool read_shared_output(void *dst, size_t dst_pitch, unsigned rows) {
@@ -1521,6 +1553,7 @@ void shutdown() {
     g.num_features = 0;
 
     release_shared(g.color);
+    release_shared(g.backbuffer);
     release_shared(g.depth);
     release_shared(g.motion);
     release_shared(g.output);

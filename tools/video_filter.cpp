@@ -547,11 +547,25 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
     return true;
 }
 
+static inline double srgb_to_linear(double c) {
+    if (c <= 0.0) return 0.0;
+    if (c >= 1.0) return 1.0;
+    return (c <= 0.04045) ? (c / 12.92) : std::pow((c + 0.055) / 1.055, 2.4);
+}
+
+static inline double linear_to_srgb(double c) {
+    if (c <= 0.0) return 0.0;
+    if (c >= 1.0) return 1.0;
+    return (c <= 0.0031308) ? (c * 12.92) : (1.055 * std::pow(c, 1.0 / 2.4) - 0.055);
+}
+
 const std::array<uint16_t, 65536> &rgb48_half_lut() {
     static const std::array<uint16_t, 65536> lut = [] {
         std::array<uint16_t, 65536> values{};
-        for (unsigned i = 0; i < values.size(); ++i)
-            values[i] = enhancer::float_to_half((float)i / 65535.0f);
+        for (unsigned i = 0; i < values.size(); ++i) {
+            double s = (double)i / 65535.0;
+            values[i] = enhancer::float_to_half((float)srgb_to_linear(s));
+        }
         return values;
     }();
     return lut;
@@ -576,17 +590,23 @@ void rgb48_to_half_rgba(const unsigned char *rgb48, enhancer::Image &image) {
 }
 
 // --------------------------------------------------------------------------
-// Output tone handling. The network writes LINEAR (HDR-style) half floats;
-// storing them directly as sRGB makes images look dark and over-saturated.
-// The default applies gamma (1.4) to match source perceptual brightness;
-// --gamma 1 disables it.
+// Output tone handling. The network operates in physically LINEAR (HDR) half floats.
+// Input is converted from sRGB to linear, and output is converted back from
+// linear to sRGB via IEC 61966-2-1.
+// Default gamma is 1.0 (standard physical sRGB pass-through);
+// --gamma F allows optional custom power curve scaling.
 // --------------------------------------------------------------------------
-double g_gamma = 1.4;
+double g_gamma = 1.0;
 
 static inline double to_sdr(double value) {
     if (value <= 0.0) return 0.0;
     if (value >= 1.0) return 1.0;
-    return std::pow(value, 1.0 / g_gamma);
+    if (g_gamma != 1.0) {
+        value = std::pow(value, 1.0 / g_gamma);
+        if (value <= 0.0) return 0.0;
+        if (value >= 1.0) return 1.0;
+    }
+    return linear_to_srgb(value);
 }
 
 uint16_t clamp_half_to_u16(uint16_t half) {
@@ -803,7 +823,7 @@ struct Options {
     // ones before it, so a cut test that trips on ordinary motion reads as
     // flicker. 0.30 is a mean luma change only a real cut reaches.
     double cut_threshold = 0.30;
-    double gamma = 1.4;      // output gamma, 1.4 matches source perceptual brightness
+    double gamma = 1.0;      // output gamma, 1.0 = standard IEC 61966-2-1 sRGB
     // Off by default. The estimator is a coarse CPU block matcher -- a grid at
     // 1/16 of the frame, whole-pixel SAD, ties resolved by scan order -- so the
     // field it produces jitters from frame to frame, and the network reprojects
@@ -837,7 +857,7 @@ void usage() {
         "  --passes N            evaluate each frame N times (1 default)\n"
         "  --reset auto|always|never|every=N   accumulation reset policy (auto)\n"
         "  --cut-threshold F     scene-cut threshold, 0..1 (0.30)\n"
-        "  --gamma F             output gamma, linear->sRGB (1.4 default, 1 = off)\n"
+        "  --gamma F             output gamma adjustment (1.0 default = standard sRGB)\n"
         "  --flow 0|1           motion-vector guidance for video (0 default; 1 = on)\n"
         "  --upscale-mode P     native, quality, balanced, performance, ultra\n"
         "  --model-scale F      internal DLSS render scale, 0.25..1.0 (1.0 default)\n"
@@ -1374,6 +1394,16 @@ bool load_image(IWICImagingFactory *wic, const std::wstring &path, enhancer::Ima
         ok = SUCCEEDED(converter->CopyPixels(nullptr, image.width * 8,
                                              (UINT)(image.pixels.size() * 2),
                                              (BYTE *)image.pixels.data()));
+        if (ok) {
+            for (size_t i = 0; i < (size_t)image.width * image.height; ++i) {
+                float r = enhancer::half_to_float(image.pixels[i * 4 + 0]);
+                float g = enhancer::half_to_float(image.pixels[i * 4 + 1]);
+                float b = enhancer::half_to_float(image.pixels[i * 4 + 2]);
+                image.pixels[i * 4 + 0] = enhancer::float_to_half((float)srgb_to_linear(r));
+                image.pixels[i * 4 + 1] = enhancer::float_to_half((float)srgb_to_linear(g));
+                image.pixels[i * 4 + 2] = enhancer::float_to_half((float)srgb_to_linear(b));
+            }
+        }
     }
     if (converter) converter->Release();
     if (frame) frame->Release();

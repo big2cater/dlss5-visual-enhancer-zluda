@@ -24,21 +24,25 @@ void set_error(const char *fmt, ...) {
     va_end(ap);
 }
 
-// A straight copy. The conversion is the point: reading through a typed SRV and
-// writing through a typed UAV lets the hardware do it, so the shader itself
-// stays a copy and the formats carry the meaning.
+// Converts sRGB input from swapchain into linear radiance in shared buffer.
 const char kComputeSource[] =
     "Texture2D<float4> src : register(t0);\n"
     "RWTexture2D<float4> dst : register(u0);\n"
     "cbuffer Size : register(b0) { uint2 extent; };\n"
+    "float3 srgb_to_linear(float3 c) {\n"
+    "    c = clamp(c, 0.0f, 1.0f);\n"
+    "    return (c <= 0.04045f) ? (c / 12.92f) : pow((c + 0.055f) / 1.055f, 2.4f);\n"
+    "}\n"
     "[numthreads(8, 8, 1)]\n"
     "void main(uint3 id : SV_DispatchThreadID) {\n"
     "    if (id.x >= extent.x || id.y >= extent.y) return;\n"
-    "    dst[id.xy] = src[id.xy];\n"
+    "    float4 c = src[id.xy];\n"
+    "    c.rgb = srgb_to_linear(c.rgb);\n"
+    "    dst[id.xy] = c;\n"
     "}\n";
 
 // A full-screen triangle rather than a quad: three vertices, no vertex buffer,
-// and no seam down the diagonal.
+// and no seam down the diagonal. Converts linear radiance output back to sRGB for swapchain.
 const char kGraphicsSource[] =
     "Texture2D<float4> src : register(t0);\n"
     "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD; };\n"
@@ -48,9 +52,15 @@ const char kGraphicsSource[] =
     "    o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);\n"
     "    return o;\n"
     "}\n"
+    "float3 linear_to_srgb(float3 c) {\n"
+    "    c = clamp(c, 0.0f, 1.0f);\n"
+    "    return (c <= 0.0031308f) ? (c * 12.92f) : (1.055f * pow(c, 1.0f / 2.4f) - 0.055f);\n"
+    "}\n"
     "float4 ps_main(VSOut i) : SV_Target {\n"
     "    int2 p = int2(i.pos.xy);\n"
-    "    return src.Load(int3(p, 0));\n"
+    "    float4 c = src.Load(int3(p, 0));\n"
+    "    c.rgb = linear_to_srgb(c.rgb);\n"
+    "    return c;\n"
     "}\n";
 
 struct State {

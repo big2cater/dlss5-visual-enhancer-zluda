@@ -233,7 +233,7 @@ QWidget *BatchWindow::build_left_column() {
     gamma_->setRange(0.5, 3.0);
     gamma_->setSingleStep(0.1);
     gamma_->setDecimals(1);
-    gamma_->setValue(1.4);
+    gamma_->setValue(1.0);
     form->addRow(tr("输出伽马"), gamma_);
 
     // Lives in this column, not the video panel, so it shows in both modes:
@@ -462,9 +462,9 @@ void BatchWindow::load_settings() {
     skin_structure_->setValue(settings.value(QStringLiteral("skinStructure"), 0).toInt());
     style_->setCurrentIndex(settings.value(QStringLiteral("style"), 0).toInt());
     preset_->setCurrentIndex(settings.value(QStringLiteral("preset"), 0).toInt());
-    double loaded_gamma = settings.value(QStringLiteral("gamma"), 1.4).toDouble();
-    if (std::abs(loaded_gamma - 1.0) < 0.05) {
-        loaded_gamma = 1.4; // 升级旧版遗留的 1.0 默认值至 1.4
+    double loaded_gamma = settings.value(QStringLiteral("gamma"), 1.0).toDouble();
+    if (std::abs(loaded_gamma - 1.4) < 0.05) {
+        loaded_gamma = 1.0; // 升级旧版临时 1.4 补偿值回正至物理正确的 1.0
     }
     gamma_->setValue(loaded_gamma);
     auto_mask_->setChecked(settings.value(QStringLiteral("autoMask"), true).toBool());
@@ -590,7 +590,7 @@ void BatchWindow::reset_effects() {
     upscale_->setCurrentIndex(0);
     codec_->setCurrentIndex(0);
     auto_mask_->setChecked(true);
-    gamma_->setValue(1.4);
+    gamma_->setValue(1.0);
     image_passes_->setValue(3);
     passes_->setValue(1);
     reset_->setCurrentIndex(0);
