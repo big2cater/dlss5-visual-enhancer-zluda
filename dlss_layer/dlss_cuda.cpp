@@ -566,7 +566,12 @@ bool flush_and_wait() {
             set_error("SetEventOnCompletion failed");
             return false;
         }
-        WaitForSingleObject(g.fence_event, INFINITE);
+        const DWORD wr = WaitForSingleObject(g.fence_event, 10000);
+        if (wr == WAIT_TIMEOUT) {
+            const HRESULT hr = g.device ? g.device->GetDeviceRemovedReason() : E_FAIL;
+            set_error("flush_and_wait timed out after 10s (device removed: 0x%08lX)", hr);
+            return false;
+        }
     }
     return true;
 }
@@ -1498,6 +1503,39 @@ bool upload_shared_colour(const void *src, size_t src_pitch, unsigned rows) {
     }
     return true;
 }
+
+bool upload_shared_colour_raw_rgb48(ID3D12Resource *src_buffer, unsigned width, unsigned height) {
+    if (!src_buffer || !width || !height || !g.color.resource) {
+        set_error("upload_shared_colour_raw_rgb48: invalid buffer or colour resource");
+        return false;
+    }
+    if (!frame_blit::init(g.device)) {
+        set_error("%s", frame_blit::last_error());
+        return false;
+    }
+    g.allocator->Reset();
+    g.cmd->Reset(g.allocator, nullptr);
+    transition(g.color.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (g.backbuffer.resource)
+        transition(g.backbuffer.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    const bool ok = frame_blit::raw_rgb48_to_shared(g.cmd, src_buffer, g.color.resource,
+                                                    g.backbuffer.resource, width, height);
+
+    transition(g.color.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    if (g.backbuffer.resource)
+        transition(g.backbuffer.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+    g.cmd->Close();
+    ID3D12CommandList *cmds[] = {g.cmd};
+    g.queue->ExecuteCommandLists(1, cmds);
+    if (!ok) {
+        set_error("%s", frame_blit::last_error());
+        return false;
+    }
+    return flush_and_wait();
+}
+
 
 bool read_shared_output(void *dst, size_t dst_pitch, unsigned rows) {
     if (!dst || !dst_pitch || !rows || !g.cu.cuMemcpy2D || !g.output.level0) {

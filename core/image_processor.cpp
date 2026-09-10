@@ -633,6 +633,10 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
             return false;
         }
 
+        if (settings.yield_ms > 0) {
+            Sleep((DWORD)settings.yield_ms);
+        }
+
         // Pass 1 -> Feature 1 -> result (takes intermediate, removes residual grain, advances Feature 1 history once)
         dlss_cuda::FrameDesc f1 = frame;
         f1.color = s->intermediate;
@@ -654,6 +658,9 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
             // Only the first pass of a call resets; the later ones chain onto it.
             if (frame.reset_accumulation)
                 frame.reset_accumulation = false;
+            if (pass + 1 < passes && settings.yield_ms > 0) {
+                Sleep((DWORD)settings.yield_ms);
+            }
         }
     }
 
@@ -722,6 +729,267 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
     return true;
 }
+
+bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned width, unsigned height,
+                                  Image &out, const Settings &settings, std::string &error,
+                                  const Image *motion, ID3D12Resource *motion_gpu,
+                                  unsigned motion_gpu_row_pitch) {
+    if (!s->started) {
+        error = "the DLSS layer has not been started";
+        return false;
+    }
+    if (!raw_rgb48_buffer || !width || !height) {
+        error = "invalid raw RGB48 buffer or dimensions";
+        return false;
+    }
+
+    const auto began = std::chrono::steady_clock::now();
+    const unsigned output_width = settings.output_width ? settings.output_width : width;
+    const unsigned output_height = settings.output_height ? settings.output_height : height;
+    const UINT out_row_bytes = output_width * 8;
+    const UINT out_padded = aligned_pitch(out_row_bytes);
+    const bool direct_readback = [] {
+        char value[8] = {};
+        return GetEnvironmentVariableA("DLSS_DIRECT_READBACK", value,
+                                       sizeof value) > 0 && value[0] == '1';
+    }();
+
+    const bool need_intermediate = settings.passes > 1;
+    if (width != s->width || height != s->height || output_width != s->out_width ||
+        output_height != s->out_height || (need_intermediate && !s->intermediate)) {
+        s->release_images();
+        s->colour = make_texture(s->device, width, height, false);
+        s->result = make_texture(s->device, output_width, output_height, true);
+        if (need_intermediate) {
+            s->intermediate = make_texture(s->device, output_width, output_height, true);
+        }
+        s->readback = make_buffer(s->device, (UINT64)out_padded * output_height, D3D12_HEAP_TYPE_READBACK,
+                                  D3D12_RESOURCE_STATE_COPY_DEST);
+        s->motion_tex = make_motion_texture(s->device, width, height);
+        s->motion_up = make_buffer(s->device,
+                                   (UINT64)aligned_pitch((UINT)width * 4) * height,
+                                   D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (!s->colour || !s->result || (need_intermediate && !s->intermediate) ||
+            !s->readback || !s->motion_tex || !s->motion_up) {
+            error = "the working images could not be created";
+            return false;
+        }
+        s->width = width;
+        s->height = height;
+        s->out_width = output_width;
+        s->out_height = output_height;
+    }
+
+    dlss_cuda::FeatureDesc feature{};
+    feature.feature = dlss_cuda::Feature::NeuralRendering;
+    feature.render_width = width;
+    feature.render_height = height;
+    feature.output_width = output_width;
+    feature.output_height = output_height;
+    feature.perf_quality = 2;
+    feature.max_passes = settings.passes > 1 ? 2 : 1;
+    feature.neural.intensity = settings.intensity;
+    feature.neural.global_tone_strength = settings.global_tone;
+    feature.neural.local_tone_strength = settings.local_tone;
+    feature.neural.local_structure_strength = settings.local_structure;
+    feature.neural.skin_structure_strength = settings.skin_structure;
+    feature.neural.style = settings.style;
+    feature.neural.render_preset = settings.preset;
+    feature.neural.use_auto_mask = settings.auto_mask;
+    if (!dlss_cuda::create_feature(feature)) {
+        error = dlss_cuda::last_error();
+        return false;
+    }
+
+    // Fast GPU compute format conversion: ByteAddressBuffer -> shared colour & backbuffer
+    if (!dlss_cuda::upload_shared_colour_raw_rgb48(raw_rgb48_buffer, width, height)) {
+        error = dlss_cuda::last_error();
+        return false;
+    }
+
+    // Motion vector handling if present
+    if (motion_gpu && s->motion_tex) {
+        D3D12_TEXTURE_COPY_LOCATION into{};
+        into.pResource = s->motion_tex;
+        into.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION from{};
+        from.pResource = motion_gpu;
+        from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        from.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16_FLOAT;
+        from.PlacedFootprint.Footprint.Width = width;
+        from.PlacedFootprint.Footprint.Height = height;
+        from.PlacedFootprint.Footprint.Depth = 1;
+        from.PlacedFootprint.Footprint.RowPitch = motion_gpu_row_pitch ? motion_gpu_row_pitch : aligned_pitch((UINT)width * 4);
+
+        D3D12_RESOURCE_BARRIER mb{};
+        mb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        mb.Transition.pResource = s->motion_tex;
+        mb.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        mb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        mb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+        s->allocator->Reset();
+        s->cmd->Reset(s->allocator, nullptr);
+        s->cmd->ResourceBarrier(1, &mb);
+        s->cmd->CopyTextureRegion(&into, 0, 0, 0, &from, nullptr);
+        std::swap(mb.Transition.StateBefore, mb.Transition.StateAfter);
+        s->cmd->ResourceBarrier(1, &mb);
+        s->cmd->Close();
+        ID3D12CommandList *mlists[] = {s->cmd};
+        s->queue->ExecuteCommandLists(1, mlists);
+        s->wait();
+    } else if (motion && !motion->empty() && s->motion_tex && s->motion_up) {
+        const UINT motion_pitch = aligned_pitch((UINT)width * 4);
+        unsigned char *mapped = nullptr;
+        D3D12_RANGE nothing{0, 0};
+        if (SUCCEEDED(s->motion_up->Map(0, &nothing, (void **)&mapped)) && mapped) {
+            const unsigned char *src = (const unsigned char *)motion->pixels.data();
+            const UINT row_b = (UINT)width * 4;
+            for (unsigned y = 0; y < height; ++y)
+                memcpy(mapped + (size_t)y * motion_pitch, src + (size_t)y * row_b, row_b);
+            s->motion_up->Unmap(0, nullptr);
+
+            D3D12_TEXTURE_COPY_LOCATION into{};
+            into.pResource = s->motion_tex;
+            into.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            D3D12_TEXTURE_COPY_LOCATION from{};
+            from.pResource = s->motion_up;
+            from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            from.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16_FLOAT;
+            from.PlacedFootprint.Footprint.Width = width;
+            from.PlacedFootprint.Footprint.Height = height;
+            from.PlacedFootprint.Footprint.Depth = 1;
+            from.PlacedFootprint.Footprint.RowPitch = motion_pitch;
+
+            D3D12_RESOURCE_BARRIER mb{};
+            mb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            mb.Transition.pResource = s->motion_tex;
+            mb.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            mb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            mb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+            s->allocator->Reset();
+            s->cmd->Reset(s->allocator, nullptr);
+            s->cmd->ResourceBarrier(1, &mb);
+            s->cmd->CopyTextureRegion(&into, 0, 0, 0, &from, nullptr);
+            std::swap(mb.Transition.StateBefore, mb.Transition.StateAfter);
+            s->cmd->ResourceBarrier(1, &mb);
+            s->cmd->Close();
+            ID3D12CommandList *mlists[] = {s->cmd};
+            s->queue->ExecuteCommandLists(1, mlists);
+            s->wait();
+        }
+    }
+
+    dlss_cuda::FrameDesc frame{};
+    frame.color = nullptr;
+    frame.color_is_shared = true;
+    frame.output = s->result;
+    if ((motion_gpu || (motion && !motion->empty())) && s->motion_tex)
+        frame.motion_vectors = s->motion_tex;
+    frame.reset_accumulation = settings.reset_accumulation;
+    const int passes = settings.passes < 1 ? 1 : settings.passes;
+
+    if (settings.is_video && passes >= 2 && s->intermediate) {
+        dlss_cuda::FrameDesc f0 = frame;
+        f0.output = s->intermediate;
+        f0.pass_index = 0;
+        f0.reset_accumulation = settings.reset_accumulation;
+        if (!dlss_cuda::evaluate(f0, true)) {
+            error = dlss_cuda::last_error();
+            return false;
+        }
+
+        if (settings.yield_ms > 0) {
+            Sleep((DWORD)settings.yield_ms);
+        }
+
+        dlss_cuda::FrameDesc f1 = frame;
+        f1.color = s->intermediate;
+        f1.color_is_shared = false;
+        f1.output = s->result;
+        f1.pass_index = 1;
+        f1.reset_accumulation = settings.reset_accumulation;
+        if (!dlss_cuda::evaluate(f1, !direct_readback)) {
+            error = dlss_cuda::last_error();
+            return false;
+        }
+    } else {
+        for (int pass = 0; pass < passes; ++pass) {
+            frame.pass_index = 0;
+            if (!dlss_cuda::evaluate(frame, !direct_readback)) {
+                error = dlss_cuda::last_error();
+                return false;
+            }
+            if (frame.reset_accumulation)
+                frame.reset_accumulation = false;
+            if (pass + 1 < passes && settings.yield_ms > 0) {
+                Sleep((DWORD)settings.yield_ms);
+            }
+        }
+    }
+
+    out.width = output_width;
+    out.height = output_height;
+    out.pixels.resize((size_t)output_width * output_height * 4);
+    if (direct_readback) {
+        if (!dlss_cuda::read_shared_output(out.pixels.data(), out_row_bytes, output_height)) {
+            error = dlss_cuda::last_error();
+            return false;
+        }
+    } else {
+        D3D12_RESOURCE_BARRIER back{};
+        back.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        back.Transition.pResource = s->result;
+        back.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        back.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        back.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+        D3D12_TEXTURE_COPY_LOCATION source{};
+        source.pResource = s->result;
+        source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION target{};
+        target.pResource = s->readback;
+        target.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        target.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        target.PlacedFootprint.Footprint.Width = output_width;
+        target.PlacedFootprint.Footprint.Height = output_height;
+        target.PlacedFootprint.Footprint.Depth = 1;
+        target.PlacedFootprint.Footprint.RowPitch = out_padded;
+
+        s->allocator->Reset();
+        s->cmd->Reset(s->allocator, nullptr);
+        s->cmd->ResourceBarrier(1, &back);
+        s->cmd->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+        std::swap(back.Transition.StateBefore, back.Transition.StateAfter);
+        s->cmd->ResourceBarrier(1, &back);
+        s->cmd->Close();
+        ID3D12CommandList *readback_lists[] = {s->cmd};
+        s->queue->ExecuteCommandLists(1, readback_lists);
+        s->wait();
+
+        unsigned char *mapped = nullptr;
+        D3D12_RANGE whole{0, (SIZE_T)out_padded * output_height};
+        if (FAILED(s->readback->Map(0, &whole, (void **)&mapped))) {
+            error = "the result could not be read back";
+            return false;
+        }
+        unsigned char *destination = (unsigned char *)out.pixels.data();
+        if (out_padded == out_row_bytes) {
+            memcpy(destination, mapped, (size_t)out_row_bytes * output_height);
+        } else {
+            for (unsigned y = 0; y < output_height; ++y)
+                memcpy(destination + (size_t)y * out_row_bytes,
+                       mapped + (size_t)y * out_padded, out_row_bytes);
+        }
+        s->readback->Unmap(0, nullptr);
+    }
+
+    s->last_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+    return true;
+}
+
 
 void Processor::stop() {
     if (s->started) dlss_cuda::shutdown();

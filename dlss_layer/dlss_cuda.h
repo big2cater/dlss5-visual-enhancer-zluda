@@ -166,6 +166,11 @@ bool evaluate(const FrameDesc &frame, bool copy_output = true);
 // array. This bypasses the intermediate D3D12 upload texture and queue fence.
 bool upload_shared_colour(const void *src, size_t src_pitch, unsigned rows);
 
+// Zero-copy GPU compute path: converts packed RGB48 in a D3D12 buffer directly
+// into the shared half-float colour texture and backbuffer via compute shader.
+bool upload_shared_colour_raw_rgb48(ID3D12Resource *src_buffer, unsigned width, unsigned height);
+
+
 // Copies the internal neural output array directly to host memory after an
 // evaluation. dst_pitch is in bytes and must cover one complete row.
 bool read_shared_output(void *dst, size_t dst_pitch, unsigned rows);

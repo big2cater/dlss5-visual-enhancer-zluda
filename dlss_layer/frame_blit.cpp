@@ -41,6 +41,31 @@ const char kComputeSource[] =
     "    dst[id.xy] = c;\n"
     "}\n";
 
+// Converts raw RGB48LE byte buffer into linear radiance RGBA16F textures (color & optional backbuffer).
+const char kRawComputeSource[] =
+    "ByteAddressBuffer src : register(t0);\n"
+    "RWTexture2D<float4> dst_color : register(u0);\n"
+    "RWTexture2D<float4> dst_back : register(u1);\n"
+    "cbuffer Size : register(b0) { uint2 extent; uint has_back; uint pad; };\n"
+    "float3 srgb_to_linear(float3 c) {\n"
+    "    c = clamp(c, 0.0f, 1.0f);\n"
+    "    return (c <= 0.04045f) ? (c / 12.92f) : pow((c + 0.055f) / 1.055f, 2.4f);\n"
+    "}\n"
+    "[numthreads(8, 8, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID) {\n"
+    "    if (id.x >= extent.x || id.y >= extent.y) return;\n"
+    "    uint byte_idx = (id.y * extent.x + id.x) * 6u;\n"
+    "    uint d0 = src.Load(byte_idx & ~3u);\n"
+    "    uint d1 = src.Load((byte_idx & ~3u) + 4u);\n"
+    "    uint r16 = (byte_idx & 2u) ? (d0 >> 16u) : (d0 & 0xffffu);\n"
+    "    uint g16 = (byte_idx & 2u) ? (d1 & 0xffffu) : (d0 >> 16u);\n"
+    "    uint b16 = (byte_idx & 2u) ? (d1 >> 16u) : (d1 & 0xffffu);\n"
+    "    float3 rgb = float3(r16, g16, b16) / 65535.0f;\n"
+    "    float4 out_val = float4(srgb_to_linear(rgb), 1.0f);\n"
+    "    dst_color[id.xy] = out_val;\n"
+    "    if (has_back != 0u) dst_back[id.xy] = out_val;\n"
+    "}\n";
+
 // A full-screen triangle rather than a quad: three vertices, no vertex buffer,
 // and no seam down the diagonal. Converts linear radiance output back to sRGB for swapchain.
 const char kGraphicsSource[] =
@@ -67,6 +92,8 @@ struct State {
     ID3D12Device *device = nullptr;
     ID3D12RootSignature *compute_root = nullptr;
     ID3D12PipelineState *compute_pso = nullptr;
+    ID3D12RootSignature *raw_compute_root = nullptr;
+    ID3D12PipelineState *raw_compute_pso = nullptr;
     ID3D12RootSignature *graphics_root = nullptr;
     // One graphics pipeline per destination format: the render target format is
     // baked into a pipeline state and a game may present in any of several.
@@ -79,6 +106,7 @@ struct State {
     UINT view_stride = 0;
     bool ready = false;
 };
+
 
 State g;
 
@@ -160,6 +188,14 @@ bool init(ID3D12Device *device) {
         return false;
     }
 
+    ID3DBlob *raw_cs = nullptr;
+    if (!compile(kRawComputeSource, sizeof kRawComputeSource - 1, "main", "cs_5_0", &raw_cs)) {
+        cs->Release();
+        g.vs->Release();
+        g.ps->Release();
+        return false;
+    }
+
     // Compute: one descriptor table holding the source SRV and the destination
     // UAV, plus the extent as root constants.
     D3D12_DESCRIPTOR_RANGE compute_ranges[2] = {};
@@ -184,6 +220,7 @@ bool init(ID3D12Device *device) {
     compute_desc.pParameters = compute_params;
     if (!make_root_signature(compute_desc, &g.compute_root)) {
         cs->Release();
+        raw_cs->Release();
         return false;
     }
 
@@ -193,7 +230,44 @@ bool init(ID3D12Device *device) {
     const HRESULT hr = device->CreateComputePipelineState(&compute_pso, IID_PPV_ARGS(&g.compute_pso));
     cs->Release();
     if (FAILED(hr)) {
+        raw_cs->Release();
         set_error("CreateComputePipelineState failed: 0x%08lX", hr);
+        return false;
+    }
+
+    // Raw compute: SRV (raw buffer) + 2 UAVs (color, backbuffer), plus 4 root constants
+    D3D12_DESCRIPTOR_RANGE raw_ranges[2] = {};
+    raw_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    raw_ranges[0].NumDescriptors = 1;
+    raw_ranges[0].BaseShaderRegister = 0;
+    raw_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    raw_ranges[1].NumDescriptors = 2;
+    raw_ranges[1].BaseShaderRegister = 0;
+    raw_ranges[1].OffsetInDescriptorsFromTableStart = 1;
+
+    D3D12_ROOT_PARAMETER raw_params[2] = {};
+    raw_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    raw_params[0].DescriptorTable.NumDescriptorRanges = 2;
+    raw_params[0].DescriptorTable.pDescriptorRanges = raw_ranges;
+    raw_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    raw_params[1].Constants.Num32BitValues = 4;
+    raw_params[1].Constants.ShaderRegister = 0;
+
+    D3D12_ROOT_SIGNATURE_DESC raw_desc{};
+    raw_desc.NumParameters = 2;
+    raw_desc.pParameters = raw_params;
+    if (!make_root_signature(raw_desc, &g.raw_compute_root)) {
+        raw_cs->Release();
+        return false;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC raw_pso{};
+    raw_pso.pRootSignature = g.raw_compute_root;
+    raw_pso.CS = {raw_cs->GetBufferPointer(), raw_cs->GetBufferSize()};
+    const HRESULT hr_raw = device->CreateComputePipelineState(&raw_pso, IID_PPV_ARGS(&g.raw_compute_pso));
+    raw_cs->Release();
+    if (FAILED(hr_raw)) {
+        set_error("CreateComputePipelineState (raw) failed: 0x%08lX", hr_raw);
         return false;
     }
 
@@ -215,11 +289,10 @@ bool init(ID3D12Device *device) {
     graphics_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     if (!make_root_signature(graphics_desc, &g.graphics_root)) return false;
 
-    // Two slots are enough: each pass binds its own views immediately before
-    // using them, and the passes never overlap.
+    // View heap with 8 slots for overlapping passes
     D3D12_DESCRIPTOR_HEAP_DESC view_heap{};
     view_heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    view_heap.NumDescriptors = 2;
+    view_heap.NumDescriptors = 8;
     view_heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&view_heap, IID_PPV_ARGS(&g.view_heap)))) {
         set_error("CreateDescriptorHeap (views) failed");
@@ -238,6 +311,7 @@ bool init(ID3D12Device *device) {
     g.ready = true;
     return true;
 }
+
 
 bool to_shared(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src, ID3D12Resource *dst,
                unsigned width, unsigned height) {
@@ -310,10 +384,59 @@ bool to_backbuffer(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src, ID3D12Re
     return true;
 }
 
+bool raw_rgb48_to_shared(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src_buffer,
+                         ID3D12Resource *dst_color, ID3D12Resource *dst_backbuffer,
+                         unsigned width, unsigned height) {
+    if (!g.ready) {
+        set_error("frame_blit::init has not run");
+        return false;
+    }
+    if (!cmd || !src_buffer || !dst_color) {
+        set_error("raw_rgb48_to_shared: missing parameters");
+        return false;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g.view_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_TYPELESS;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.FirstElement = 0;
+    srv.Buffer.NumElements = (width * height * 6 + 3) / 4;
+    srv.Buffer.StructureByteStride = 0;
+    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    g.device->CreateShaderResourceView(src_buffer, &srv, cpu);
+
+    cpu.ptr += g.view_stride;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav0{};
+    uav0.Format = dst_color->GetDesc().Format;
+    uav0.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g.device->CreateUnorderedAccessView(dst_color, nullptr, &uav0, cpu);
+
+    cpu.ptr += g.view_stride;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav1{};
+    ID3D12Resource *target_back = dst_backbuffer ? dst_backbuffer : dst_color;
+    uav1.Format = target_back->GetDesc().Format;
+    uav1.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g.device->CreateUnorderedAccessView(target_back, nullptr, &uav1, cpu);
+
+    ID3D12DescriptorHeap *heaps[] = {g.view_heap};
+    cmd->SetDescriptorHeaps(1, heaps);
+    cmd->SetComputeRootSignature(g.raw_compute_root);
+    cmd->SetPipelineState(g.raw_compute_pso);
+    cmd->SetComputeRootDescriptorTable(0, g.view_heap->GetGPUDescriptorHandleForHeapStart());
+    const UINT constants[4] = {width, height, dst_backbuffer ? 1u : 0u, 0u};
+    cmd->SetComputeRoot32BitConstants(1, 4, constants, 0);
+    cmd->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    return true;
+}
+
 void shutdown() {
     for (auto &entry : g.graphics_pso)
         if (entry.second) entry.second->Release();
     g.graphics_pso.clear();
+    if (g.raw_compute_pso) g.raw_compute_pso->Release();
+    if (g.raw_compute_root) g.raw_compute_root->Release();
     if (g.compute_pso) g.compute_pso->Release();
     if (g.compute_root) g.compute_root->Release();
     if (g.graphics_root) g.graphics_root->Release();
@@ -327,3 +450,4 @@ void shutdown() {
 const char *last_error() { return g_error; }
 
 } // namespace frame_blit
+

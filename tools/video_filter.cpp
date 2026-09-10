@@ -279,7 +279,19 @@ struct InputFrame {
     enhancer::Image motion;
     bool reset = false;
     bool is_eos = false;
+    ID3D12Resource *upload_buf = nullptr;
+    void *mapped_ptr = nullptr;
+
+    ~InputFrame() {
+        if (upload_buf) {
+            if (mapped_ptr) upload_buf->Unmap(0, nullptr);
+            upload_buf->Release();
+            upload_buf = nullptr;
+            mapped_ptr = nullptr;
+        }
+    }
 };
+
 
 struct OutputFrame {
     unsigned index = 0;
@@ -841,6 +853,7 @@ struct Options {
     double model_scale = 1.0; // compatibility; legacy GUI flag is ignored
     std::string dlss_model_preset = "default";
     std::string encoder = "auto";
+    int yield_ms = 1; // ms to yield per frame to prevent TDR and keep DWM responsive
 };
 
 void usage() {
@@ -869,6 +882,7 @@ void usage() {
         "  --fps N               override output frame rate\n"
         "  --no-audio            don't copy the source audio\n"
         "  --max-frames N        stop after N frames\n"
+        "  --yield-ms N          GPU scheduling yield per frame in ms for TDR prevention (1 default)\n"
         "  --dump-frames DIR     write each output frame as PNG into DIR\n");
 }
 
@@ -969,6 +983,11 @@ bool parse_args(int argc, char **argv, Options &options) {
         } else if (arg == "--max-frames") {
             const char *v = need("--max-frames"); if (!v) return false;
             options.max_frames = atoi(v);
+        } else if (arg == "--yield-ms") {
+            const char *v = need("--yield-ms"); if (!v) return false;
+            options.yield_ms = atoi(v);
+            if (options.yield_ms < 0) options.yield_ms = 0;
+            options.settings.yield_ms = options.yield_ms;
         } else if (arg == "--dump-frames") {
             const char *v = need("--dump-frames"); if (!v) return false;
             options.dump_dir = widen(v);
@@ -1748,12 +1767,36 @@ static int run_main_once(int argc, char **argv) {
     Channel<std::shared_ptr<OutputFrame>> free_output_pool(POOL_SIZE);
     Channel<std::shared_ptr<OutputFrame>> ready_output_channel(POOL_SIZE);
 
+    ID3D12Device *d3d_dev = processor.native_device();
+    bool zero_copy_in = false;
     for (size_t i = 0; i < POOL_SIZE; ++i) {
         auto in_f = std::make_shared<InputFrame>();
         in_f->raw_bytes.resize(frame_bytes);
-        in_f->in.width = model_w;
-        in_f->in.height = model_h;
-        in_f->in.pixels.resize((size_t)model_w * model_h * 4);
+        if (d3d_dev) {
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC rdesc{};
+            rdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rdesc.Width = frame_bytes;
+            rdesc.Height = 1;
+            rdesc.DepthOrArraySize = 1;
+            rdesc.MipLevels = 1;
+            rdesc.SampleDesc.Count = 1;
+            rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (SUCCEEDED(d3d_dev->CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &rdesc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                    IID_PPV_ARGS(&in_f->upload_buf))) && in_f->upload_buf) {
+                if (SUCCEEDED(in_f->upload_buf->Map(0, nullptr, &in_f->mapped_ptr)) && in_f->mapped_ptr) {
+                    zero_copy_in = true;
+                }
+            }
+        }
+        if (!in_f->mapped_ptr) {
+            in_f->in.width = model_w;
+            in_f->in.height = model_h;
+            in_f->in.pixels.resize((size_t)model_w * model_h * 4);
+        }
         if (options.flow) {
             in_f->motion.width = model_w;
             in_f->motion.height = model_h;
@@ -1768,6 +1811,10 @@ static int run_main_once(int argc, char **argv) {
         out_f->model_output.resize(frame_bytes);
         free_output_pool.push(out_f);
     }
+    if (zero_copy_in) {
+        fprintf(stderr, "[zero-copy] D3D12 mapped upload heap enabled (direct pipe-to-GPU, CPU LUT bypass)\n");
+    }
+
 
     std::atomic<bool> abort_pipeline{false};
     std::atomic<int> reset_count{0};
@@ -1791,10 +1838,11 @@ static int run_main_once(int argc, char **argv) {
             if (!free_input_pool.pop(frame)) break;
             if (abort_pipeline.load()) break;
 
+            unsigned char *dst_raw = frame->mapped_ptr ? (unsigned char *)frame->mapped_ptr : frame->raw_bytes.data();
             size_t got = 0;
             while (got < frame_bytes && !abort_pipeline.load()) {
                 DWORD chunk = 0;
-                if (!ReadFile(decoder_stdout.read_end, frame->raw_bytes.data() + got,
+                if (!ReadFile(decoder_stdout.read_end, dst_raw + got,
                               (DWORD)(frame_bytes - got), &chunk, nullptr) || chunk == 0) {
                     break;
                 }
@@ -1823,17 +1871,21 @@ static int run_main_once(int argc, char **argv) {
                 case ResetMode::Always: reset = true; break;
                 case ResetMode::Never: reset = (dec_index == 0); break;
                 case ResetMode::Every: reset = (dec_index % options.reset_every) == 0; break;
-                case ResetMode::Auto: reset = detector.consider(frame->raw_bytes.data(), model_w, model_h); break;
+                case ResetMode::Auto: reset = detector.consider(dst_raw, model_w, model_h); break;
             }
             frame->reset = reset;
 
-            // Parallel format conversion: RGB48 -> Half-RGBA
-            rgb48_to_half_rgba(frame->raw_bytes.data(), frame->in);
+            // Format conversion: GPU Compute Shader handles format conversion if upload_buf is mapped.
+            // Only run CPU rgb48_to_half_rgba if falling back to CPU host staging.
+            if (!frame->mapped_ptr) {
+                rgb48_to_half_rgba(frame->raw_bytes.data(), frame->in);
+            }
 
             // If CPU flow is used, compute it in worker thread
             if (options.flow && !gpu_flow_ready) {
-                flowgen.compute(frame->raw_bytes.data(), model_w, model_h, reset, frame->motion.pixels);
+                flowgen.compute(dst_raw, model_w, model_h, reset, frame->motion.pixels);
             }
+
 
             if (!ready_input_channel.push(frame)) break;
             ++dec_index;
@@ -1926,10 +1978,11 @@ static int run_main_once(int argc, char **argv) {
             if (in_frame->reset) gpuflow.reset();
             const unsigned qw = (model_w + 3) / 4, qh = (model_h + 3) / 4;
             flow_luma.resize((size_t)qw * qh);
+            const unsigned char *data_ptr = in_frame->mapped_ptr ? (const unsigned char *)in_frame->mapped_ptr : in_frame->raw_bytes.data();
             for (unsigned y = 0; y < qh; ++y) for (unsigned x = 0; x < qw; ++x) {
                 unsigned px = std::min(model_w - 1, x * 4u);
                 unsigned py = std::min(model_h - 1, y * 4u);
-                const uint16_t *p = (const uint16_t *)(in_frame->raw_bytes.data() + ((size_t)py * model_w + px) * 6);
+                const uint16_t *p = (const uint16_t *)(data_ptr + ((size_t)py * model_w + px) * 6);
                 flow_luma[(size_t)y * qw + x] = ((unsigned)p[0] * 19595u + (unsigned)p[1] * 38470u + (unsigned)p[2] * 7471u) >> 16;
             }
             bool generated = gpuflow.compute(flow_luma, qflow);
@@ -1940,9 +1993,20 @@ static int run_main_once(int argc, char **argv) {
         }
 
         const auto began = std::chrono::steady_clock::now();
-        if (!processor.process(in_frame->in, out_frame->out, settings, error,
-                               gpu_motion ? nullptr : (useFlow ? &in_frame->motion : nullptr),
-                               gpu_motion, gpu_motion_pitch)) {
+        bool proc_ok = false;
+        if (in_frame->upload_buf) {
+            proc_ok = processor.process_raw_rgb48(
+                in_frame->upload_buf, model_w, model_h, out_frame->out, settings, error,
+                gpu_motion ? nullptr : (useFlow ? &in_frame->motion : nullptr),
+                gpu_motion, gpu_motion_pitch);
+        } else {
+            proc_ok = processor.process(
+                in_frame->in, out_frame->out, settings, error,
+                gpu_motion ? nullptr : (useFlow ? &in_frame->motion : nullptr),
+                gpu_motion, gpu_motion_pitch);
+        }
+        if (!proc_ok) {
+
             fprintf(stderr, "[FAIL] frame %u: %s\n", in_frame->index, error.c_str());
             if (error.find("blank image") != std::string::npos) {
                 retryable = true;
@@ -1975,6 +2039,18 @@ static int run_main_once(int argc, char **argv) {
         // Send output frame to encoder
         ready_output_channel.push(out_frame);
         ++eval_index;
+
+        // TDR Prevention & DWM responsiveness:
+        // High resolution (1080p, 1440p, 4K) or multipass keeps the GPU hardware queue heavily loaded.
+        // Yielding 1-2 ms gives the Windows Desktop Window Manager (DWM) and display driver
+        // a guaranteed scheduling window to present desktop frames, completely eliminating
+        // Windows TDR Watchdog timeouts (LiveKernelEvent 0x141).
+        if (options.yield_ms > 0) {
+            Sleep((DWORD)options.yield_ms);
+        } else if (ms > 300.0) {
+            // Adaptive yield for heavy frames
+            Sleep(2);
+        }
     }
 
     if (abort_pipeline.load()) {

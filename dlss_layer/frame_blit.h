@@ -30,6 +30,13 @@ bool init(ID3D12Device *device);
 bool to_shared(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src, ID3D12Resource *dst,
                unsigned width, unsigned height);
 
+// Converts raw RGB48 from a D3D12 Buffer directly into shared RGBA16F textures (color & optional backbuffer)
+// on GPU using IEC 61966-2-1 linear sRGB conversion.
+bool raw_rgb48_to_shared(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src_buffer,
+                         ID3D12Resource *dst_color, ID3D12Resource *dst_backbuffer,
+                         unsigned width, unsigned height);
+
+
 // Our half-float output -> the swapchain buffer, as a draw. The pipeline
 // depends on the destination's format, so one is built per format seen.
 bool to_backbuffer(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src, ID3D12Resource *dst,

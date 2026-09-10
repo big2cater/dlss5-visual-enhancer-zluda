@@ -55,6 +55,9 @@ struct Settings {
     // When true, enables video mode with dual-engine cascaded multipass (Pass 1 -> Pass 2)
     // using independent persistent temporal features to prevent temporal flicker.
     bool is_video = false;
+
+    // Milliseconds to yield/sleep between passes to prevent Windows TDR / driver timeout (default 1ms)
+    int yield_ms = 1;
 };
 
 // Where the pieces are. All of them belong to someone else; the program never
@@ -107,6 +110,14 @@ public:
     bool process(const Image &in, Image &out, const Settings &settings, std::string &error,
                  const Image *motion = nullptr, ID3D12Resource *motion_gpu = nullptr,
                  unsigned motion_gpu_row_pitch = 0);
+
+    // Zero-copy GPU path: takes a mapped/committed D3D12 buffer containing raw RGB48LE
+    // and converts it directly into shared textures on GPU via Compute Shader.
+    bool process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned width, unsigned height,
+                           Image &out, const Settings &settings, std::string &error,
+                           const Image *motion = nullptr, ID3D12Resource *motion_gpu = nullptr,
+                           unsigned motion_gpu_row_pitch = 0);
+
 
     // Native D3D12 objects for zero-copy auxiliary passes (for example a GPU
     // motion guide). Borrowed pointers; Processor retains ownership.
