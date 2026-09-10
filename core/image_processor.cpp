@@ -330,11 +330,12 @@ bool Processor::start(const Paths &paths, std::string &error,
     // path by mistake on real hardware too.
     // DLSSNR_PRECOMPILE_SKIP=1: caller already ran a strict-serial prewarm
     // (--precompile-wait); do not spawn parallel translation children here.
+    const bool real_nvidia = is_real_nvidia_driver(cuda_driver);
     const bool skip_precompile = [] {
         char b[2] = {};
         return GetEnvironmentVariableA("DLSSNR_PRECOMPILE_SKIP", b, 2) > 0 && b[0] == '1';
     }();
-    if (!skip_precompile && !is_real_nvidia_driver(cuda_driver)) {
+    if (!skip_precompile && !real_nvidia) {
         std::string precompile_error;
         const bool ok = precompile(
             paths.snippet, cuda_driver, 0,
@@ -370,6 +371,11 @@ bool Processor::start(const Paths &paths, std::string &error,
     init.nvcuda_dll_path = cuda_driver.c_str();
     init.ngx_runtime_path = or_null(paths.ngx_runtime);
     init.nvapi_dll_path = or_null(nvapi);
+    // The file itself answers this, rather than the mode the user picked:
+    // pointing the driver field at the system's own nvcuda.dll by hand is
+    // the same situation as choosing NVIDIA mode, and the workarounds meant
+    // for the stand-in are wrong in both.
+    init.nvidia_driver = real_nvidia;
     if (!dlss_cuda::init(init)) {
         error = dlss_cuda::last_error();
         return false;
