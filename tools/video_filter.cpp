@@ -57,12 +57,17 @@
 #include <chrono>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../core/image_processor.h"
@@ -98,14 +103,16 @@ struct Pipe {
     HANDLE read_end = nullptr;
     HANDLE write_end = nullptr;
 
-    bool make(bool inheritable_read, bool inheritable_write) {
+    bool make(bool inheritable_read, bool inheritable_write, DWORD buffer_size = 16 << 20) {
         SECURITY_ATTRIBUTES attributes{};
         attributes.nLength = sizeof attributes;
         attributes.bInheritHandle = TRUE;
         // Raw video frames are multi-megabyte. The Win32 default pipe buffer
         // is only a few KiB, which turns every frame into thousands of wakeups
         // and context switches between ffmpeg and this process.
-        if (!CreatePipe(&read_end, &write_end, &attributes, 1 << 20)) return false;
+        // We use 16MB by default so an entire 1080p raw RGB48 frame (12.44MB)
+        // can be passed in a single atomic burst without stalling.
+        if (!CreatePipe(&read_end, &write_end, &attributes, buffer_size)) return false;
         // Keep the ends we use ourselves from being inherited by mistake.
         SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, inheritable_read ? HANDLE_FLAG_INHERIT : 0);
         SetHandleInformation(write_end, HANDLE_FLAG_INHERIT, inheritable_write ? HANDLE_FLAG_INHERIT : 0);
@@ -115,6 +122,97 @@ struct Pipe {
     void close() {
         if (read_end) { CloseHandle(read_end); read_end = nullptr; }
         if (write_end) { CloseHandle(write_end); write_end = nullptr; }
+    }
+};
+
+// --------------------------------------------------------------------------
+// Lightweight worker pool for CPU format conversions
+// --------------------------------------------------------------------------
+class WorkerPool {
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queue_mutex;
+    std::condition_variable cv_task;
+    std::condition_variable cv_finished;
+    int active_tasks = 0;
+    bool stop = false;
+
+public:
+    static WorkerPool &instance() {
+        static WorkerPool pool;
+        return pool;
+    }
+
+    WorkerPool() {
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        if (num_threads == 0) num_threads = 4;
+        if (num_threads > 16) num_threads = 16;
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(queue_mutex);
+                        cv_task.wait(lock, [this] { return stop || !tasks.empty(); });
+                        if (stop && tasks.empty()) return;
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+                    task();
+                    {
+                        std::unique_lock<std::mutex> lock(queue_mutex);
+                        if (--active_tasks == 0) {
+                            cv_finished.notify_all();
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    ~WorkerPool() {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            stop = true;
+        }
+        cv_task.notify_all();
+        for (auto &w : workers) {
+            if (w.joinable()) w.join();
+        }
+    }
+
+    size_t thread_count() const {
+        return workers.size();
+    }
+
+    template <typename F>
+    void parallel_for(size_t total_items, F &&func) {
+        if (total_items == 0) return;
+        const size_t n_threads = workers.size();
+        if (n_threads <= 1 || total_items < 16384) {
+            func(0, total_items, 0);
+            return;
+        }
+        const size_t chunk_size = (total_items + n_threads - 1) / n_threads;
+        size_t scheduled = 0;
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            for (size_t t = 0; t < n_threads; ++t) {
+                size_t start = t * chunk_size;
+                if (start >= total_items) break;
+                size_t end = std::min(start + chunk_size, total_items);
+                ++scheduled;
+                tasks.push([start, end, t, &func] {
+                    func(start, end, t);
+                });
+            }
+            active_tasks = (int)scheduled;
+        }
+        cv_task.notify_all();
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            cv_finished.wait(lock, [this] { return active_tasks == 0; });
+        }
     }
 };
 
@@ -243,10 +341,37 @@ bool start_decoder(const std::wstring &input, Pipe &collect, ChildProcess &child
     return true;
 }
 
+bool detect_amf_support(unsigned width, unsigned height) {
+    if (width < 128 || height < 128) return false;
+    static int cached_amf = -1;
+    if (cached_amf != -1) return cached_amf == 1;
+
+    Pipe pipe;
+    if (!pipe.make(false, true, 4096)) {
+        cached_amf = 0;
+        return false;
+    }
+    Pipe empty_feed;
+    ChildProcess child;
+    std::wstring command = tool_cmd(false) + L" -nostdin -v error -f lavfi -i testsrc=duration=0.1:size=320x240:rate=1 -c:v h264_amf -f null -";
+    if (!spawn(command, empty_feed, pipe, child)) {
+        pipe.close();
+        cached_amf = 0;
+        return false;
+    }
+    pipe.close();
+    DWORD code = 1;
+    wait_exit(child.process, 5000, code);
+    child.close();
+    cached_amf = (code == 0) ? 1 : 0;
+    return cached_amf == 1;
+}
+
 // Encoder: audio by copy from the source, video from the raw pipe.
 bool start_encoder(const std::wstring &input, const std::wstring &output,
                    const VideoParams &params, int crf, bool audio, Pipe &feed,
-                   ChildProcess &child, unsigned output_width = 0, unsigned output_height = 0) {
+                   ChildProcess &child, unsigned output_width = 0, unsigned output_height = 0,
+                   const std::string &encoder_choice = "auto") {
     Pipe empty;
     char rate[64];
     if (params.fps > 0.0) {
@@ -264,23 +389,63 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
     }
     if (!output_width) output_width = params.width;
     if (!output_height) output_height = params.height;
-    std::wstring command = tool_cmd(false) + L" -nostdin -v error -y -i \"" + input + L"\" " +
-                           L"-f rawvideo -pix_fmt rgb48le -s " +
-                           std::to_wstring(params.width) + L"x" + std::to_wstring(params.height) +
-                           L" -r " + widen(rate) + L" -i - " +
-                           (audio ? L"-map 0:a? " : L"") +
-                           L"-map 1:v " +
-                           ((output_width != params.width || output_height != params.height) ?
-                            (L"-vf scale=" + std::to_wstring(output_width) + L":" + std::to_wstring(output_height) + L":flags=lanczos ") : L"") +
-                           // Encoding is not part of the neural pass. Use a
-                           // faster x264 preset so the CPU encoder is less
-                           // likely to hold up the GPU/pipe without changing
-                           // the requested CRF.
-                           L"-c:v libx264 -crf " + std::to_wstring(crf) +
-                           L" -preset veryfast -pix_fmt yuv420p " +
-                           (audio ? L"-c:a copy " : L"-an ") +
-                           L"\"" + output + L"\"";
-    if (!spawn(command, feed, empty, child)) return false;
+
+    std::string actual_encoder = encoder_choice;
+    if (actual_encoder == "auto") {
+        if (detect_amf_support(params.width, params.height)) {
+            actual_encoder = "h264_amf";
+        } else {
+            actual_encoder = "x264";
+        }
+    }
+
+    auto get_codec_args = [&](const std::string &enc) -> std::wstring {
+        if (enc == "hevc_amf") {
+            return L"-c:v hevc_amf -rc cqp -qp_i " + std::to_wstring(crf) +
+                   L" -qp_p " + std::to_wstring(crf) +
+                   L" -quality quality -pix_fmt yuv420p ";
+        } else if (enc == "h264_amf" || enc == "amf") {
+            return L"-c:v h264_amf -rc cqp -qp_i " + std::to_wstring(crf) +
+                   L" -qp_p " + std::to_wstring(crf) +
+                   L" -quality quality -pix_fmt yuv420p ";
+        } else {
+            return L"-c:v libx264 -crf " + std::to_wstring(crf) +
+                   L" -preset veryfast -pix_fmt yuv420p ";
+        }
+    };
+
+    auto build_command = [&](const std::wstring &codec_args) -> std::wstring {
+        return tool_cmd(false) + L" -nostdin -v error -y -i \"" + input + L"\" " +
+               L"-f rawvideo -pix_fmt rgb48le -s " +
+               std::to_wstring(params.width) + L"x" + std::to_wstring(params.height) +
+               L" -r " + widen(rate) + L" -i - " +
+               (audio ? L"-map 0:a? " : L"") +
+               L"-map 1:v " +
+               ((output_width != params.width || output_height != params.height) ?
+                (L"-vf scale=" + std::to_wstring(output_width) + L":" + std::to_wstring(output_height) + L":flags=lanczos ") : L"") +
+               codec_args +
+               (audio ? L"-c:a copy " : L"-an ") +
+               L"\"" + output + L"\"";
+    };
+
+    if (actual_encoder == "hevc_amf") {
+        fprintf(stderr, "[encoder] Using AMD AMF HEVC (hardware accelerated, CQP=%d)\n", crf);
+    } else if (actual_encoder == "h264_amf" || actual_encoder == "amf") {
+        fprintf(stderr, "[encoder] Using AMD AMF H.264 (hardware accelerated, CQP=%d)\n", crf);
+    } else {
+        fprintf(stderr, "[encoder] Using CPU libx264 (software, CRF=%d)\n", crf);
+    }
+
+    std::wstring command = build_command(get_codec_args(actual_encoder));
+    if (!spawn(command, feed, empty, child)) {
+        if (actual_encoder != "x264" && encoder_choice == "auto") {
+            fprintf(stderr, "[warn] Failed to start AMF encoder; falling back to CPU libx264\n");
+            actual_encoder = "x264";
+            command = build_command(get_codec_args("x264"));
+            return spawn(command, feed, empty, child);
+        }
+        return false;
+    }
     return true;
 }
 
@@ -299,15 +464,17 @@ void rgb48_to_half_rgba(const unsigned char *rgb48, enhancer::Image &image) {
     uint16_t *dst = image.pixels.data();
     const auto &lut = rgb48_half_lut();
     const size_t count = (size_t)image.width * image.height;
-    for (size_t i = 0; i < count; ++i) {
-        const uint16_t r = src[i * 3 + 0];
-        const uint16_t g = src[i * 3 + 1];
-        const uint16_t b = src[i * 3 + 2];
-        dst[i * 4 + 0] = lut[r];
-        dst[i * 4 + 1] = lut[g];
-        dst[i * 4 + 2] = lut[b];
-        dst[i * 4 + 3] = 0x3C00; // 1.0
-    }
+    WorkerPool::instance().parallel_for(count, [&](size_t start, size_t end, size_t /*tid*/) {
+        for (size_t i = start; i < end; ++i) {
+            const uint16_t r = src[i * 3 + 0];
+            const uint16_t g = src[i * 3 + 1];
+            const uint16_t b = src[i * 3 + 2];
+            dst[i * 4 + 0] = lut[r];
+            dst[i * 4 + 1] = lut[g];
+            dst[i * 4 + 2] = lut[b];
+            dst[i * 4 + 3] = 0x3C00; // 1.0
+        }
+    });
 }
 
 // --------------------------------------------------------------------------
@@ -348,21 +515,46 @@ void half_rgba_to_rgb48(const enhancer::Image &image, unsigned char *rgb48, bool
     uint16_t *dst = (uint16_t *)rgb48;
     const auto &lut = half_to_rgb48_lut();
     const size_t count = (size_t)image.width * image.height;
+
+    struct PartialStat {
+        double sum = 0.0;
+        double sum_sq = 0.0;
+        size_t samples = 0;
+    };
+    const size_t n_threads = WorkerPool::instance().thread_count();
+    std::vector<PartialStat> stats(n_threads);
+
+    WorkerPool::instance().parallel_for(count, [&](size_t start, size_t end, size_t tid) {
+        double l_sum = 0.0;
+        double l_sum_sq = 0.0;
+        size_t l_samples = 0;
+        for (size_t i = start; i < end; ++i) {
+            const uint16_t r = lut[src[i * 4 + 0]];
+            const uint16_t g = lut[src[i * 4 + 1]];
+            const uint16_t b = lut[src[i * 4 + 2]];
+            dst[i * 3 + 0] = r;
+            dst[i * 3 + 1] = g;
+            dst[i * 3 + 2] = b;
+            if ((i & 7u) == 0) {
+                const double luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 65535.0;
+                l_sum += luma;
+                l_sum_sq += luma * luma;
+                ++l_samples;
+            }
+        }
+        if (tid < stats.size()) {
+            stats[tid].sum = l_sum;
+            stats[tid].sum_sq = l_sum_sq;
+            stats[tid].samples = l_samples;
+        }
+    });
+
     double sum = 0.0, sum_sq = 0.0;
     size_t samples = 0;
-    for (size_t i = 0; i < count; ++i) {
-        const uint16_t r = lut[src[i * 4 + 0]];
-        const uint16_t g = lut[src[i * 4 + 1]];
-        const uint16_t b = lut[src[i * 4 + 2]];
-        dst[i * 3 + 0] = r;
-        dst[i * 3 + 1] = g;
-        dst[i * 3 + 2] = b;
-        if ((i & 7u) == 0) {
-            const double luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 65535.0;
-            sum += luma;
-            sum_sq += luma * luma;
-            ++samples;
-        }
+    for (const auto &s : stats) {
+        sum += s.sum;
+        sum_sq += s.sum_sq;
+        samples += s.samples;
     }
     const double mean = samples ? sum / (double)samples : 0.0;
     const double variance = samples ? sum_sq / (double)samples - mean * mean : 0.0;
@@ -372,15 +564,21 @@ void half_rgba_to_rgb48(const enhancer::Image &image, unsigned char *rgb48, bool
 void resize_rgb48(const unsigned char *src, unsigned sw, unsigned sh,
                   unsigned char *dst, unsigned dw, unsigned dh) {
     const uint16_t *in = (const uint16_t *)src; uint16_t *out = (uint16_t *)dst;
-    for (unsigned y=0; y<dh; ++y) {
-        double fy = ((double)y + 0.5) * sh / dh - 0.5; int y0=(int)floor(fy); double ty=fy-y0;
-        if(y0<0){y0=0;ty=0;} if(y0>=(int)sh-1){y0=(int)sh-1;ty=0;} int y1=(y0+1<(int)sh)?y0+1:y0;
-        for (unsigned x=0; x<dw; ++x) {
-            double fx=((double)x+0.5)*sw/dw-0.5; int x0=(int)floor(fx); double tx=fx-x0;
-            if(x0<0){x0=0;tx=0;} if(x0>=(int)sw-1){x0=(int)sw-1;tx=0;} int x1=(x0+1<(int)sw)?x0+1:x0;
-            for(int c=0;c<3;++c){ double a=in[((size_t)y0*sw+x0)*3+c]*(1-tx)+in[((size_t)y0*sw+x1)*3+c]*tx; double b=in[((size_t)y1*sw+x0)*3+c]*(1-tx)+in[((size_t)y1*sw+x1)*3+c]*tx; out[((size_t)y*dw+x)*3+c]=(uint16_t)(a*(1-ty)+b*ty+0.5); }
+    WorkerPool::instance().parallel_for(dh, [&](size_t y_start, size_t y_end, size_t /*tid*/) {
+        for (size_t y = y_start; y < y_end; ++y) {
+            double fy = ((double)y + 0.5) * sh / dh - 0.5; int y0 = (int)floor(fy); double ty = fy - y0;
+            if (y0 < 0) { y0 = 0; ty = 0; } if (y0 >= (int)sh - 1) { y0 = (int)sh - 1; ty = 0; } int y1 = (y0 + 1 < (int)sh) ? y0 + 1 : y0;
+            for (unsigned x = 0; x < dw; ++x) {
+                double fx = ((double)x + 0.5) * sw / dw - 0.5; int x0 = (int)floor(fx); double tx = fx - x0;
+                if (x0 < 0) { x0 = 0; tx = 0; } if (x0 >= (int)sw - 1) { x0 = (int)sw - 1; tx = 0; } int x1 = (x0 + 1 < (int)sw) ? x0 + 1 : x0;
+                for (int c = 0; c < 3; ++c) {
+                    double a = in[((size_t)y0 * sw + x0) * 3 + c] * (1 - tx) + in[((size_t)y0 * sw + x1) * 3 + c] * tx;
+                    double b = in[((size_t)y1 * sw + x0) * 3 + c] * (1 - tx) + in[((size_t)y1 * sw + x1) * 3 + c] * tx;
+                    out[((size_t)y * dw + x) * 3 + c] = (uint16_t)(a * (1 - ty) + b * ty + 0.5);
+                }
+            }
         }
-    }
+    });
 }
 
 // --------------------------------------------------------------------------
@@ -524,6 +722,7 @@ struct Options {
     double upscale = 1.0;
     double model_scale = 1.0; // compatibility; legacy GUI flag is ignored
     std::string dlss_model_preset = "default";
+    std::string encoder = "auto";
 };
 
 void usage() {
@@ -546,7 +745,8 @@ void usage() {
         "  --dlss-model-preset P DLSS model preset: default, J, K, L, M\n"
         "  --intensity F --global-tone F --local-tone F --local-structure F\n"
         "  --skin-structure F --style N --preset N --no-auto-mask\n"
-        "  --crf N               x264 quality (18)\n"
+        "  --crf N               quality / CQP value (18)\n"
+        "  --encoder P           encoder: auto, amf/h264_amf, hevc_amf, x264 (auto default)\n"
         "  --fps N               override output frame rate\n"
         "  --no-audio            don't copy the source audio\n"
         "  --max-frames N        stop after N frames\n"
@@ -636,6 +836,9 @@ bool parse_args(int argc, char **argv, Options &options) {
         } else if (arg == "--crf") {
             const char *v = need("--crf"); if (!v) return false;
             options.crf = atoi(v);
+        } else if (arg == "--encoder") {
+            const char *v = need("--encoder"); if (!v) return false;
+            options.encoder = v;
         } else if (arg == "--fps") {
             const char *v = need("--fps"); if (!v) return false;
             options.fps_override = atof(v);
@@ -1308,7 +1511,7 @@ static int run_main_once(int argc, char **argv) {
     if (!encoder_stdin.make(true, false)) { fprintf(stderr, "[FAIL] pipe\n"); return 1; }
     ChildProcess encoder;
     if (!start_encoder(options.input, options.output, params, options.crf, options.audio,
-                       encoder_stdin, encoder, output_w, output_h)) {
+                       encoder_stdin, encoder, output_w, output_h, options.encoder)) {
         fprintf(stderr, "[FAIL] encoder could not be started (invalid output path or ffmpeg)\n");
         encoder_stdin.close();
         return 1;
@@ -1605,6 +1808,11 @@ static int run_main_once(int argc, char **argv) {
 // (default 3, i.e. up to 4 attempts in total).
 // ---------------------------------------------------------------------------
 int main(int argc, char **argv) {
+    if (argc < 2 || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
+        usage();
+        return 0;
+    }
+
     // Internal modes never retry: --compile-one and --precompile belong to
     // the translation machinery and have no image pipeline to go black.
     if (argc >= 2 && (!strcmp(argv[1], "--compile-one") || !strcmp(argv[1], "--precompile")))
