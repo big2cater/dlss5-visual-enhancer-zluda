@@ -1420,8 +1420,10 @@ bool evaluate(const FrameDesc &frame, bool copy_output) {
     // And back into the game's output.
     g.allocator->Reset();
     g.cmd->Reset(g.allocator, nullptr);
+    transition(frame.output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     transition(g.output.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     g.cmd->CopyResource(frame.output, g.output.resource);
+    transition(frame.output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     transition(g.output.resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     g.cmd->Close();
     ID3D12CommandList *back[] = {g.cmd};

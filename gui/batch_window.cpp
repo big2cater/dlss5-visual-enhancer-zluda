@@ -636,12 +636,14 @@ QStringList BatchWindow::arguments() const {
         args << QStringLiteral("--image") << frame_hold_in_ << frame_hold_out_
              << snippet_->text() << driver_->text() << runtime_->text() << nvapi_->text();
         args << QStringLiteral("--passes") << QString::number(image_passes_->value());
+        args << QStringLiteral("--retries") << QStringLiteral("3");
     } else if (image) {
         args << QStringLiteral("--image") << input_->text() << out_file
              << snippet_->text() << driver_->text() << runtime_->text() << nvapi_->text();
         // A still has no neighbours to disagree with, so repeating the
         // evaluation only deepens the blend -- which is what makes it settle.
         args << QStringLiteral("--passes") << QString::number(image_passes_->value());
+        args << QStringLiteral("--retries") << QStringLiteral("3");
     } else {
         args << input_->text() << out_file << snippet_->text() << driver_->text()
              << runtime_->text() << nvapi_->text();

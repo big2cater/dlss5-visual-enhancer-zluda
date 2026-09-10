@@ -1458,6 +1458,10 @@ int run_image_mode(int argc, char **argv) {
         fprintf(stderr, "[FAIL] process: %s\n", error.c_str());
         processor.stop();
         wic->Release();
+        if (error.find("blank image") != std::string::npos) {
+            fprintf(stderr, "[warn] 单帧输出空白（ZLUDA 概率竞态），交由外层重跑\n");
+            return 2;
+        }
         return 1;
     }
     const bool blank = output_is_blank(out);
