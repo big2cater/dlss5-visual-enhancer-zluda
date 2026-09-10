@@ -1223,12 +1223,12 @@ struct GpuFlow {
             rel(adapter);
         }
         if (!device) { fprintf(stderr, "[flow] no D3D12 device\n"); rel(adapter); factory->Release(); return false; }
-        D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         if ((!queue && FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)))) ||
-            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&allocator))) ||
-            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator, nullptr, IID_PPV_ARGS(&cmd))) ||
+            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&cmd))) ||
             FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
-            fprintf(stderr, "[flow] failed to create D3D12 compute objects (queue=%p)\n", (void*)queue);
+            fprintf(stderr, "[flow] failed to create D3D12 objects (queue=%p)\n", (void*)queue);
             rel(adapter); factory->Release(); stop(); return false;
         }
         cmd->Close(); fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -1285,12 +1285,18 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
         if(!ready || cur_luma.size()!=(size_t)qw*qh) return false;
         if(!has_prev) { prev_luma=cur_luma; has_prev=true; flow.assign((size_t)qw*qh*2,0); return true; }
         unsigned *p=nullptr; D3D12_RANGE z{0,0}; prev->Map(0,&z,(void**)&p); memcpy(p,prev_luma.data(),prev_luma.size()*4); prev->Unmap(0,nullptr); cur->Map(0,&z,(void**)&p); memcpy(p,cur_luma.data(),cur_luma.size()*4); cur->Unmap(0,nullptr);
-        unsigned *c=nullptr; cb->Map(0,&z,(void**)&c); c[0]=qw;c[1]=qh;c[2]=fw;c[3]=fh;cb->Unmap(0,nullptr);
+        const uint32_t constants[4] = {qw, qh, fw, fh};
         auto cpu=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV); auto base=heap->GetCPUDescriptorHandleForHeapStart();
-        D3D12_SHADER_RESOURCE_VIEW_DESC sv{}; sv.ViewDimension=D3D12_SRV_DIMENSION_BUFFER; sv.Format=DXGI_FORMAT_UNKNOWN; sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Buffer.NumElements=qw*qh; sv.Buffer.StructureByteStride=4; device->CreateShaderResourceView(prev,&sv,{base.ptr}); device->CreateShaderResourceView(cur,&sv,{base.ptr+cpu}); D3D12_SHADER_RESOURCE_VIEW_DESC hv=sv; hv.Buffer.NumElements=fw*fh; device->CreateShaderResourceView(history,&hv,{base.ptr+cpu*2});
-        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{}; uv.ViewDimension=D3D12_UAV_DIMENSION_BUFFER; uv.Format=DXGI_FORMAT_UNKNOWN; uv.Buffer.NumElements=qw*qh; uv.Buffer.StructureByteStride=8; device->CreateUnorderedAccessView(out,nullptr,&uv,{base.ptr+cpu*2});
-        D3D12_UNORDERED_ACCESS_VIEW_DESC fv{}; fv.ViewDimension=D3D12_UAV_DIMENSION_BUFFER; fv.Format=DXGI_FORMAT_UNKNOWN; fv.Buffer.NumElements=fw*fh; fv.Buffer.StructureByteStride=4; device->CreateUnorderedAccessView(full_out,nullptr,&fv,{base.ptr+cpu*3});
-        allocator->Reset(); cmd->Reset(allocator,pso); ID3D12DescriptorHeap *hs[]={heap}; cmd->SetDescriptorHeaps(1,hs); cmd->SetComputeRootSignature(root); cmd->SetComputeRoot32BitConstants(0,4,c,0); auto gpu=heap->GetGPUDescriptorHandleForHeapStart(); cmd->SetComputeRootDescriptorTable(1,gpu); cmd->SetComputeRootDescriptorTable(2,{gpu.ptr+cpu*2}); cmd->Dispatch((qw+7)/8,(qh+7)/8,1); D3D12_RESOURCE_BARRIER b[3]{}; b[0].Type=D3D12_RESOURCE_BARRIER_TYPE_UAV; b[0].UAV.pResource=out; b[1].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[1].Transition.pResource=out; b[1].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[1].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[1].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b[2].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[2].Transition.pResource=full_out; b[2].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[2].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[2].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; cmd->ResourceBarrier(3,b); cmd->CopyResource(readback,out); cmd->Close(); ID3D12CommandList *ls[]={cmd}; queue->ExecuteCommandLists(1,ls); queue->Signal(fence,++fence_value); if(fence->GetCompletedValue()<fence_value){fence->SetEventOnCompletion(fence_value,fence_event);WaitForSingleObject(fence_event,5000);}
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{}; sv.ViewDimension=D3D12_SRV_DIMENSION_BUFFER; sv.Format=DXGI_FORMAT_UNKNOWN; sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Buffer.NumElements=qw*qh; sv.Buffer.StructureByteStride=4;
+        device->CreateShaderResourceView(prev,&sv,{base.ptr});
+        device->CreateShaderResourceView(cur,&sv,{base.ptr+cpu});
+        D3D12_SHADER_RESOURCE_VIEW_DESC hv=sv; hv.Buffer.NumElements=fw*fh;
+        device->CreateShaderResourceView(history,&hv,{base.ptr+cpu*2});
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{}; uv.ViewDimension=D3D12_UAV_DIMENSION_BUFFER; uv.Format=DXGI_FORMAT_UNKNOWN; uv.Buffer.NumElements=qw*qh; uv.Buffer.StructureByteStride=8;
+        device->CreateUnorderedAccessView(out,nullptr,&uv,{base.ptr+cpu*3});
+        D3D12_UNORDERED_ACCESS_VIEW_DESC fv{}; fv.ViewDimension=D3D12_UAV_DIMENSION_BUFFER; fv.Format=DXGI_FORMAT_UNKNOWN; fv.Buffer.NumElements=fw*fh; fv.Buffer.StructureByteStride=4;
+        device->CreateUnorderedAccessView(full_out,nullptr,&fv,{base.ptr+cpu*4});
+        allocator->Reset(); cmd->Reset(allocator,pso); ID3D12DescriptorHeap *hs[]={heap}; cmd->SetDescriptorHeaps(1,hs); cmd->SetComputeRootSignature(root); cmd->SetComputeRoot32BitConstants(0,4,constants,0); auto gpu=heap->GetGPUDescriptorHandleForHeapStart(); cmd->SetComputeRootDescriptorTable(1,gpu); cmd->SetComputeRootDescriptorTable(2,{gpu.ptr+cpu*3}); cmd->Dispatch((qw+7)/8,(qh+7)/8,1); D3D12_RESOURCE_BARRIER b[3]{}; b[0].Type=D3D12_RESOURCE_BARRIER_TYPE_UAV; b[0].UAV.pResource=out; b[1].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[1].Transition.pResource=out; b[1].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[1].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[1].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b[2].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[2].Transition.pResource=full_out; b[2].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[2].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[2].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; cmd->ResourceBarrier(3,b); cmd->CopyResource(readback,out); cmd->Close(); ID3D12CommandList *ls[]={cmd}; queue->ExecuteCommandLists(1,ls); queue->Signal(fence,++fence_value); if(fence->GetCompletedValue()<fence_value){fence->SetEventOnCompletion(fence_value,fence_event);WaitForSingleObject(fence_event,5000);}
         allocator->Reset(); cmd->Reset(allocator,nullptr);
         D3D12_RESOURCE_BARRIER hb[3]{};
         hb[0].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

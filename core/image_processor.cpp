@@ -472,7 +472,14 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     } else {
         unsigned char *mapped = nullptr;
         D3D12_RANGE nothing{0, 0};
-        s->upload->Map(0, &nothing, (void **)&mapped);
+        HRESULT hr = s->upload->Map(0, &nothing, (void **)&mapped);
+        if (FAILED(hr) || !mapped) {
+            HRESULT reason = s->device ? s->device->GetDeviceRemovedReason() : E_FAIL;
+            char buf[128];
+            snprintf(buf, sizeof(buf), "staging upload Map failed (hr=0x%08X, reason=0x%08X)", (unsigned)hr, (unsigned)reason);
+            error = buf;
+            return false;
+        }
         const unsigned char *source = (const unsigned char *)in.pixels.data();
         if (padded == row_bytes) {
             // Most video widths produce a naturally aligned row.  Copy the
@@ -487,24 +494,24 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     }
 
     if (!direct_upload) {
-    D3D12_TEXTURE_COPY_LOCATION into{};
-    into.pResource = s->colour;
-    into.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    D3D12_TEXTURE_COPY_LOCATION from{};
-    from.pResource = s->upload;
-    from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    from.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    from.PlacedFootprint.Footprint.Width = in.width;
-    from.PlacedFootprint.Footprint.Height = in.height;
-    from.PlacedFootprint.Footprint.Depth = 1;
-    from.PlacedFootprint.Footprint.RowPitch = padded;
+        D3D12_TEXTURE_COPY_LOCATION into{};
+        into.pResource = s->colour;
+        into.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION from{};
+        from.pResource = s->upload;
+        from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        from.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        from.PlacedFootprint.Footprint.Width = in.width;
+        from.PlacedFootprint.Footprint.Height = in.height;
+        from.PlacedFootprint.Footprint.Depth = 1;
+        from.PlacedFootprint.Footprint.RowPitch = padded;
 
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = s->colour;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = s->colour;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
         s->allocator->Reset();
         s->cmd->Reset(s->allocator, nullptr);
