@@ -310,6 +310,15 @@ QWidget *BatchWindow::build_right_column() {
     max_frames_ = new QLineEdit(QStringLiteral("0"));
     form->addRow(tr("最大帧数(0=全)"), max_frames_);
 
+    model_scale_ = new QComboBox;
+    model_scale_->addItems({tr("100% (原画质量 - 最清晰)"),
+                            tr("75% (画质平衡 - 提速约1.8x)"),
+                            tr("50% (极速性能 - 提速约3x)")});
+    model_scale_->setCurrentIndex(0);
+    model_scale_->setToolTip(
+        tr("内部模型渲染比例：降低送入 DLSS 5 模型的内部渲染分辨率以极大地提高处理速度，再通过 Lanczos 放大至输出分辨率。"));
+    form->addRow(tr("模型渲染比例"), model_scale_);
+
     upscale_ = new QComboBox;
     upscale_->addItems({tr("DLAA / native (1x)"), tr("Quality (1.5x)"), tr("Balanced (1.724x)"),
                         tr("Performance (2x)"), tr("Ultra Performance (3x)")});
@@ -444,6 +453,7 @@ void BatchWindow::load_settings() {
     fps_->setText(settings.value(QStringLiteral("fps"), QStringLiteral("0")).toString());
     max_frames_->setText(
         settings.value(QStringLiteral("maxFrames"), QStringLiteral("0")).toString());
+    model_scale_->setCurrentIndex(settings.value(QStringLiteral("modelScale"), 0).toInt());
     upscale_->setCurrentIndex(settings.value(QStringLiteral("upscale"), 0).toInt());
     dump_->setChecked(settings.value(QStringLiteral("dump"), false).toBool());
     flow_->setChecked(settings.value(QStringLiteral("flow"), false).toBool());
@@ -482,6 +492,7 @@ void BatchWindow::save_settings() const {
     settings.setValue(QStringLiteral("crf"), crf_->value());
     settings.setValue(QStringLiteral("fps"), fps_->text());
     settings.setValue(QStringLiteral("maxFrames"), max_frames_->text());
+    settings.setValue(QStringLiteral("modelScale"), model_scale_->currentIndex());
     settings.setValue(QStringLiteral("upscale"), upscale_->currentIndex());
     settings.setValue(QStringLiteral("dump"), dump_->isChecked());
     settings.setValue(QStringLiteral("flow"), flow_->isChecked());
@@ -549,6 +560,7 @@ void BatchWindow::reset_effects() {
     style_->setCurrentIndex(0);
     preset_->setCurrentIndex(0);
     model_->setCurrentIndex(0);
+    model_scale_->setCurrentIndex(0);
     upscale_->setCurrentIndex(0);
     auto_mask_->setChecked(true);
     gamma_->setValue(1.0);
@@ -632,6 +644,10 @@ QStringList BatchWindow::arguments() const {
         if (!audio_->isChecked()) args << QStringLiteral("--no-audio");
         if (dump_->isChecked() && !dump_dir_->text().trimmed().isEmpty())
             args << QStringLiteral("--dump-frames") << dump_dir_->text().trimmed();
+
+        static const double model_scales[] = {1.0, 0.75, 0.50};
+        if (model_scale_->currentIndex() > 0 && model_scale_->currentIndex() < 3)
+            args << QStringLiteral("--model-scale") << number(model_scales[model_scale_->currentIndex()]);
 
         static const char *upscale_modes[] = {"native", "quality", "balanced", "performance", "ultra"};
         if (upscale_->currentIndex() > 0 && upscale_->currentIndex() < 5)

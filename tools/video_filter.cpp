@@ -405,10 +405,15 @@ bool probe_video(const std::wstring &input, VideoParams &params, std::string &er
 }
 
 // Decoder: ffmpeg -i in -an -f rawvideo -pix_fmt rgb48le -
-bool start_decoder(const std::wstring &input, Pipe &collect, ChildProcess &child) {
+bool start_decoder(const std::wstring &input, Pipe &collect, ChildProcess &child,
+                   unsigned decode_w = 0, unsigned decode_h = 0) {
     Pipe empty;
+    std::wstring scale_filter;
+    if (decode_w > 0 && decode_h > 0) {
+        scale_filter = L"-vf scale=" + std::to_wstring(decode_w) + L":" + std::to_wstring(decode_h) + L":flags=bicubic ";
+    }
     std::wstring command = tool_cmd(false) + L" -nostdin -v error -i \"" + input +
-                           L"\" -an -f rawvideo -pix_fmt rgb48le -";
+                           L"\" -an " + scale_filter + L"-f rawvideo -pix_fmt rgb48le -";
     if (!spawn(command, empty, collect, child)) return false;
     return true;
 }
@@ -442,7 +447,8 @@ bool detect_amf_support(unsigned width, unsigned height) {
 // Encoder: audio by copy from the source, video from the raw pipe.
 bool start_encoder(const std::wstring &input, const std::wstring &output,
                    const VideoParams &params, int crf, bool audio, Pipe &feed,
-                   ChildProcess &child, unsigned output_width = 0, unsigned output_height = 0,
+                   ChildProcess &child, unsigned input_width = 0, unsigned input_height = 0,
+                   unsigned output_width = 0, unsigned output_height = 0,
                    const std::string &encoder_choice = "auto") {
     Pipe empty;
     char rate[64];
@@ -459,8 +465,10 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
     } else {
         strcpy(rate, "30");
     }
-    if (!output_width) output_width = params.width;
-    if (!output_height) output_height = params.height;
+    if (!input_width) input_width = params.width;
+    if (!input_height) input_height = params.height;
+    if (!output_width) output_width = input_width;
+    if (!output_height) output_height = input_height;
 
     std::string actual_encoder = encoder_choice;
     if (actual_encoder == "auto") {
@@ -489,11 +497,11 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
     auto build_command = [&](const std::wstring &codec_args) -> std::wstring {
         return tool_cmd(false) + L" -nostdin -v error -y -i \"" + input + L"\" " +
                L"-f rawvideo -pix_fmt rgb48le -s " +
-               std::to_wstring(params.width) + L"x" + std::to_wstring(params.height) +
+               std::to_wstring(input_width) + L"x" + std::to_wstring(input_height) +
                L" -r " + widen(rate) + L" -i - " +
                (audio ? L"-map 0:a? " : L"") +
                L"-map 1:v " +
-               ((output_width != params.width || output_height != params.height) ?
+               ((output_width != input_width || output_height != input_height) ?
                 (L"-vf scale=" + std::to_wstring(output_width) + L":" + std::to_wstring(output_height) + L":flags=lanczos ") : L"") +
                codec_args +
                (audio ? L"-c:a copy " : L"-an ") +
@@ -814,6 +822,7 @@ void usage() {
         "  --gamma F             output gamma, linear->sRGB (2.2 default, 1 = off)\n"
         "  --flow 0|1           motion-vector guidance for video (0 default; 1 = on)\n"
         "  --upscale-mode P     native, quality, balanced, performance, ultra\n"
+        "  --model-scale F      internal DLSS render scale, 0.25..1.0 (1.0 default)\n"
         "  --dlss-model-preset P DLSS model preset: default, J, K, L, M\n"
         "  --intensity F --global-tone F --local-tone F --local-structure F\n"
         "  --skin-structure F --style N --preset N --no-auto-mask\n"
@@ -871,7 +880,10 @@ bool parse_args(int argc, char **argv, Options &options) {
             else if (!_stricmp(v, "ultra")) options.upscale = 3.0;
             else options.upscale = 1.0;
         } else if (arg == "--model-scale") {
-            need("--model-scale"); // legacy option; internal model scaling is removed
+            const char *v = need("--model-scale"); if (!v) return false;
+            options.model_scale = atof(v);
+            if (options.model_scale < 0.25) options.model_scale = 0.25;
+            if (options.model_scale > 1.0) options.model_scale = 1.0;
         } else if (arg == "--dlss-model-preset") {
             const char *v = need("--dlss-model-preset"); if (!v) return false;
             options.dlss_model_preset = v;
@@ -1515,12 +1527,20 @@ static int run_main_once(int argc, char **argv) {
     }
     if (options.fps_override > 0.0) params.fps = options.fps_override;
     fprintf(stderr, "[info] %ux%u %.3f fps\n", params.width, params.height, params.fps);
-    const unsigned model_w = params.width;
-    const unsigned model_h = params.height;
+    unsigned model_w = params.width;
+    unsigned model_h = params.height;
+    if (options.model_scale > 0.0 && options.model_scale < 1.0) {
+        model_w = (unsigned)std::lround(params.width * options.model_scale);
+        model_h = (unsigned)std::lround(params.height * options.model_scale);
+        model_w = (std::max)(64u, model_w & ~1u);
+        model_h = (std::max)(64u, model_h & ~1u);
+    }
     unsigned output_w = (std::max)(2u, (unsigned)std::lround(params.width * options.upscale));
     unsigned output_h = (std::max)(2u, (unsigned)std::lround(params.height * options.upscale));
     output_w &= ~1u;
     output_h &= ~1u;
+    if (options.model_scale != 1.0)
+        fprintf(stderr, "[model-scale] ratio=%.2f model_res=%ux%u\n", options.model_scale, model_w, model_h);
     if (options.upscale != 1.0)
         fprintf(stderr, "[upscale] ratio=%.3f output=%ux%u\n", options.upscale, output_w, output_h);
 
@@ -1530,7 +1550,10 @@ static int run_main_once(int argc, char **argv) {
     Pipe decoder_stdout;
     if (!decoder_stdout.make(false, true)) { fprintf(stderr, "[FAIL] pipe\n"); return 1; }
     ChildProcess decoder;
-    if (!start_decoder(options.input, decoder_stdout, decoder)) {
+    const bool need_decode_scale = (model_w != params.width || model_h != params.height);
+    if (!start_decoder(options.input, decoder_stdout, decoder,
+                       need_decode_scale ? model_w : 0,
+                       need_decode_scale ? model_h : 0)) {
         fprintf(stderr, "[FAIL] decoder: %s\n", error.c_str());
         decoder_stdout.close();
         return 1;
@@ -1544,7 +1567,7 @@ static int run_main_once(int argc, char **argv) {
             if (!strcmp(argv[i], "--flow-only")) flow_only = true;
         if (flow_only) {
             CpuFlow fg;
-            const size_t fbytes = (size_t)params.width * params.height * 6;
+            const size_t fbytes = (size_t)model_w * model_h * 6;
             std::vector<unsigned char> frame(fbytes);
             std::vector<uint16_t> mv;
             unsigned fi = 0;
@@ -1558,7 +1581,7 @@ static int run_main_once(int argc, char **argv) {
                     got += chunk;
                 }
                 if (got != fbytes) break;
-                fg.compute(frame.data(), params.width, params.height, fi == 0, mv);
+                fg.compute(frame.data(), model_w, model_h, fi == 0, mv);
                 double sum = 0.0;
                 float mx = 0.0f;
                 size_t nz = 0;
@@ -1589,7 +1612,7 @@ static int run_main_once(int argc, char **argv) {
     if (!encoder_stdin.make(true, false)) { fprintf(stderr, "[FAIL] pipe\n"); return 1; }
     ChildProcess encoder;
     if (!start_encoder(options.input, options.output, params, options.crf, options.audio,
-                       encoder_stdin, encoder, output_w, output_h, options.encoder)) {
+                       encoder_stdin, encoder, model_w, model_h, output_w, output_h, options.encoder)) {
         fprintf(stderr, "[FAIL] encoder could not be started (invalid output path or ffmpeg)\n");
         encoder_stdin.close();
         return 1;
@@ -1633,7 +1656,7 @@ static int run_main_once(int argc, char **argv) {
 
     // --- the frame loop ---------------------------------------------------
     SceneDetector detector;
-    detector.configure(params.width, params.height, options.cut_threshold);
+    detector.configure(model_w, model_h, options.cut_threshold);
     CpuFlow flowgen; // motion-vector estimator for temporal guidance
     GpuFlow gpuflow; // D3D12 compute estimator; CPU remains the fallback
     bool gpu_flow_ready = false;
@@ -1647,17 +1670,17 @@ static int run_main_once(int argc, char **argv) {
         // Keep the flow queue independent from the DLSS queue. Sharing the
         // queue reuses command execution state owned by the processor and can
         // corrupt the second frame on ZLUDA when both allocators are reset.
-        gpu_flow_ready = gpuflow.init(params.width, params.height,
+        gpu_flow_ready = gpuflow.init(model_w, model_h,
                                       processor.native_device(), nullptr);
         fprintf(stderr, "[flow] %s\n", gpu_flow_ready ?
                 "D3D12 GPU motion guide enabled (quarter-resolution compute)" :
                 "D3D12 GPU motion guide unavailable; using CPU fallback");
     }
 
-    const size_t frame_bytes = (size_t)params.width * params.height * 6;
+    const size_t frame_bytes = (size_t)model_w * model_h * 6;
     enhancer::Settings settings = options.settings;
-    settings.output_width = params.width;
-    settings.output_height = params.height;
+    settings.output_width = model_w;
+    settings.output_height = model_h;
 
     std::vector<unsigned> flow_luma;
     std::vector<short> qflow;
@@ -1683,9 +1706,9 @@ static int run_main_once(int argc, char **argv) {
         free_input_pool.push(in_f);
 
         auto out_f = std::make_shared<OutputFrame>();
-        out_f->out.width = params.width;
-        out_f->out.height = params.height;
-        out_f->out.pixels.resize((size_t)params.width * params.height * 4);
+        out_f->out.width = model_w;
+        out_f->out.height = model_h;
+        out_f->out.pixels.resize((size_t)model_w * model_h * 4);
         out_f->model_output.resize(frame_bytes);
         free_output_pool.push(out_f);
     }
@@ -1744,7 +1767,7 @@ static int run_main_once(int argc, char **argv) {
                 case ResetMode::Always: reset = true; break;
                 case ResetMode::Never: reset = (dec_index == 0); break;
                 case ResetMode::Every: reset = (dec_index % options.reset_every) == 0; break;
-                case ResetMode::Auto: reset = detector.consider(frame->raw_bytes.data(), params.width, params.height); break;
+                case ResetMode::Auto: reset = detector.consider(frame->raw_bytes.data(), model_w, model_h); break;
             }
             frame->reset = reset;
 

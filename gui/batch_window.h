@@ -119,6 +119,7 @@ private:
     QSpinBox *crf_ = nullptr;
     QLineEdit *fps_ = nullptr;
     QLineEdit *max_frames_ = nullptr;
+    QComboBox *model_scale_ = nullptr;
     QComboBox *upscale_ = nullptr;
     QCheckBox *dump_ = nullptr;
     QLineEdit *dump_dir_ = nullptr;
