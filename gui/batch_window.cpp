@@ -207,17 +207,19 @@ QWidget *BatchWindow::build_left_column() {
     form->addRow(tr("全局色调"), slider_row(100, 0, global_tone_, global_tone_value_));
     form->addRow(tr("局部色调"), slider_row(200, 100, local_tone_, local_tone_value_));
     form->addRow(tr("局部结构"), slider_row(200, 100, local_structure_, local_structure_value_));
-    form->addRow(tr("皮肤结构"), slider_row(100, 0, skin_structure_, skin_structure_value_));
+    form->addRow(tr("皮肤结构 (防塑料感)"), slider_row(100, 0, skin_structure_, skin_structure_value_));
+    skin_structure_->setToolTip(
+        tr("人脸/皮肤纹理防过度平滑保护：调高此项可在强力降噪的同时保护人像面部微毛孔与天然皮肤质感，避免塑料脸或假面感。"));
 
     style_ = new QComboBox;
     style_->addItems({tr("0 - 默认"), tr("1 - 自然"), tr("2 - 电影")});
     form->addRow(tr("风格"), style_);
 
     preset_ = new QComboBox;
-    preset_->addItems({tr("0 - 自动"), tr("1 - Preset #1"), tr("2 - Preset #2"),
-                       tr("3 - Preset #3")});
+    preset_->addItems({tr("0 - 自动 (内置 Preset 1)"), tr("1 - Preset #1 (内置核心权重)"),
+                       tr("2 - Preset #2 (回退至 Preset 1)"), tr("3 - Preset #3 (回退至 Preset 1)")});
     preset_->setToolTip(
-        tr("选择 DLSS 神经渲染模型预设。0 为自动选择；具体预设是否存在由网络 DLL 决定。"));
+        tr("DLSS 神经渲染模型预设。注意：当前官方 nvngx_dlssnr.dll (v310.8) 内部仅打包内置了 Preset 1 单套神经网络权重，其余预设底层均自动回退至 Preset 1。"));
     form->addRow(tr("DLSS模型预设"), preset_);
 
     model_ = new QComboBox;
@@ -293,11 +295,13 @@ QWidget *BatchWindow::build_right_column() {
     form->addRow(tr("切场阈值"), cut_);
 
     passes_ = new QSpinBox;
-    passes_->setRange(1, 8);
+    passes_->setRange(1, 2);
     passes_->setValue(1);
     passes_->setToolTip(
-        tr("每帧跑几次网络。2 以上会把效果叠加、同时放大帧间差异，视频会闪；保持 1。"));
-    form->addRow(tr("帧pass次数"), passes_);
+        tr("每帧降噪轮数 (Multipass)：\n"
+           "· 1: 标准单轮降噪 (默认推荐，速度最快，画质平衡)\n"
+           "· 2: 深度迭代降噪 (双引擎独立时序级联，针对高 ISO/强噪点与颗粒感，两轮净化且完全防闪烁)"));
+    form->addRow(tr("降噪轮数(Multipass)"), passes_);
 
     crf_ = new QSpinBox;
     crf_->setRange(0, 40);
@@ -395,6 +399,8 @@ QWidget *BatchWindow::build_run() {
     start_button_ = new QPushButton(tr("开始"));
     preview_button_ = new QPushButton(tr("预览 3 秒"));
     preview_button_->setToolTip(tr("仅处理前 3 秒视频快速验证效果，完成后自动打开对比窗口。"));
+    frame_hold_button_ = new QPushButton(tr("单帧定帧对比"));
+    frame_hold_button_->setToolTip(tr("瞬间提取参考帧并以当前参数增强（约0.1秒），立即打开分屏对比，调参极速反馈！"));
     stop_button_ = new QPushButton(tr("停止"));
     compare_button_ = new QPushButton(tr("对比结果"));
     stop_button_->setEnabled(false);
@@ -408,6 +414,7 @@ QWidget *BatchWindow::build_run() {
 
     layout->addWidget(start_button_);
     layout->addWidget(preview_button_);
+    layout->addWidget(frame_hold_button_);
     layout->addWidget(stop_button_);
     layout->addWidget(compare_button_);
     layout->addWidget(progress_, 1);
@@ -415,6 +422,7 @@ QWidget *BatchWindow::build_run() {
 
     connect(start_button_, &QPushButton::clicked, this, &BatchWindow::start_run);
     connect(preview_button_, &QPushButton::clicked, this, &BatchWindow::start_preview);
+    connect(frame_hold_button_, &QPushButton::clicked, this, &BatchWindow::start_frame_hold_compare);
     connect(stop_button_, &QPushButton::clicked, this, &BatchWindow::stop_run);
     connect(compare_button_, &QPushButton::clicked, this, &BatchWindow::open_compare);
 
@@ -624,7 +632,11 @@ QStringList BatchWindow::arguments() const {
     const bool image = image_mode_->isChecked();
     const QString out_file = (is_preview_ && !preview_output_path_.isEmpty()) ? preview_output_path_ : output_->text();
 
-    if (image) {
+    if (is_frame_hold_) {
+        args << QStringLiteral("--image") << frame_hold_in_ << frame_hold_out_
+             << snippet_->text() << driver_->text() << runtime_->text() << nvapi_->text();
+        args << QStringLiteral("--passes") << QString::number(image_passes_->value());
+    } else if (image) {
         args << QStringLiteral("--image") << input_->text() << out_file
              << snippet_->text() << driver_->text() << runtime_->text() << nvapi_->text();
         // A still has no neighbours to disagree with, so repeating the
@@ -735,6 +747,7 @@ void BatchWindow::start_run() {
     running_ = true;
     start_button_->setEnabled(false);
     if (preview_button_) preview_button_->setEnabled(false);
+    if (frame_hold_button_) frame_hold_button_->setEnabled(false);
     stop_button_->setEnabled(true);
     timer_->start();
     log_line(tr(">>> 开始%1处理").arg(image_mode_->isChecked() ? tr("图片") : tr("视频")),
@@ -817,16 +830,88 @@ void BatchWindow::start_preview() {
     running_ = true;
     start_button_->setEnabled(false);
     if (preview_button_) preview_button_->setEnabled(false);
+    if (frame_hold_button_) frame_hold_button_->setEnabled(false);
     stop_button_->setEnabled(true);
     timer_->start();
     log_line(tr(">>> 开始 3 秒快速预览（共 %1 帧）-> %2").arg(frames_total_).arg(preview_output_path_),
              QColor(135, 206, 250));
 }
 
+void BatchWindow::start_frame_hold_compare() {
+    QString problem;
+    if (!validate(&problem)) {
+        log_line(problem, QColor(255, 90, 60));
+        return;
+    }
+    save_settings();
+
+    const QString exe = application_dir() + QStringLiteral("/video_filter.exe");
+    if (!QFileInfo::exists(exe)) {
+        log_line(tr("找不到 video_filter.exe：%1").arg(exe), QColor(255, 90, 60));
+        return;
+    }
+
+    const QString source = input_->text().trimmed();
+    frame_hold_out_ = application_dir() + QStringLiteral("/frame_hold_out.png");
+
+    if (image_mode_->isChecked() || is_image(source)) {
+        frame_hold_in_ = source;
+    } else {
+        frame_hold_in_ = application_dir() + QStringLiteral("/frame_hold_in.png");
+        log_line(tr(">>> 正在从视频截取单帧..."), QColor(135, 206, 250));
+        QProcess extract;
+        extract.start(QStringLiteral("ffmpeg"),
+                      {QStringLiteral("-y"), QStringLiteral("-ss"), QStringLiteral("00:00:01"),
+                       QStringLiteral("-i"), source,
+                       QStringLiteral("-frames:v"), QStringLiteral("1"),
+                       frame_hold_in_});
+        if (!extract.waitForFinished(5000) || !QFileInfo::exists(frame_hold_in_)) {
+            extract.start(QStringLiteral("ffmpeg"),
+                          {QStringLiteral("-y"), QStringLiteral("-i"), source,
+                           QStringLiteral("-frames:v"), QStringLiteral("1"),
+                           frame_hold_in_});
+            if (!extract.waitForFinished(5000) || !QFileInfo::exists(frame_hold_in_)) {
+                log_line(tr("从视频截取单帧失败，请检查视频文件与 ffmpeg。"), QColor(255, 90, 60));
+                return;
+            }
+        }
+    }
+
+    frames_done_ = 0;
+    frames_total_ = 1;
+    seconds_ = 0;
+    error_buffer_.clear();
+    progress_->setValue(0);
+    status_->setText(tr("单帧画质增强中…"));
+
+    is_preview_ = false;
+    is_frame_hold_ = true;
+
+    process_.setProgram(exe);
+    process_.setArguments(arguments());
+    process_.setWorkingDirectory(application_dir());
+    process_.start();
+
+    if (!process_.waitForStarted(5000)) {
+        log_line(tr("启动失败：%1").arg(process_.errorString()), QColor(255, 90, 60));
+        is_frame_hold_ = false;
+        return;
+    }
+
+    running_ = true;
+    start_button_->setEnabled(false);
+    if (preview_button_) preview_button_->setEnabled(false);
+    if (frame_hold_button_) frame_hold_button_->setEnabled(false);
+    stop_button_->setEnabled(true);
+    timer_->start();
+    log_line(tr(">>> 开始单帧定帧降噪增强 -> 准备对比"), QColor(135, 206, 250));
+}
+
 void BatchWindow::stop_run() {
     if (!running_) return;
     process_.kill();
     is_preview_ = false;
+    is_frame_hold_ = false;
     log_line(tr(">>> 已请求停止"), QColor(255, 165, 0));
 }
 
@@ -930,6 +1015,7 @@ void BatchWindow::on_finished(int code, QProcess::ExitStatus) {
     running_ = false;
     start_button_->setEnabled(true);
     if (preview_button_) preview_button_->setEnabled(true);
+    if (frame_hold_button_) frame_hold_button_->setEnabled(true);
     stop_button_->setEnabled(false);
     timer_->stop();
 
@@ -946,6 +1032,16 @@ void BatchWindow::on_finished(int code, QProcess::ExitStatus) {
         if (code == 0 && QFileInfo::exists(prev_out)) {
             log_line(tr(">>> 3 秒快速预览完成，正在自动打开对比窗口..."), QColor(144, 238, 144));
             auto *dialog = new CompareDialog(input_->text().trimmed(), prev_out, this);
+            dialog->setAttribute(Qt::WA_DeleteOnClose);
+            dialog->show();
+        }
+    }
+
+    if (is_frame_hold_) {
+        is_frame_hold_ = false;
+        if (code == 0 && QFileInfo::exists(frame_hold_out_)) {
+            log_line(tr(">>> 单帧定帧增强完成，正在自动打开对比窗口..."), QColor(144, 238, 144));
+            auto *dialog = new CompareDialog(frame_hold_in_, frame_hold_out_, this);
             dialog->setAttribute(Qt::WA_DeleteOnClose);
             dialog->show();
         }

@@ -117,6 +117,7 @@ struct FeatureDesc {
     uint32_t output_height = 0;
     int32_t perf_quality = 2;  // NVSDK_NGX_PerfQuality_Value_MaxQuality
     uint32_t create_flags = 0; // NVSDK_NGX_DLSS_Feature_Flags_*
+    int32_t max_passes = 1;    // Supports multipass cascaded features (Pass 1 -> Pass 2)
     // Only read when feature is NeuralRendering.
     NeuralRenderingDesc neural{};
 };
@@ -128,6 +129,9 @@ struct FrameDesc {
     ID3D12Resource *depth = nullptr;
     ID3D12Resource *motion_vectors = nullptr;
     ID3D12Resource *output = nullptr;
+
+    // Which multipass layer to evaluate (0 for pass 1, 1 for pass 2)
+    int32_t pass_index = 0;
 
     // When true, color is already in the layer's shared CUDA array and no
     // D3D12 copy is needed. This is used by the video path's host upload fast

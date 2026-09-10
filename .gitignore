@@ -1,2 +1,13 @@
 /build
 /dist
+/build_qt*
+/run
+*.zip
+*.log
+*.err
+gui_app/bin/
+gui_app/obj/
+.release-staging*
+speed-test-staging*
+DLSSNRFilter-*/
+/build_gpu_check/

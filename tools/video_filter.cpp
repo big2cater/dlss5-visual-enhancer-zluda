@@ -1686,6 +1686,10 @@ static int run_main_once(int argc, char **argv) {
     enhancer::Settings settings = options.settings;
     settings.output_width = model_w;
     settings.output_height = model_h;
+    settings.is_video = true;
+    if (settings.passes >= 2) {
+        fprintf(stderr, "[multipass] 2-pass cascaded dual-engine enabled (flicker-free independent temporal features)\n");
+    }
 
     std::vector<unsigned> flow_luma;
     std::vector<short> qflow;

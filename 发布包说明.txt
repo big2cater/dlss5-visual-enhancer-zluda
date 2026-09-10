@@ -1,0 +1,29 @@
+DLSSNRFilter ZLUDA 加速与双引擎多轮降噪发布包 (2026-09-10)
+
+【使用方法】
+1. 解压整个文件夹，不要只复制单个 DLL。
+2. 将 NVIDIA 官方的 nvngx_dlssnr.dll 放入根目录（与 video_filter.exe / DLSSNRFilter.exe 同级目录）。
+3. 双击运行 DLSSNRFilter.exe（或 dlssnr_gui.exe）。
+4. 视频处理需要 ffmpeg.exe 和 ffprobe.exe；请确保已安装 FFmpeg 并把 bin 目录加入系统环境变量 PATH。
+5. 首次运行可能需要较长时间编译/翻译 CUDA 模块，之后会直接调用本机编译缓存（秒级启动）。
+
+【本次核心更新】
+1. 双引擎独立时序级联多轮降噪（Multipass）：
+   - 借鉴并整合 OptiScaler-DLSSNR-PreSR-Multipass 架构，彻底重构多轮降噪管线。
+   - 废除在单个 Feature 上多轮累加的旧做法（旧做法会导致每帧推进多次时序时钟、时序状态错位并引发严重频闪）；
+   - 升级为双独立 Feature 级联乒乓引擎（Feature 0 -> intermediate -> Feature 1 -> result），各引擎每帧严格只推进一次时序历史，在大幅提升降噪与细节纯净度的同时，100% 保持时域稳定、彻底告别频闪！
+2. 皮肤结构保护（Skin Structure / 防塑料感保护）：
+   - 完整开放并调优底层 DLSSNR.SkinStructureStrength 参数调节（0.00 ~ 1.00）。
+   - 在人脸、皮肤特写场景下智能保留原生毛孔细节与真实皮肤微结构，有效消除传统 AI 降噪过度磨皮导致的“蜡像感/塑料假面感”。
+   - 并在界面明确提示当前官方 DLL 内置 Preset 1 默认网络。
+3. 单帧定帧极速对比（Frame Hold Compare）：
+   - GUI 运行控制区新增【单帧定帧对比】按钮。
+   - 针对视频文件，在秒级内快速抽取单帧并执行高精度降噪渲染（1~2 秒即可完成），自动弹出可拖拽中轴线的分屏对比视窗（CompareDialog），极大提升调参效率！
+4. C# 与 Qt 双端 GUI 全面对齐：
+   - C# WinForms GUI (DLSSNRFilter) 与 Qt GUI (dlssnr_gui) 同步获得上述全部新特性。
+5. 异步流水线与 AMF 原生硬件视频编码：
+   - 保持三级解耦异步流水线，支持 AMD AMF H.264 / AMF HEVC 硬件编码，吞吐性能拉满。
+
+【特别声明】
+- 本发布包与开源仓库严格不包含任何第三方闭源专有模型文件（nvngx_dlssnr.dll）。
+- 请自行从 NVIDIA 官方驱动或相关合法渠道获取 nvngx_dlssnr.dll 并放置于软件根目录即可正常使用。

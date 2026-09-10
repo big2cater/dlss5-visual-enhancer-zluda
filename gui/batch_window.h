@@ -67,6 +67,7 @@ private:
 
     void start_run();
     void start_preview();
+    void start_frame_hold_compare();
     void stop_run();
     void open_compare();
     void probe_total();
@@ -135,6 +136,7 @@ private:
     // ---- run ------------------------------------------------------------
     QPushButton *start_button_ = nullptr;
     QPushButton *preview_button_ = nullptr;
+    QPushButton *frame_hold_button_ = nullptr;
     QPushButton *stop_button_ = nullptr;
     QPushButton *compare_button_ = nullptr;
     QProgressBar *progress_ = nullptr;
@@ -145,7 +147,10 @@ private:
     QTimer *timer_ = nullptr;
     bool running_ = false;
     bool is_preview_ = false;
+    bool is_frame_hold_ = false;
     QString preview_output_path_;
+    QString frame_hold_in_;
+    QString frame_hold_out_;
     long frames_done_ = 0;
     long frames_total_ = -1;
     int seconds_ = 0;

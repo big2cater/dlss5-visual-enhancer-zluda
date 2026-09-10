@@ -46,6 +46,8 @@ void set_error(const char *fmt, ...) {
 // or surface object. Only that field is read before the query, and the query
 // itself then requires resType == CU_RESOURCE_TYPE_ARRAY and a working
 // cuArrayGetDescriptor -- which a surface built on a mip level satisfies.
+static constexpr int kMaxPasses = 2;
+
 struct NgxResourceCuda {
     unsigned long long object; // CUsurfObject or CUtexObject
     uint32_t width;
@@ -101,7 +103,9 @@ struct State {
     NVSDK_NGX_Result (*ngx_shutdown)(void) = nullptr;
 
     NVSDK_NGX_Parameter *params = nullptr;
-    NVSDK_NGX_Handle *feature = nullptr;
+    static constexpr int kMaxPasses = 2;
+    NVSDK_NGX_Handle *features[kMaxPasses] = {nullptr, nullptr};
+    int num_features = 0;
 
     ID3D12Device *device = nullptr;
     ID3D12CommandQueue *queue = nullptr;
@@ -1025,17 +1029,22 @@ bool create_feature(const FeatureDesc &desc) {
         GetEnvironmentVariableA("DLSS_FORCE_RECREATE_FEATURE", force_recreate, sizeof force_recreate) >
             0 &&
         force_recreate[0] == '1';
-    if (!always_recreate && g.feature && desc.render_width == g.current.render_width &&
+    const int wanted_passes = desc.max_passes > 1 ? 2 : 1;
+    if (!always_recreate && g.features[0] && g.num_features >= wanted_passes &&
+        desc.render_width == g.current.render_width &&
         desc.render_height == g.current.render_height &&
         desc.output_width == g.current.output_width &&
         desc.output_height == g.current.output_height &&
         desc.perf_quality == g.current.perf_quality && desc.create_flags == g.current.create_flags)
         return true;
 
-    if (g.feature) {
-        g.ngx_release(g.feature);
-        g.feature = nullptr;
+    for (int i = 0; i < kMaxPasses; ++i) {
+        if (g.features[i]) {
+            g.ngx_release(g.features[i]);
+            g.features[i] = nullptr;
+        }
     }
+    g.num_features = 0;
 
     // Colour and output are HDR-friendly; depth is single-channel float; motion
     // vectors are two-channel float at render resolution.
@@ -1097,8 +1106,10 @@ bool create_feature(const FeatureDesc &desc) {
     }
 
     report_device_count("before CreateFeature");
+    if (!cu_ok(g.cu.cuCtxSetCurrent(g.ctx), "cuCtxSetCurrent (before CreateFeature pass 1)"))
+        return false;
     const NVSDK_NGX_Result create_result =
-        g.ngx_create(feature_id(desc.feature), g.params, &g.feature);
+        g.ngx_create(feature_id(desc.feature), g.params, &g.features[0]);
     // Which branch the runtime actually took. A fix that lives in nvngx.dll does
     // nothing if an older copy of that file is the one beside the addon, and the
     // return code alone cannot tell the two apart.
@@ -1122,9 +1133,23 @@ bool create_feature(const FeatureDesc &desc) {
         fputs(line, stderr);
         if (g_reshade_log) g_reshade_log(line);
     }
-    if (!ngx_ok(create_result, "NVSDK_NGX_CUDA_CreateFeature")) {
+    if (!ngx_ok(create_result, "NVSDK_NGX_CUDA_CreateFeature (pass 1)")) {
         report_snippet_compression(g.snippet_path.c_str(), g.nvidia_driver);
         return false;
+    }
+    g.num_features = 1;
+
+    if (wanted_passes > 1) {
+        cu_ok(g.cu.cuCtxSetCurrent(g.ctx), "cuCtxSetCurrent (before CreateFeature pass 2)");
+        const NVSDK_NGX_Result create_result2 =
+            g.ngx_create(feature_id(desc.feature), g.params, &g.features[1]);
+        if (!ngx_ok(create_result2, "NVSDK_NGX_CUDA_CreateFeature (pass 2)")) {
+            fprintf(stderr, "[dlss-cuda] WARNING: secondary feature creation failed (0x%x); falling back to single pass\n",
+                    (unsigned)create_result2);
+        } else {
+            g.num_features = 2;
+            fprintf(stderr, "[dlss-cuda] multipass: dual-engine independent temporal features created successfully\n");
+        }
     }
 
     g.current = desc;
@@ -1195,6 +1220,10 @@ static bool finish_evaluation() {
 static bool evaluate_ngx(const FrameDesc &frame) {
     if (!cu_ok(g.cu.cuCtxSetCurrent(g.ctx), "cuCtxSetCurrent")) return false;
 
+    const int pass = (frame.pass_index >= 0 && frame.pass_index < g.num_features) ? frame.pass_index : 0;
+    NVSDK_NGX_Handle *target_feat = g.features[pass] ? g.features[pass] : g.features[0];
+    if (!target_feat) return false;
+
     // DLSS resolves cuSurfObjectCreate, cuTexObjectCreate and
     // cuMipmappedArrayDestroy but imports no external memory of its own, so it
     // takes ownership of array handles handed to it and builds its own surface
@@ -1202,7 +1231,7 @@ static bool evaluate_ngx(const FrameDesc &frame) {
     // than a surface object.
     if (g.current.feature == Feature::NeuralRendering) {
         set_frame_params_nr(g.current, g.current.neural, frame);
-        if (!ngx_ok(g.ngx_evaluate(g.feature, g.params), "NVSDK_NGX_CUDA_EvaluateFeature"))
+        if (!ngx_ok(g.ngx_evaluate(target_feat, g.params), "NVSDK_NGX_CUDA_EvaluateFeature"))
             return false;
         return finish_evaluation();
     }
@@ -1250,7 +1279,7 @@ static bool evaluate_ngx(const FrameDesc &frame) {
     // after the evaluation reports was actually produced by the evaluation.
     if (!cu_ok(g.cu.cuCtxSynchronize(), "cuCtxSynchronize (before evaluation)"))
         return false;
-    if (!ngx_ok(g.ngx_evaluate(g.feature, g.params), "NVSDK_NGX_CUDA_EvaluateFeature"))
+    if (!ngx_ok(g.ngx_evaluate(target_feat, g.params), "NVSDK_NGX_CUDA_EvaluateFeature"))
         return false;
 
     return finish_evaluation();
@@ -1263,7 +1292,7 @@ bool evaluate_selftest() {
         char buf[8];
         trace(GetEnvironmentVariableA("DLSS_TRACE_PARAMS", buf, sizeof buf) > 0 ? 1 : 0);
     }
-    if (!g.feature) {
+    if (!g.features[0]) {
         set_error("evaluate_selftest called before create_feature");
         return false;
     }
@@ -1273,7 +1302,7 @@ bool evaluate_selftest() {
 }
 
 bool evaluate_backbuffer(void *back_buffer, unsigned width, unsigned height, int format) {
-    if (!g.feature) {
+    if (!g.features[0]) {
         set_error("evaluate_backbuffer called before create_feature");
         return false;
     }
@@ -1337,7 +1366,7 @@ bool evaluate_backbuffer(void *back_buffer, unsigned width, unsigned height, int
 }
 
 bool evaluate(const FrameDesc &frame, bool copy_output) {
-    if (!g.feature) {
+    if (!g.features[0]) {
         set_error("evaluate called before create_feature");
         return false;
     }
@@ -1483,8 +1512,11 @@ bool debug_read_shared_colour(void *rows, size_t row_bytes, unsigned row_count) 
 }
 
 void shutdown() {
-    if (g.feature && g.ngx_release) g.ngx_release(g.feature);
-    g.feature = nullptr;
+    for (int i = 0; i < kMaxPasses; ++i) {
+        if (g.features[i] && g.ngx_release) g.ngx_release(g.features[i]);
+        g.features[i] = nullptr;
+    }
+    g.num_features = 0;
 
     release_shared(g.color);
     release_shared(g.depth);

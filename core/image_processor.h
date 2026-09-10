@@ -51,6 +51,10 @@ struct Settings {
     // frames, and chaining is what stops motion from flickering. Scene cuts
     // then need an explicit reset, which the video tool detects by default.
     bool reset_accumulation = true;
+
+    // When true, enables video mode with dual-engine cascaded multipass (Pass 1 -> Pass 2)
+    // using independent persistent temporal features to prevent temporal flicker.
+    bool is_video = false;
 };
 
 // Where the pieces are. All of them belong to someone else; the program never

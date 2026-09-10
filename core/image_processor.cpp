@@ -165,6 +165,7 @@ struct Processor::State {
 
     // Rebuilt whenever the image size changes.
     ID3D12Resource *colour = nullptr;
+    ID3D12Resource *intermediate = nullptr; // Ping-pong buffer for cascaded multipass
     ID3D12Resource *result = nullptr;
     ID3D12Resource *upload = nullptr;
     ID3D12Resource *readback = nullptr;
@@ -188,6 +189,7 @@ struct Processor::State {
 
     void release_images() {
         release(reinterpret_cast<IUnknown *&>(colour));
+        release(reinterpret_cast<IUnknown *&>(intermediate));
         release(reinterpret_cast<IUnknown *&>(result));
         release(reinterpret_cast<IUnknown *&>(upload));
         release(reinterpret_cast<IUnknown *&>(readback));
@@ -418,10 +420,15 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         return GetEnvironmentVariableA("DLSS_DIRECT_UPLOAD", value,
                                        sizeof value) > 0 && value[0] == '1';
     }();
-    if (in.width != s->width || in.height != s->height || output_width != s->out_width || output_height != s->out_height) {
+    const bool need_intermediate = settings.passes > 1;
+    if (in.width != s->width || in.height != s->height || output_width != s->out_width ||
+        output_height != s->out_height || (need_intermediate && !s->intermediate)) {
         s->release_images();
         s->colour = make_texture(s->device, in.width, in.height, false);
         s->result = make_texture(s->device, output_width, output_height, true);
+        if (need_intermediate) {
+            s->intermediate = make_texture(s->device, output_width, output_height, true);
+        }
         s->upload = make_buffer(s->device, (UINT64)padded * in.height, D3D12_HEAP_TYPE_UPLOAD,
                                 D3D12_RESOURCE_STATE_GENERIC_READ);
         s->readback = make_buffer(s->device, (UINT64)aligned_pitch(output_width * 8) * output_height, D3D12_HEAP_TYPE_READBACK,
@@ -431,8 +438,8 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         s->motion_up = make_buffer(s->device,
                                    (UINT64)aligned_pitch((UINT)in.width * 4) * in.height,
                                    D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-        if (!s->colour || !s->result || !s->upload || !s->readback ||
-            !s->motion_tex || !s->motion_up) {
+        if (!s->colour || !s->result || (need_intermediate && !s->intermediate) ||
+            !s->upload || !s->readback || !s->motion_tex || !s->motion_up) {
             error = "the working images could not be created";
             return false;
         }
@@ -451,6 +458,7 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     feature.output_width = output_width;
     feature.output_height = output_height;
     feature.perf_quality = 2;
+    feature.max_passes = settings.passes > 1 ? 2 : 1;
     feature.neural.intensity = settings.intensity;
     feature.neural.global_tone_strength = settings.global_tone;
     feature.neural.local_tone_strength = settings.local_tone;
@@ -612,14 +620,41 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     // history carry across calls; scene cuts then reset it explicitly.
     frame.reset_accumulation = settings.reset_accumulation;
     const int passes = settings.passes < 1 ? 1 : settings.passes;
-    for (int pass = 0; pass < passes; ++pass) {
-        if (!dlss_cuda::evaluate(frame, !direct_readback)) {
+
+    if (settings.is_video && passes >= 2 && s->intermediate) {
+        // Cascaded dual-engine multipass for video:
+        // Pass 0 -> Feature 0 -> intermediate (denoises raw frame, advances Feature 0 history once)
+        dlss_cuda::FrameDesc f0 = frame;
+        f0.output = s->intermediate;
+        f0.pass_index = 0;
+        f0.reset_accumulation = settings.reset_accumulation;
+        if (!dlss_cuda::evaluate(f0, true)) {
             error = dlss_cuda::last_error();
             return false;
         }
-        // Only the first pass of a call resets; the later ones chain onto it.
-        if (frame.reset_accumulation)
-            frame.reset_accumulation = false;
+
+        // Pass 1 -> Feature 1 -> result (takes intermediate, removes residual grain, advances Feature 1 history once)
+        dlss_cuda::FrameDesc f1 = frame;
+        f1.color = s->intermediate;
+        f1.color_is_shared = false;
+        f1.output = s->result;
+        f1.pass_index = 1;
+        f1.reset_accumulation = settings.reset_accumulation;
+        if (!dlss_cuda::evaluate(f1, !direct_readback)) {
+            error = dlss_cuda::last_error();
+            return false;
+        }
+    } else {
+        for (int pass = 0; pass < passes; ++pass) {
+            frame.pass_index = 0;
+            if (!dlss_cuda::evaluate(frame, !direct_readback)) {
+                error = dlss_cuda::last_error();
+                return false;
+            }
+            // Only the first pass of a call resets; the later ones chain onto it.
+            if (frame.reset_accumulation)
+                frame.reset_accumulation = false;
+        }
     }
 
     out.width = output_width;
