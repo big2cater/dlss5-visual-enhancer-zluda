@@ -578,10 +578,10 @@ void rgb48_to_half_rgba(const unsigned char *rgb48, enhancer::Image &image) {
 // --------------------------------------------------------------------------
 // Output tone handling. The network writes LINEAR (HDR-style) half floats;
 // storing them directly as sRGB makes images look dark and over-saturated.
-// The default applies the linear->sRGB gamma (2.2) so a 0.5 input comes back
-// as a 0.5 output; --gamma 1 disables it.
+// The default applies gamma (1.4) to match source perceptual brightness;
+// --gamma 1 disables it.
 // --------------------------------------------------------------------------
-double g_gamma = 2.2;
+double g_gamma = 1.4;
 
 static inline double to_sdr(double value) {
     if (value <= 0.0) return 0.0;
@@ -803,7 +803,7 @@ struct Options {
     // ones before it, so a cut test that trips on ordinary motion reads as
     // flicker. 0.30 is a mean luma change only a real cut reaches.
     double cut_threshold = 0.30;
-    double gamma = 2.2;      // linear -> sRGB conversion for saved pixels
+    double gamma = 1.4;      // output gamma, 1.4 matches source perceptual brightness
     // Off by default. The estimator is a coarse CPU block matcher -- a grid at
     // 1/16 of the frame, whole-pixel SAD, ties resolved by scan order -- so the
     // field it produces jitters from frame to frame, and the network reprojects
@@ -837,7 +837,7 @@ void usage() {
         "  --passes N            evaluate each frame N times (1 default)\n"
         "  --reset auto|always|never|every=N   accumulation reset policy (auto)\n"
         "  --cut-threshold F     scene-cut threshold, 0..1 (0.30)\n"
-        "  --gamma F             output gamma, linear->sRGB (2.2 default, 1 = off)\n"
+        "  --gamma F             output gamma, linear->sRGB (1.4 default, 1 = off)\n"
         "  --flow 0|1           motion-vector guidance for video (0 default; 1 = on)\n"
         "  --upscale-mode P     native, quality, balanced, performance, ultra\n"
         "  --model-scale F      internal DLSS render scale, 0.25..1.0 (1.0 default)\n"

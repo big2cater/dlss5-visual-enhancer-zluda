@@ -233,7 +233,7 @@ QWidget *BatchWindow::build_left_column() {
     gamma_->setRange(0.5, 3.0);
     gamma_->setSingleStep(0.1);
     gamma_->setDecimals(1);
-    gamma_->setValue(1.0);
+    gamma_->setValue(1.4);
     form->addRow(tr("输出伽马"), gamma_);
 
     // Lives in this column, not the video panel, so it shows in both modes:
@@ -463,7 +463,7 @@ void BatchWindow::load_settings() {
     style_->setCurrentIndex(settings.value(QStringLiteral("style"), 0).toInt());
     preset_->setCurrentIndex(settings.value(QStringLiteral("preset"), 0).toInt());
     model_->setCurrentIndex(settings.value(QStringLiteral("model"), 0).toInt());
-    gamma_->setValue(settings.value(QStringLiteral("gamma"), 1.0).toDouble());
+    gamma_->setValue(settings.value(QStringLiteral("gamma"), 1.4).toDouble());
     image_passes_->setValue(settings.value(QStringLiteral("imagePasses"), 3).toInt());
     auto_mask_->setChecked(settings.value(QStringLiteral("autoMask"), true).toBool());
 
@@ -588,7 +588,7 @@ void BatchWindow::reset_effects() {
     upscale_->setCurrentIndex(0);
     codec_->setCurrentIndex(0);
     auto_mask_->setChecked(true);
-    gamma_->setValue(1.0);
+    gamma_->setValue(1.4);
     image_passes_->setValue(3);
     passes_->setValue(1);
     reset_->setCurrentIndex(0);
