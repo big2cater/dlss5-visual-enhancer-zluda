@@ -1413,16 +1413,9 @@ bool load_image(IWICImagingFactory *wic, const std::wstring &path, enhancer::Ima
         ok = SUCCEEDED(converter->CopyPixels(nullptr, image.width * 8,
                                              (UINT)(image.pixels.size() * 2),
                                              (BYTE *)image.pixels.data()));
-        if (ok) {
-            for (size_t i = 0; i < (size_t)image.width * image.height; ++i) {
-                float r = enhancer::half_to_float(image.pixels[i * 4 + 0]);
-                float g = enhancer::half_to_float(image.pixels[i * 4 + 1]);
-                float b = enhancer::half_to_float(image.pixels[i * 4 + 2]);
-                image.pixels[i * 4 + 0] = enhancer::float_to_half((float)srgb_to_linear(r));
-                image.pixels[i * 4 + 1] = enhancer::float_to_half((float)srgb_to_linear(g));
-                image.pixels[i * 4 + 2] = enhancer::float_to_half((float)srgb_to_linear(b));
-            }
-        }
+        // Note: WIC's format converter to GUID_WICPixelFormat64bppRGBAHalf already
+        // decodes sRGB integer formats into linear radiance half-floats.
+        // Applying srgb_to_linear again would cause double linearization and crush the image.
     }
     if (converter) converter->Release();
     if (frame) frame->Release();
