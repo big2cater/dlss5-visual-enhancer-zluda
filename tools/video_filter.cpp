@@ -133,8 +133,6 @@ class WorkerPool {
     std::queue<std::function<void()>> tasks;
     std::mutex queue_mutex;
     std::condition_variable cv_task;
-    std::condition_variable cv_finished;
-    int active_tasks = 0;
     bool stop = false;
 
 public:
@@ -159,12 +157,6 @@ public:
                         tasks.pop();
                     }
                     task();
-                    {
-                        std::unique_lock<std::mutex> lock(queue_mutex);
-                        if (--active_tasks == 0) {
-                            cv_finished.notify_all();
-                        }
-                    }
                 }
             });
         }
@@ -194,6 +186,9 @@ public:
             return;
         }
         const size_t chunk_size = (total_items + n_threads - 1) / n_threads;
+        std::mutex local_mtx;
+        std::condition_variable local_cv;
+        std::atomic<int> remaining{0};
         size_t scheduled = 0;
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
@@ -202,18 +197,95 @@ public:
                 if (start >= total_items) break;
                 size_t end = std::min(start + chunk_size, total_items);
                 ++scheduled;
-                tasks.push([start, end, t, &func] {
+                tasks.push([start, end, t, &func, &remaining, &local_mtx, &local_cv] {
                     func(start, end, t);
+                    if (--remaining == 0) {
+                        std::lock_guard<std::mutex> lk(local_mtx);
+                        local_cv.notify_one();
+                    }
                 });
             }
-            active_tasks = (int)scheduled;
+            remaining.store((int)scheduled);
         }
         cv_task.notify_all();
         {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            cv_finished.wait(lock, [this] { return active_tasks == 0; });
+            std::unique_lock<std::mutex> lock(local_mtx);
+            local_cv.wait(lock, [&] { return remaining.load() == 0; });
         }
     }
+};
+
+// --------------------------------------------------------------------------
+// Thread-safe bounded channel for streaming frames across stages
+// --------------------------------------------------------------------------
+template <typename T>
+class Channel {
+    std::queue<T> queue_;
+    std::mutex mutex_;
+    std::condition_variable cv_push_;
+    std::condition_variable cv_pop_;
+    size_t capacity_;
+    bool closed_ = false;
+
+public:
+    explicit Channel(size_t capacity = 3) : capacity_(capacity) {}
+
+    bool push(T item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_push_.wait(lock, [this] { return closed_ || queue_.size() < capacity_; });
+        if (closed_) return false;
+        queue_.push(std::move(item));
+        cv_pop_.notify_one();
+        return true;
+    }
+
+    bool pop(T &item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_pop_.wait(lock, [this] { return closed_ || !queue_.empty(); });
+        if (queue_.empty()) return false;
+        item = std::move(queue_.front());
+        queue_.pop();
+        cv_push_.notify_one();
+        return true;
+    }
+
+    void close() {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            closed_ = true;
+        }
+        cv_push_.notify_all();
+        cv_pop_.notify_all();
+    }
+
+    bool is_closed() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return closed_;
+    }
+
+    void clear() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!queue_.empty()) queue_.pop();
+        cv_push_.notify_all();
+    }
+};
+
+struct InputFrame {
+    unsigned index = 0;
+    std::vector<unsigned char> raw_bytes;
+    enhancer::Image in;
+    enhancer::Image motion;
+    bool reset = false;
+    bool is_eos = false;
+};
+
+struct OutputFrame {
+    unsigned index = 0;
+    enhancer::Image out;
+    std::vector<unsigned char> model_output;
+    double ms = 0.0;
+    bool is_eos = false;
+    bool blank = false;
 };
 
 struct ChildProcess {
@@ -1575,200 +1647,266 @@ static int run_main_once(int argc, char **argv) {
     }
 
     const size_t frame_bytes = (size_t)params.width * params.height * 6;
-    std::vector<unsigned char> input_frame(frame_bytes);
-    std::vector<unsigned char> model_output((size_t)model_w * model_h * 6);
-    enhancer::Image in, out;
-    // Reuse motion buffers across frames.  Flow is optional, but when enabled
-    // these vectors otherwise allocate and release several times per frame.
-    enhancer::Image motion;
-    std::vector<unsigned> flow_luma;
-    std::vector<short> qflow;
-    in.width = model_w;
-    in.height = model_h;
-    in.pixels.resize((size_t)model_w * model_h * 4);
     enhancer::Settings settings = options.settings;
     settings.output_width = params.width;
     settings.output_height = params.height;
 
-    double elapsed_total = 0.0;
-    int reset_count = 0;
-    int blank_count = 0;
-    unsigned frame_index = 0;
-    bool failed = false;
-    bool retryable = false; // a blank first frame: the whole run is a loss,
-                            // report exit code 2 so outer main() re-runs it
+    std::vector<unsigned> flow_luma;
+    std::vector<short> qflow;
 
-    while (true) {
-        // Read one frame from the decoder; EOF on a frame boundary = the end.
-        size_t got = 0;
-        while (got < frame_bytes) {
-            DWORD chunk = 0;
-            if (!ReadFile(decoder_stdout.read_end, input_frame.data() + got,
-                          (DWORD)(frame_bytes - got), &chunk, nullptr) || chunk == 0) {
+    // --- 3-stage asynchronous pipeline (Triple-Buffering) ----------------
+    constexpr size_t POOL_SIZE = 3;
+    Channel<std::shared_ptr<InputFrame>> free_input_pool(POOL_SIZE);
+    Channel<std::shared_ptr<InputFrame>> ready_input_channel(POOL_SIZE);
+    Channel<std::shared_ptr<OutputFrame>> free_output_pool(POOL_SIZE);
+    Channel<std::shared_ptr<OutputFrame>> ready_output_channel(POOL_SIZE);
+
+    for (size_t i = 0; i < POOL_SIZE; ++i) {
+        auto in_f = std::make_shared<InputFrame>();
+        in_f->raw_bytes.resize(frame_bytes);
+        in_f->in.width = model_w;
+        in_f->in.height = model_h;
+        in_f->in.pixels.resize((size_t)model_w * model_h * 4);
+        if (options.flow) {
+            in_f->motion.width = model_w;
+            in_f->motion.height = model_h;
+            in_f->motion.pixels.resize((size_t)model_w * model_h * 2);
+        }
+        free_input_pool.push(in_f);
+
+        auto out_f = std::make_shared<OutputFrame>();
+        out_f->out.width = params.width;
+        out_f->out.height = params.height;
+        out_f->out.pixels.resize((size_t)params.width * params.height * 4);
+        out_f->model_output.resize(frame_bytes);
+        free_output_pool.push(out_f);
+    }
+
+    std::atomic<bool> abort_pipeline{false};
+    std::atomic<int> reset_count{0};
+    std::atomic<int> blank_count{0};
+    std::atomic<double> elapsed_total{0.0};
+    std::atomic<unsigned> frames_written{0};
+    bool failed = false;
+    bool retryable = false;
+    const auto pipeline_began = std::chrono::steady_clock::now();
+
+    // Stage 1: Decoder reader & preprocessor thread
+    std::thread decode_thread([&]() {
+        unsigned dec_index = 0;
+        while (!abort_pipeline.load()) {
+            if (options.max_frames && (int)dec_index >= options.max_frames) {
+                if (decoder.process) TerminateProcess(decoder.process, 0);
                 break;
             }
-            got += chunk;
+
+            std::shared_ptr<InputFrame> frame;
+            if (!free_input_pool.pop(frame)) break;
+            if (abort_pipeline.load()) break;
+
+            size_t got = 0;
+            while (got < frame_bytes && !abort_pipeline.load()) {
+                DWORD chunk = 0;
+                if (!ReadFile(decoder_stdout.read_end, frame->raw_bytes.data() + got,
+                              (DWORD)(frame_bytes - got), &chunk, nullptr) || chunk == 0) {
+                    break;
+                }
+                got += chunk;
+            }
+
+            if (got == 0) {
+                // Clean end of video
+                break;
+            }
+            if (got != frame_bytes) {
+                if (!abort_pipeline.load()) {
+                    fprintf(stderr, "[FAIL] short read at frame %u (%zu of %zu bytes)\n", dec_index, got, frame_bytes);
+                    failed = true;
+                    abort_pipeline.store(true);
+                }
+                break;
+            }
+
+            frame->index = dec_index;
+            frame->is_eos = false;
+
+            // Reset determination
+            bool reset = false;
+            switch (options.reset) {
+                case ResetMode::Always: reset = true; break;
+                case ResetMode::Never: reset = (dec_index == 0); break;
+                case ResetMode::Every: reset = (dec_index % options.reset_every) == 0; break;
+                case ResetMode::Auto: reset = detector.consider(frame->raw_bytes.data(), params.width, params.height); break;
+            }
+            frame->reset = reset;
+
+            // Parallel format conversion: RGB48 -> Half-RGBA
+            rgb48_to_half_rgba(frame->raw_bytes.data(), frame->in);
+
+            // If CPU flow is used, compute it in worker thread
+            if (options.flow && !gpu_flow_ready) {
+                flowgen.compute(frame->raw_bytes.data(), model_w, model_h, reset, frame->motion.pixels);
+            }
+
+            if (!ready_input_channel.push(frame)) break;
+            ++dec_index;
         }
-        if (got == 0) break; // clean end of video
-        if (got != frame_bytes) {
-            fprintf(stderr, "[FAIL] short read at frame %u (%zu of %zu bytes)\n", frame_index,
-                    got, frame_bytes);
-            failed = true;
+
+        // Push EOS to signal Stage 2
+        auto eos_frame = std::make_shared<InputFrame>();
+        eos_frame->is_eos = true;
+        ready_input_channel.push(eos_frame);
+    });
+
+    // Stage 3: Encoder writer & postprocessor thread
+    std::thread encode_thread([&]() {
+        if (!options.dump_dir.empty()) {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        }
+        while (!abort_pipeline.load()) {
+            std::shared_ptr<OutputFrame> frame;
+            if (!ready_output_channel.pop(frame)) break;
+            if (frame->is_eos) {
+                break;
+            }
+
+            bool blank = false;
+            half_rgba_to_rgb48(frame->out, frame->model_output.data(), blank);
+            if (blank) {
+                blank_count.fetch_add(1);
+                fprintf(stderr, "[warn] frame %u output looks blank\n", frame->index);
+            }
+
+            DWORD written = 0;
+            if (!WriteFile(encoder_stdin.write_end, frame->model_output.data(), (DWORD)frame_bytes,
+                           &written, nullptr) || written != frame_bytes) {
+                if (!abort_pipeline.load()) {
+                    fprintf(stderr, "[FAIL] encoder pipe broke at frame %u\n", frame->index);
+                    failed = true;
+                    abort_pipeline.store(true);
+                }
+                break;
+            }
+
+            if (!options.dump_dir.empty() && dump_ok) {
+                wchar_t name[512];
+                swprintf(name, 512, L"%s\\frame_%05u.png", options.dump_dir.c_str(), frame->index);
+                if (!dump_png(wic, name, frame->out))
+                    fprintf(stderr, "[warn] could not dump frame %u\n", frame->index);
+            }
+
+            frames_written.store(frame->index + 1);
+            if ((frame->index % 5) == 0 || (frame->index < 5)) {
+                fprintf(stderr, "[%.5u] %.0f ms (avg %.1f, reset=%d, blanks=%d)\n",
+                        frame->index, frame->ms,
+                        elapsed_total.load() / (frame->index + 1),
+                        reset_count.load(), blank_count.load());
+                fflush(stderr);
+            }
+
+            free_output_pool.push(frame);
+        }
+        if (!options.dump_dir.empty()) {
+            CoUninitialize();
+        }
+    });
+
+    // Stage 2: GPU inference (Main thread)
+    unsigned eval_index = 0;
+    while (!abort_pipeline.load()) {
+        std::shared_ptr<InputFrame> in_frame;
+        if (!ready_input_channel.pop(in_frame)) break;
+        if (in_frame->is_eos) {
+            // Forward EOS to Stage 3
+            auto eos_out = std::make_shared<OutputFrame>();
+            eos_out->is_eos = true;
+            ready_output_channel.push(eos_out);
             break;
         }
-        if (options.max_frames && (int)frame_index >= options.max_frames) break;
 
-        // Decide whether this frame resets the network's accumulation history.
-        bool reset = false;
-        switch (options.reset) {
-            case ResetMode::Always: reset = true; break;
-            case ResetMode::Never: reset = frame_index == 0; break;
-            case ResetMode::Every: reset = (frame_index % options.reset_every) == 0; break;
-            case ResetMode::Auto: reset = detector.consider(input_frame.data(), params.width,
-                                                            params.height);
-        }
-        if (reset) ++reset_count;
-        settings.reset_accumulation = reset;
+        std::shared_ptr<OutputFrame> out_frame;
+        if (!free_output_pool.pop(out_frame)) break;
+        if (abort_pipeline.load()) break;
 
-        // The model currently runs at source resolution, so the decoder's
-        // RGB48 buffer is already the exact input layout needed by both the
-        // neural conversion and optional motion estimation. Avoid copying
-        // the whole frame before every evaluation.
-        rgb48_to_half_rgba(input_frame.data(), in);
-        const auto began = std::chrono::steady_clock::now();
+        if (in_frame->reset) reset_count.fetch_add(1);
+        settings.reset_accumulation = in_frame->reset;
 
-        // Optional motion-vector guidance: backward flow (where each pixel was
-        // in the previous frame, in pixels). Zeroed on reset frames.
+        // GPU motion vectors if enabled
         ID3D12Resource *gpu_motion = nullptr;
         unsigned gpu_motion_pitch = 0;
         const bool useFlow = options.flow;
-        if (useFlow) {
-            motion.width = model_w;
-            motion.height = model_h;
-            motion.pixels.resize((size_t)model_w * model_h * 2);
-            bool generated = false;
-            if (gpu_flow_ready) {
-                if (reset) gpuflow.reset();
-                const unsigned qw = (model_w + 3) / 4, qh = (model_h + 3) / 4;
-                flow_luma.resize((size_t)qw * qh);
-                for (unsigned y = 0; y < qh; ++y) for (unsigned x = 0; x < qw; ++x) {
-                    unsigned px = std::min(model_w - 1, x * 4u);
-                    unsigned py = std::min(model_h - 1, y * 4u);
-                    const uint16_t *p = (const uint16_t *)(input_frame.data() + ((size_t)py * model_w + px) * 6);
-                    flow_luma[(size_t)y * qw + x] = ((unsigned)p[0] * 19595u + (unsigned)p[1] * 38470u + (unsigned)p[2] * 7471u) >> 16;
-                }
-                generated = gpuflow.compute(flow_luma, qflow);
-                if (generated) {
-                    CpuFlow::median3(qflow, qw, qh);
-                    CpuFlow::upscale4(qflow, qw, qh, model_w, model_h, motion.pixels);
-                    // Extreme neural controls amplify tiny vector errors. Keep
-                    // the temporally smoothed CPU field for that regime; the
-                    // direct GPU buffer remains the fast path for normal video
-                    // settings until GPU history filtering is enabled.
-                    const bool high_temporal_risk =
-                        settings.intensity > 1.0f || settings.global_tone > 1.0f ||
-                        settings.local_tone > 1.0f || settings.local_structure > 1.0f ||
-                        settings.skin_structure > 1.0f || settings.passes > 1;
-                    // `full_out` is a structured buffer used by the flow
-                    // compute pass, not a DLSS texture. Do not hand it to
-                    // NGX as a zero-copy motion resource: ZLUDA accepts the
-                    // pointer but can fault on the next frame. The readback
-                    // above is converted into the validated CPU Image path.
-                    (void)high_temporal_risk;
-                }
+        if (useFlow && gpu_flow_ready) {
+            if (in_frame->reset) gpuflow.reset();
+            const unsigned qw = (model_w + 3) / 4, qh = (model_h + 3) / 4;
+            flow_luma.resize((size_t)qw * qh);
+            for (unsigned y = 0; y < qh; ++y) for (unsigned x = 0; x < qw; ++x) {
+                unsigned px = std::min(model_w - 1, x * 4u);
+                unsigned py = std::min(model_h - 1, y * 4u);
+                const uint16_t *p = (const uint16_t *)(in_frame->raw_bytes.data() + ((size_t)py * model_w + px) * 6);
+                flow_luma[(size_t)y * qw + x] = ((unsigned)p[0] * 19595u + (unsigned)p[1] * 38470u + (unsigned)p[2] * 7471u) >> 16;
             }
-            if (!generated) flowgen.compute(input_frame.data(), model_w, model_h, reset, motion.pixels);
-            if (flow_stats) {
-                double msum = 0.0;
-                size_t mcnt = motion.pixels.size() / 2;
-                const uint16_t *mp = motion.pixels.data();
-                size_t nf = 0;
-                float mn = 0.0f, mx = 0.0f;
-                for (size_t i = 0; i + 1 < motion.pixels.size(); i += 2) {
-                    float dx = enhancer::half_to_float(mp[i]);
-                    float dy = enhancer::half_to_float(mp[i + 1]);
-                    if (!std::isfinite(dx) || !std::isfinite(dy)) {
-                        ++nf;
-                        if (nf == 1)
-                            fprintf(stderr, "[flow-debug] first nonfinite at px %zu/%zu half=0x%04X,0x%04X\n",
-                                    (i / 2) % params.width, (i / 2) / params.width, mp[i], mp[i + 1]);
-                    }
-                    msum += fabsf(dx) + fabsf(dy);
-                    float a = fabsf(dx), b = fabsf(dy);
-                    if (a > mx) mx = a; if (b > mx) mx = b;
-                    if (i == 0) { mn = a < b ? a : b; }
-                    if (mn > (a < b ? a : b)) mn = a < b ? a : b;
-                }
-                fprintf(stderr, "[flow] frame %u mean|mv|=%.3f px min=%.2f max=%.2f nonfinite=%zu\n",
-                        frame_index, mcnt ? (float)(msum / (double)mcnt) : 0.0f, mn, mx, nf);
-                fflush(stderr);
+            bool generated = gpuflow.compute(flow_luma, qflow);
+            if (generated) {
+                CpuFlow::median3(qflow, qw, qh);
+                CpuFlow::upscale4(qflow, qw, qh, model_w, model_h, in_frame->motion.pixels);
             }
         }
 
-        if (!processor.process(in, out, settings, error,
-                               gpu_motion ? nullptr : (useFlow ? &motion : nullptr),
+        const auto began = std::chrono::steady_clock::now();
+        if (!processor.process(in_frame->in, out_frame->out, settings, error,
+                               gpu_motion ? nullptr : (useFlow ? &in_frame->motion : nullptr),
                                gpu_motion, gpu_motion_pitch)) {
-            fprintf(stderr, "[FAIL] frame %u: %s\n", frame_index, error.c_str());
+            fprintf(stderr, "[FAIL] frame %u: %s\n", in_frame->index, error.c_str());
             if (error.find("blank image") != std::string::npos) {
-                // Processor-level validation catches the race before the
-                // frame reaches the encoder; keep this retryable so main()
-                // can re-execute the whole pipeline in a fresh process.
                 retryable = true;
             }
             failed = true;
+            abort_pipeline.store(true);
             break;
         }
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - began)
                               .count();
-        elapsed_total += ms;
+        elapsed_total.store(elapsed_total.load() + ms);
 
-        // The blank race is sticky per process: if the first frame came out
-        // black every later frame will too, so stop right here and let the
-        // outer main() re-run the whole thing in a fresh process (~90% of
-        // re-runs recover).
-        if (frame_index == 0 && output_is_blank(out)) {
+        // Check if first frame came out blank (ZLUDA sticky race)
+        if (in_frame->index == 0 && output_is_blank(out_frame->out)) {
             fprintf(stderr, "[FAIL] 首帧输出空白（本轮竞态），交由外层重跑\n");
             failed = true;
             retryable = true;
+            abort_pipeline.store(true);
             break;
         }
 
-        bool blank = false;
-        half_rgba_to_rgb48(out, model_output.data(), blank);
-        if (out.width != params.width || out.height != params.height) {
-            fprintf(stderr, "[FAIL] frame %u: unexpected output size %ux%u (wanted %ux%u)\n", frame_index, out.width, out.height, params.width, params.height);
-            failed = true;
-            break;
-        }
-        if (blank) {
-            ++blank_count;
-            fprintf(stderr, "[warn] frame %u output looks blank\n", frame_index);
-        }
+        out_frame->index = in_frame->index;
+        out_frame->ms = ms;
+        out_frame->is_eos = false;
 
-        // Feed the encoder; a dead pipe means it gave up (bad args, disk full).
-        DWORD written = 0;
-        if (!WriteFile(encoder_stdin.write_end, model_output.data(), (DWORD)frame_bytes,
-                       &written, nullptr) || written != frame_bytes) {
-            fprintf(stderr, "[FAIL] encoder pipe broke at frame %u\n", frame_index);
-            failed = true;
-            break;
-        }
+        // Return input frame buffer to free pool for reuse
+        free_input_pool.push(in_frame);
 
-        if (!options.dump_dir.empty() && dump_ok) {
-            wchar_t name[512];
-            swprintf(name, 512, L"%s\\frame_%05u.png", options.dump_dir.c_str(), frame_index);
-            if (!dump_png(wic, name, out))
-                fprintf(stderr, "[warn] could not dump frame %u\n", frame_index);
-        }
-
-        if ((frame_index % 5) == 0 || (frame_index < 5)) {
-            fprintf(stderr, "[%.5u] %.0f ms (avg %.1f, reset=%d, blanks=%d)\n", frame_index, ms,
-                    elapsed_total / (frame_index + 1), reset_count, blank_count);
-            fflush(stderr);
-        }
-        ++frame_index;
+        // Send output frame to encoder
+        ready_output_channel.push(out_frame);
+        ++eval_index;
     }
+
+    if (abort_pipeline.load()) {
+        free_input_pool.close();
+        ready_input_channel.close();
+        free_output_pool.close();
+        ready_output_channel.close();
+        decoder_stdout.close();
+        encoder_stdin.close();
+        if (decoder.process) TerminateProcess(decoder.process, 1);
+        if (encoder.process) TerminateProcess(encoder.process, 1);
+    }
+
+    if (decode_thread.joinable()) decode_thread.join();
+    if (encode_thread.joinable()) encode_thread.join();
+
+    const double wall_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - pipeline_began)
+                               .count();
 
     // --- finish the pipes ------------------------------------------------
     decoder_stdout.close();
@@ -1788,10 +1926,14 @@ static int run_main_once(int argc, char **argv) {
         failed = true;
     }
 
+    const unsigned total_done = frames_written.load();
+    const double total_eval_ms = elapsed_total.load();
     fprintf(stderr,
-            "[done] %u frames, avg %.1f ms/frame (%.2f fps), resets=%d, blanks=%d%s\n",
-            frame_index, frame_index ? elapsed_total / frame_index : 0.0,
-            frame_index ? 1000.0 * frame_index / elapsed_total : 0.0, reset_count, blank_count,
+            "[done] %u frames in %.2f s (%.2f fps throughput, avg GPU %.1f ms), resets=%d, blanks=%d%s\n",
+            total_done, wall_ms / 1000.0,
+            wall_ms > 0 ? (1000.0 * total_done / wall_ms) : 0.0,
+            total_done ? (total_eval_ms / total_done) : 0.0,
+            reset_count.load(), blank_count.load(),
             failed ? " -- FAILED" : "");
     // 2 = retryable failure (blank race) -> outer main() re-runs this program.
     return failed ? (retryable ? 2 : 1) : 0;
