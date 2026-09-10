@@ -1336,48 +1336,57 @@ bool evaluate_backbuffer(void *back_buffer, unsigned width, unsigned height, int
     return flush_and_wait();
 }
 
-bool evaluate(const FrameDesc &frame) {
+bool evaluate(const FrameDesc &frame, bool copy_output) {
     if (!g.feature) {
         set_error("evaluate called before create_feature");
         return false;
     }
-    if (!frame.color || !frame.output) {
+    if ((!frame.color && !frame.color_is_shared) || (copy_output && !frame.output)) {
         set_error("evaluate: colour and output are required");
         return false;
     }
 
     // Stage the game's buffers into the shared textures.
-    g.allocator->Reset();
-    g.cmd->Reset(g.allocator, nullptr);
-    transition(g.color.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-    g.cmd->CopyResource(g.color.resource, frame.color);
-    transition(g.color.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-    // Depth and motion vectors are optional. A caller that has them supplies
-    // them; a caller that does not leaves the staging textures as they are,
-    // which means zeroes. The network then has no motion to work from and the
-    // result is not what it would be in a game that feeds it properly, but the
-    // frame does go through the network, which is the thing being built here.
-    if (frame.depth) {
-        transition(g.depth.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-        g.cmd->CopyResource(g.depth.resource, frame.depth);
-        transition(g.depth.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    const bool has_d3d_uploads = !frame.color_is_shared || frame.depth || frame.motion_vectors;
+    if (has_d3d_uploads) {
+        g.allocator->Reset();
+        g.cmd->Reset(g.allocator, nullptr);
+        if (!frame.color_is_shared) {
+            transition(g.color.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            g.cmd->CopyResource(g.color.resource, frame.color);
+            transition(g.color.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        }
+        // Depth and motion vectors are optional. A caller that has them supplies
+        // them; a caller that does not leaves the staging textures as they are,
+        // which means zeroes. The network then has no motion to work from and the
+        // result is not what it would be in a game that feeds it properly, but the
+        // frame does go through the network, which is the thing being built here.
+        if (frame.depth) {
+            transition(g.depth.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            g.cmd->CopyResource(g.depth.resource, frame.depth);
+            transition(g.depth.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        }
+        if (frame.motion_vectors) {
+            transition(g.motion.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            g.cmd->CopyResource(g.motion.resource, frame.motion_vectors);
+            transition(g.motion.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        }
+        g.cmd->Close();
+        ID3D12CommandList *lists[] = {g.cmd};
+        g.queue->ExecuteCommandLists(1, lists);
     }
-    if (frame.motion_vectors) {
-        transition(g.motion.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-        g.cmd->CopyResource(g.motion.resource, frame.motion_vectors);
-        transition(g.motion.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-    }
-    g.cmd->Close();
-    ID3D12CommandList *lists[] = {g.cmd};
-    g.queue->ExecuteCommandLists(1, lists);
 
     // ponytail: full pipeline stall around the CUDA work. The clean way is a
     // shared D3D12 fence imported with cuImportExternalSemaphore, but ROCm does
     // not implement external semaphore import, so the CPU has to be the
     // rendezvous point. Revisit if HIP ever grows semaphore import.
-    if (!flush_and_wait()) return false;
+    if (has_d3d_uploads && !flush_and_wait()) return false;
 
     if (!evaluate_ngx(frame)) return false;
+
+    // The caller may read the shared CUDA array directly. This avoids a second
+    // D3D12 copy and fence when the final destination is host memory.
+    if (!copy_output) return true;
 
     // And back into the game's output.
     g.allocator->Reset();
@@ -1389,7 +1398,72 @@ bool evaluate(const FrameDesc &frame) {
     ID3D12CommandList *back[] = {g.cmd};
     g.queue->ExecuteCommandLists(1, back);
 
-    return true;
+    // A direct host upload does not submit a new input command on the next
+    // frame, so make the fallback output copy complete before its allocator is
+    // reused. The normal direct-readback path never enters this branch.
+    return frame.color_is_shared ? flush_and_wait() : true;
+}
+
+bool upload_shared_colour(const void *src, size_t src_pitch, unsigned rows) {
+    if (!src || !src_pitch || !rows || !g.cu.cuMemcpy2D || !g.color.level0) {
+        set_error("upload_shared_colour: invalid source or colour array");
+        return false;
+    }
+    if (!cu_ok(g.cu.cuCtxSetCurrent(g.ctx), "cuCtxSetCurrent (upload colour)"))
+        return false;
+    CUDA_ARRAY_DESCRIPTOR ad{};
+    if (!g.cu.cuArrayGetDescriptor ||
+        g.cu.cuArrayGetDescriptor(&ad, g.color.level0) != CUDA_SUCCESS) {
+        set_error("upload_shared_colour: colour descriptor unavailable");
+        return false;
+    }
+    const size_t bytes_per_texel =
+        (ad.Format == CU_AD_FORMAT_FLOAT ? 4u : ad.Format == CU_AD_FORMAT_HALF ? 2u : 1u) *
+        ad.NumChannels;
+    const size_t row_bytes = (size_t)ad.Width * bytes_per_texel;
+    if (src_pitch < row_bytes || rows > ad.Height) {
+        set_error("upload_shared_colour: source is smaller than colour array");
+        return false;
+    }
+    CUDA_MEMCPY2D copy{};
+    copy.srcMemoryType = CU_MEMORYTYPE_HOST;
+    copy.srcHost = src;
+    copy.srcPitch = src_pitch;
+    copy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+    copy.dstArray = g.color.level0;
+    copy.WidthInBytes = row_bytes;
+    copy.Height = rows;
+    return cu_ok(g.cu.cuMemcpy2D(&copy), "cuMemcpy2D (colour upload)");
+}
+
+bool read_shared_output(void *dst, size_t dst_pitch, unsigned rows) {
+    if (!dst || !dst_pitch || !rows || !g.cu.cuMemcpy2D || !g.output.level0) {
+        set_error("read_shared_output: invalid destination or output");
+        return false;
+    }
+    CUDA_ARRAY_DESCRIPTOR ad{};
+    if (!g.cu.cuArrayGetDescriptor ||
+        g.cu.cuArrayGetDescriptor(&ad, g.output.level0) != CUDA_SUCCESS) {
+        set_error("read_shared_output: output descriptor unavailable");
+        return false;
+    }
+    const size_t bytes_per_texel =
+        (ad.Format == CU_AD_FORMAT_FLOAT ? 4u : ad.Format == CU_AD_FORMAT_HALF ? 2u : 1u) *
+        ad.NumChannels;
+    const size_t row_bytes = (size_t)ad.Width * bytes_per_texel;
+    if (dst_pitch < row_bytes || rows > ad.Height) {
+        set_error("read_shared_output: destination is smaller than output");
+        return false;
+    }
+    CUDA_MEMCPY2D copy{};
+    copy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+    copy.srcArray = g.output.level0;
+    copy.dstMemoryType = CU_MEMORYTYPE_HOST;
+    copy.dstHost = dst;
+    copy.dstPitch = dst_pitch;
+    copy.WidthInBytes = row_bytes;
+    copy.Height = rows;
+    return cu_ok(g.cu.cuMemcpy2D(&copy), "cuMemcpy2D (shared output)");
 }
 
 bool debug_read_shared_colour(void *rows, size_t row_bytes, unsigned row_count) {

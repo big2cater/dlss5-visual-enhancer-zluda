@@ -404,6 +404,20 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     const UINT padded = aligned_pitch(row_bytes);
     const UINT out_row_bytes = output_width * 8;
     const UINT out_padded = aligned_pitch(out_row_bytes);
+    // Direct readback/upload bypasses D3D12 resource barrier flushes. On AMD
+    // GPUs with ZLUDA, this causes L1/L2 cache desynchronization and severe
+    // video flickering. Default to false (safe 09-08 D3D12 staging path),
+    // requiring explicit opt-in with DLSS_DIRECT_READBACK=1 / DLSS_DIRECT_UPLOAD=1.
+    const bool direct_readback = [] {
+        char value[8] = {};
+        return GetEnvironmentVariableA("DLSS_DIRECT_READBACK", value,
+                                       sizeof value) > 0 && value[0] == '1';
+    }();
+    const bool direct_upload = [] {
+        char value[8] = {};
+        return GetEnvironmentVariableA("DLSS_DIRECT_UPLOAD", value,
+                                       sizeof value) > 0 && value[0] == '1';
+    }();
     if (in.width != s->width || in.height != s->height || output_width != s->out_width || output_height != s->out_height) {
         s->release_images();
         s->colour = make_texture(s->device, in.width, in.height, false);
@@ -450,16 +464,29 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         return false;
     }
 
-    {
+    if (direct_upload) {
+        if (!dlss_cuda::upload_shared_colour(in.pixels.data(), row_bytes, in.height)) {
+            error = dlss_cuda::last_error();
+            return false;
+        }
+    } else {
         unsigned char *mapped = nullptr;
         D3D12_RANGE nothing{0, 0};
         s->upload->Map(0, &nothing, (void **)&mapped);
-        for (unsigned y = 0; y < in.height; ++y)
-            memcpy(mapped + (size_t)y * padded,
-                   (const unsigned char *)in.pixels.data() + (size_t)y * row_bytes, row_bytes);
+        const unsigned char *source = (const unsigned char *)in.pixels.data();
+        if (padded == row_bytes) {
+            // Most video widths produce a naturally aligned row.  Copy the
+            // whole image in one call so the staging upload does not pay a
+            // per-row call/branch cost.
+            memcpy(mapped, source, (size_t)row_bytes * in.height);
+        } else {
+            for (unsigned y = 0; y < in.height; ++y)
+                memcpy(mapped + (size_t)y * padded, source + (size_t)y * row_bytes, row_bytes);
+        }
         s->upload->Unmap(0, nullptr);
     }
 
+    if (!direct_upload) {
     D3D12_TEXTURE_COPY_LOCATION into{};
     into.pResource = s->colour;
     into.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -479,16 +506,17 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-    s->allocator->Reset();
-    s->cmd->Reset(s->allocator, nullptr);
-    s->cmd->ResourceBarrier(1, &barrier);
-    s->cmd->CopyTextureRegion(&into, 0, 0, 0, &from, nullptr);
-    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-    s->cmd->ResourceBarrier(1, &barrier);
-    s->cmd->Close();
-    ID3D12CommandList *lists[] = {s->cmd};
-    s->queue->ExecuteCommandLists(1, lists);
-    s->wait();
+        s->allocator->Reset();
+        s->cmd->Reset(s->allocator, nullptr);
+        s->cmd->ResourceBarrier(1, &barrier);
+        s->cmd->CopyTextureRegion(&into, 0, 0, 0, &from, nullptr);
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        s->cmd->ResourceBarrier(1, &barrier);
+        s->cmd->Close();
+        ID3D12CommandList *lists[] = {s->cmd};
+        s->queue->ExecuteCommandLists(1, lists);
+        s->wait();
+    }
 
     // Optional motion-vector guidance (video): either copy a GPU-produced
     // packed R16G16_FLOAT buffer directly, or use the compatibility CPU map.
@@ -521,10 +549,15 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
             unsigned char *mapped = nullptr;
             D3D12_RANGE nothing{0, 0};
             s->motion_up->Map(0, &nothing, (void **)&mapped);
-            for (unsigned y = 0; y < in.height; ++y)
-                memcpy(mapped + (size_t)y * mPitch,
-                       (const unsigned char *)motion->pixels.data() + (size_t)y * in.width * 4,
-                       (size_t)in.width * 4);
+            const unsigned char *source = (const unsigned char *)motion->pixels.data();
+            const size_t row_bytes_motion = (size_t)in.width * 4;
+            if (mPitch == row_bytes_motion) {
+                memcpy(mapped, source, row_bytes_motion * in.height);
+            } else {
+                for (unsigned y = 0; y < in.height; ++y)
+                    memcpy(mapped + (size_t)y * mPitch,
+                           source + (size_t)y * row_bytes_motion, row_bytes_motion);
+            }
             s->motion_up->Unmap(0, nullptr);
         }
         D3D12_TEXTURE_COPY_LOCATION dst{};
@@ -557,7 +590,8 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     }
 
     dlss_cuda::FrameDesc frame{};
-    frame.color = s->colour;
+    frame.color = direct_upload ? nullptr : s->colour;
+    frame.color_is_shared = direct_upload;
     frame.output = s->result;
     if ((motion_gpu || (motion && !motion->empty())) && s->motion_tex)
         frame.motion_vectors = s->motion_tex;
@@ -572,7 +606,7 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     frame.reset_accumulation = settings.reset_accumulation;
     const int passes = settings.passes < 1 ? 1 : settings.passes;
     for (int pass = 0; pass < passes; ++pass) {
-        if (!dlss_cuda::evaluate(frame)) {
+        if (!dlss_cuda::evaluate(frame, !direct_readback)) {
             error = dlss_cuda::last_error();
             return false;
         }
@@ -581,48 +615,59 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
             frame.reset_accumulation = false;
     }
 
-    D3D12_RESOURCE_BARRIER back{};
-    back.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    back.Transition.pResource = s->result;
-    back.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    back.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    back.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-
-    D3D12_TEXTURE_COPY_LOCATION source{};
-    source.pResource = s->result;
-    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    D3D12_TEXTURE_COPY_LOCATION target{};
-    target.pResource = s->readback;
-    target.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    target.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    target.PlacedFootprint.Footprint.Width = output_width;
-    target.PlacedFootprint.Footprint.Height = output_height;
-    target.PlacedFootprint.Footprint.Depth = 1;
-    target.PlacedFootprint.Footprint.RowPitch = out_padded;
-
-    s->allocator->Reset();
-    s->cmd->Reset(s->allocator, nullptr);
-    s->cmd->ResourceBarrier(1, &back);
-    s->cmd->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
-    std::swap(back.Transition.StateBefore, back.Transition.StateAfter);
-    s->cmd->ResourceBarrier(1, &back);
-    s->cmd->Close();
-    s->queue->ExecuteCommandLists(1, lists);
-    s->wait();
-
     out.width = output_width;
     out.height = output_height;
     out.pixels.resize((size_t)output_width * output_height * 4);
-    {
+    if (direct_readback) {
+        if (!dlss_cuda::read_shared_output(out.pixels.data(), out_row_bytes, output_height)) {
+            error = dlss_cuda::last_error();
+            return false;
+        }
+    } else {
+        D3D12_RESOURCE_BARRIER back{};
+        back.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        back.Transition.pResource = s->result;
+        back.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        back.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        back.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+        D3D12_TEXTURE_COPY_LOCATION source{};
+        source.pResource = s->result;
+        source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION target{};
+        target.pResource = s->readback;
+        target.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        target.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        target.PlacedFootprint.Footprint.Width = output_width;
+        target.PlacedFootprint.Footprint.Height = output_height;
+        target.PlacedFootprint.Footprint.Depth = 1;
+        target.PlacedFootprint.Footprint.RowPitch = out_padded;
+
+        s->allocator->Reset();
+        s->cmd->Reset(s->allocator, nullptr);
+        s->cmd->ResourceBarrier(1, &back);
+        s->cmd->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+        std::swap(back.Transition.StateBefore, back.Transition.StateAfter);
+        s->cmd->ResourceBarrier(1, &back);
+        s->cmd->Close();
+        ID3D12CommandList *readback_lists[] = {s->cmd};
+        s->queue->ExecuteCommandLists(1, readback_lists);
+        s->wait();
+
         unsigned char *mapped = nullptr;
         D3D12_RANGE whole{0, (SIZE_T)out_padded * output_height};
         if (FAILED(s->readback->Map(0, &whole, (void **)&mapped))) {
             error = "the result could not be read back";
             return false;
         }
-        for (unsigned y = 0; y < output_height; ++y)
-            memcpy((unsigned char *)out.pixels.data() + (size_t)y * out_row_bytes,
-                   mapped + (size_t)y * out_padded, out_row_bytes);
+        unsigned char *destination = (unsigned char *)out.pixels.data();
+        if (out_padded == out_row_bytes) {
+            memcpy(destination, mapped, (size_t)out_row_bytes * output_height);
+        } else {
+            for (unsigned y = 0; y < output_height; ++y)
+                memcpy(destination + (size_t)y * out_row_bytes,
+                       mapped + (size_t)y * out_padded, out_row_bytes);
+        }
         s->readback->Unmap(0, nullptr);
     }
 

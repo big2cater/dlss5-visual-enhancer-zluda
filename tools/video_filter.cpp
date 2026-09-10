@@ -56,6 +56,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -101,7 +102,10 @@ struct Pipe {
         SECURITY_ATTRIBUTES attributes{};
         attributes.nLength = sizeof attributes;
         attributes.bInheritHandle = TRUE;
-        if (!CreatePipe(&read_end, &write_end, &attributes, 0)) return false;
+        // Raw video frames are multi-megabyte. The Win32 default pipe buffer
+        // is only a few KiB, which turns every frame into thousands of wakeups
+        // and context switches between ffmpeg and this process.
+        if (!CreatePipe(&read_end, &write_end, &attributes, 1 << 20)) return false;
         // Keep the ends we use ourselves from being inherited by mistake.
         SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, inheritable_read ? HANDLE_FLAG_INHERIT : 0);
         SetHandleInformation(write_end, HANDLE_FLAG_INHERIT, inheritable_write ? HANDLE_FLAG_INHERIT : 0);
@@ -268,25 +272,40 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
                            L"-map 1:v " +
                            ((output_width != params.width || output_height != params.height) ?
                             (L"-vf scale=" + std::to_wstring(output_width) + L":" + std::to_wstring(output_height) + L":flags=lanczos ") : L"") +
+                           // Encoding is not part of the neural pass. Use a
+                           // faster x264 preset so the CPU encoder is less
+                           // likely to hold up the GPU/pipe without changing
+                           // the requested CRF.
                            L"-c:v libx264 -crf " + std::to_wstring(crf) +
-                           L" -preset medium -pix_fmt yuv420p " +
+                           L" -preset veryfast -pix_fmt yuv420p " +
                            (audio ? L"-c:a copy " : L"-an ") +
                            L"\"" + output + L"\"";
     if (!spawn(command, feed, empty, child)) return false;
     return true;
 }
 
+const std::array<uint16_t, 65536> &rgb48_half_lut() {
+    static const std::array<uint16_t, 65536> lut = [] {
+        std::array<uint16_t, 65536> values{};
+        for (unsigned i = 0; i < values.size(); ++i)
+            values[i] = enhancer::float_to_half((float)i / 65535.0f);
+        return values;
+    }();
+    return lut;
+}
+
 void rgb48_to_half_rgba(const unsigned char *rgb48, enhancer::Image &image) {
     const uint16_t *src = (const uint16_t *)rgb48;
     uint16_t *dst = image.pixels.data();
+    const auto &lut = rgb48_half_lut();
     const size_t count = (size_t)image.width * image.height;
     for (size_t i = 0; i < count; ++i) {
         const uint16_t r = src[i * 3 + 0];
         const uint16_t g = src[i * 3 + 1];
         const uint16_t b = src[i * 3 + 2];
-        dst[i * 4 + 0] = enhancer::float_to_half(r / 65535.0f);
-        dst[i * 4 + 1] = enhancer::float_to_half(g / 65535.0f);
-        dst[i * 4 + 2] = enhancer::float_to_half(b / 65535.0f);
+        dst[i * 4 + 0] = lut[r];
+        dst[i * 4 + 1] = lut[g];
+        dst[i * 4 + 2] = lut[b];
         dst[i * 4 + 3] = 0x3C00; // 1.0
     }
 }
@@ -312,25 +331,41 @@ uint16_t clamp_half_to_u16(uint16_t half) {
     return (uint16_t)(to_sdr(value) * 65535.0 + 0.5);
 }
 
+const std::array<uint16_t, 65536> &half_to_rgb48_lut() {
+    static std::array<uint16_t, 65536> lut{};
+    static double cached_gamma = -1.0;
+    if (cached_gamma != g_gamma) {
+        for (unsigned i = 0; i < lut.size(); ++i)
+            lut[i] = clamp_half_to_u16((uint16_t)i);
+        cached_gamma = g_gamma;
+    }
+    return lut;
+}
+
 // half RGBA -> rgb48, and while we are in there, a cheap blank-frame check.
 void half_rgba_to_rgb48(const enhancer::Image &image, unsigned char *rgb48, bool &blank) {
     const uint16_t *src = image.pixels.data();
     uint16_t *dst = (uint16_t *)rgb48;
+    const auto &lut = half_to_rgb48_lut();
     const size_t count = (size_t)image.width * image.height;
     double sum = 0.0, sum_sq = 0.0;
+    size_t samples = 0;
     for (size_t i = 0; i < count; ++i) {
-        const uint16_t r = clamp_half_to_u16(src[i * 4 + 0]);
-        const uint16_t g = clamp_half_to_u16(src[i * 4 + 1]);
-        const uint16_t b = clamp_half_to_u16(src[i * 4 + 2]);
+        const uint16_t r = lut[src[i * 4 + 0]];
+        const uint16_t g = lut[src[i * 4 + 1]];
+        const uint16_t b = lut[src[i * 4 + 2]];
         dst[i * 3 + 0] = r;
         dst[i * 3 + 1] = g;
         dst[i * 3 + 2] = b;
-        const double luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 65535.0;
-        sum += luma;
-        sum_sq += luma * luma;
+        if ((i & 7u) == 0) {
+            const double luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 65535.0;
+            sum += luma;
+            sum_sq += luma * luma;
+            ++samples;
+        }
     }
-    const double mean = sum / (double)count;
-    const double variance = sum_sq / (double)count - mean * mean;
+    const double mean = samples ? sum / (double)samples : 0.0;
+    const double variance = samples ? sum_sq / (double)samples - mean * mean : 0.0;
     blank = mean < 0.05 && variance < 0.01;
 }
 
@@ -355,6 +390,7 @@ void resize_rgb48(const unsigned char *src, unsigned sw, unsigned sh,
 struct SceneDetector {
     double threshold = 0.30; // mean luma difference in 0..1 that counts as a cut
     std::vector<uint16_t> previous_luma; // strided grid, null until the first frame
+    std::vector<uint16_t> current_luma;  // scratch buffer reused for each frame
     unsigned step_x = 1, step_y = 1;
 
     void configure(unsigned width, unsigned height, double threshold_value) {
@@ -363,41 +399,43 @@ struct SceneDetector {
         // planes directly, no resampling needed for a cut test.
         step_x = width / 64; if (step_x < 1) step_x = 1;
         step_y = height / 36; if (step_y < 1) step_y = 1;
+        const size_t samples = (size_t)((width + step_x - 1) / step_x) *
+                               ((height + step_y - 1) / step_y);
+        previous_luma.clear();
+        current_luma.clear();
+        previous_luma.reserve(samples);
+        current_luma.reserve(samples);
     }
 
     // Returns true when the incoming frame should reset the accumulation.
     bool consider(const unsigned char *rgb48, unsigned width, unsigned height) {
         const uint16_t *src = (const uint16_t *)rgb48;
-        std::vector<uint16_t> current;
+        current_luma.clear();
         for (unsigned y = 0; y < height; y += step_y) {
             for (unsigned x = 0; x < width; x += step_x) {
                 const uint16_t r = src[((size_t)y * width + x) * 3 + 0];
                 const uint16_t g = src[((size_t)y * width + x) * 3 + 1];
                 const uint16_t b = src[((size_t)y * width + x) * 3 + 2];
-                current.push_back((uint16_t)(((uint32_t)r * 19595 + (uint32_t)g * 38470 +
-                                              (uint32_t)b * 7471) >> 16));
+                current_luma.push_back((uint16_t)(((uint32_t)r * 19595 + (uint32_t)g * 38470 +
+                                                   (uint32_t)b * 7471) >> 16));
             }
         }
         if (previous_luma.empty()) {
-            previous_luma = std::move(current);
+            previous_luma.swap(current_luma);
             return true; // first frame always resets
         }
-        if (current.size() != previous_luma.size()) {
-            previous_luma = std::move(current);
+        if (current_luma.size() != previous_luma.size()) {
+            previous_luma.swap(current_luma);
             return true;
         }
         uint64_t total = 0;
-        for (size_t i = 0; i < current.size(); ++i) {
-            uint64_t d = current[i] > previous_luma[i] ? current[i] - previous_luma[i]
-                                                       : previous_luma[i] - current[i];
+        for (size_t i = 0; i < current_luma.size(); ++i) {
+            uint64_t d = current_luma[i] > previous_luma[i] ? current_luma[i] - previous_luma[i]
+                                                            : previous_luma[i] - current_luma[i];
             total += d;
         }
-        // Save the sample count before moving the vector.  Reading
-        // current.size() after std::move() usually returns zero, which made
-        // mean_diff become infinity and caused auto mode to reset every frame
-        // (visible as severe video flicker).
-        const size_t sample_count = current.size();
-        previous_luma = std::move(current);
+        const size_t sample_count = current_luma.size();
+        previous_luma.swap(current_luma);
         const double mean_diff = sample_count
                                      ? (double)total / ((double)sample_count * 65535.0)
                                      : 1.0;
@@ -909,12 +947,15 @@ struct GpuFlow {
             if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) break;
             rel(adapter);
         }
-        if (!device) { rel(adapter); factory->Release(); return false; }
+        if (!device) { fprintf(stderr, "[flow] no D3D12 device\n"); rel(adapter); factory->Release(); return false; }
         D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
         if ((!queue && FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)))) ||
             FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&allocator))) ||
             FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator, nullptr, IID_PPV_ARGS(&cmd))) ||
-            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) { rel(adapter); factory->Release(); stop(); return false; }
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+            fprintf(stderr, "[flow] failed to create D3D12 compute objects (queue=%p)\n", (void*)queue);
+            rel(adapter); factory->Release(); stop(); return false;
+        }
         cmd->Close(); fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         const char *src = R"(
 cbuffer Params : register(b0) { uint W; uint H; uint FW; uint FH; };
@@ -931,7 +972,8 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
     if(sad<best) { best=sad; bestX=dx; bestY=dy; } }
   Flow[y*W+x]=int2(bestX,bestY);
   uint hx = f32tof16(float(bestX * 4)); uint hy = f32tof16(float(bestY * 4));
-    uint old = Hist[py*FW+px]; float ox=f16tof32(old & 0xffff), oy=f16tof32(old >> 16);
+    uint hpx = min(x * 4, FW - 1), hpy = min(y * 4, FH - 1);
+    uint old = Hist[hpy*FW+hpx]; float ox=f16tof32(old & 0xffff), oy=f16tof32(old >> 16);
     float motion_mag = abs(float(bestX)) + abs(float(bestY));
     float current_weight = motion_mag >= 2.0 ? 0.88 : 0.70;
     float sx = ox * (1.0 - current_weight) + float(bestX * 4) * current_weight;
@@ -944,15 +986,18 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
 }
 )";
         ID3DBlob *cs = nullptr, *err = nullptr;
-        if (FAILED(D3DCompile(src, strlen(src), "gpu_flow", nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &err))) { if(err) err->Release(); rel(adapter); factory->Release(); stop(); return false; }
+        if (FAILED(D3DCompile(src, strlen(src), "gpu_flow", nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &err))) {
+            if (err) { fprintf(stderr, "[flow] shader compile failed: %.*s\n", (int)err->GetBufferSize(), (const char*)err->GetBufferPointer()); err->Release(); }
+            rel(adapter); factory->Release(); stop(); return false;
+        }
         D3D12_DESCRIPTOR_RANGE ranges[2]{}; ranges[0].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[0].NumDescriptors=3; ranges[0].BaseShaderRegister=0; ranges[1].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_UAV; ranges[1].NumDescriptors=2; ranges[1].BaseShaderRegister=0;
         D3D12_ROOT_PARAMETER rp[3]{}; rp[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[0].Constants.Num32BitValues=4; rp[0].Constants.ShaderRegister=0; rp[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp[1].DescriptorTable.NumDescriptorRanges=1; rp[1].DescriptorTable.pDescriptorRanges=&ranges[0]; rp[2].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp[2].DescriptorTable.NumDescriptorRanges=1; rp[2].DescriptorTable.pDescriptorRanges=&ranges[1];
         D3D12_ROOT_SIGNATURE_DESC rsd{}; rsd.NumParameters=3; rsd.pParameters=rp; rsd.Flags=D3D12_ROOT_SIGNATURE_FLAG_NONE; ID3DBlob *sig=nullptr;
         if (FAILED(D3D12SerializeRootSignature(&rsd,D3D_ROOT_SIGNATURE_VERSION_1,&sig,&err)) || FAILED(device->CreateRootSignature(0,sig->GetBufferPointer(),sig->GetBufferSize(),IID_PPV_ARGS(&root)))) { if(err) err->Release(); if(sig) sig->Release(); cs->Release(); rel(adapter); factory->Release(); stop(); return false; }
         sig->Release(); D3D12_COMPUTE_PIPELINE_STATE_DESC pd{}; pd.pRootSignature=root; pd.CS={cs->GetBufferPointer(),cs->GetBufferSize()};
-        bool ok=SUCCEEDED(device->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pso))); cs->Release(); if(!ok) { rel(adapter); factory->Release(); stop(); return false; }
+        bool ok=SUCCEEDED(device->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pso))); cs->Release(); if(!ok) { fprintf(stderr, "[flow] CreateComputePipelineState failed\n"); rel(adapter); factory->Release(); stop(); return false; }
         D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors=5; hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        if(FAILED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap)))) { rel(adapter); factory->Release(); stop(); return false; }
+        if(FAILED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap)))) { fprintf(stderr, "[flow] CreateDescriptorHeap failed\n"); rel(adapter); factory->Release(); stop(); return false; }
         rel(adapter); factory->Release(); ready=true; return resize();
     }
     bool resize() {
@@ -970,8 +1015,31 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
         D3D12_SHADER_RESOURCE_VIEW_DESC sv{}; sv.ViewDimension=D3D12_SRV_DIMENSION_BUFFER; sv.Format=DXGI_FORMAT_UNKNOWN; sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Buffer.NumElements=qw*qh; sv.Buffer.StructureByteStride=4; device->CreateShaderResourceView(prev,&sv,{base.ptr}); device->CreateShaderResourceView(cur,&sv,{base.ptr+cpu}); D3D12_SHADER_RESOURCE_VIEW_DESC hv=sv; hv.Buffer.NumElements=fw*fh; device->CreateShaderResourceView(history,&hv,{base.ptr+cpu*2});
         D3D12_UNORDERED_ACCESS_VIEW_DESC uv{}; uv.ViewDimension=D3D12_UAV_DIMENSION_BUFFER; uv.Format=DXGI_FORMAT_UNKNOWN; uv.Buffer.NumElements=qw*qh; uv.Buffer.StructureByteStride=8; device->CreateUnorderedAccessView(out,nullptr,&uv,{base.ptr+cpu*2});
         D3D12_UNORDERED_ACCESS_VIEW_DESC fv{}; fv.ViewDimension=D3D12_UAV_DIMENSION_BUFFER; fv.Format=DXGI_FORMAT_UNKNOWN; fv.Buffer.NumElements=fw*fh; fv.Buffer.StructureByteStride=4; device->CreateUnorderedAccessView(full_out,nullptr,&fv,{base.ptr+cpu*3});
-        allocator->Reset(); cmd->Reset(allocator,pso); ID3D12DescriptorHeap *hs[]={heap}; cmd->SetDescriptorHeaps(1,hs); cmd->SetComputeRootSignature(root); cmd->SetComputeRoot32BitConstants(0,4,c,0); auto gpu=heap->GetGPUDescriptorHandleForHeapStart(); cmd->SetComputeRootDescriptorTable(1,gpu); cmd->SetComputeRootDescriptorTable(2,{gpu.ptr+cpu*2}); cmd->Dispatch((qw+7)/8,(qh+7)/8,1); D3D12_RESOURCE_BARRIER b[2]{}; b[0].Type=D3D12_RESOURCE_BARRIER_TYPE_UAV; b[0].UAV.pResource=out; b[1].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[1].Transition.pResource=full_out; b[1].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[1].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[1].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; cmd->ResourceBarrier(2,b); cmd->CopyResource(readback,out); cmd->Close(); ID3D12CommandList *ls[]={cmd}; queue->ExecuteCommandLists(1,ls); queue->Signal(fence,++fence_value); if(fence->GetCompletedValue()<fence_value){fence->SetEventOnCompletion(fence_value,fence_event);WaitForSingleObject(fence_event,5000);}
-        allocator->Reset(); cmd->Reset(allocator,nullptr); D3D12_RESOURCE_BARRIER hb[2]{}; hb[0].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; hb[0].Transition.pResource=history; hb[0].Transition.StateBefore=D3D12_RESOURCE_STATE_GENERIC_READ; hb[0].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_DEST; hb[0].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; hb[1].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; hb[1].Transition.pResource=full_out; hb[1].Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE; hb[1].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; hb[1].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; cmd->ResourceBarrier(1,&hb[0]); cmd->CopyResource(history,full_out); std::swap(hb[0].Transition.StateBefore,hb[0].Transition.StateAfter); cmd->ResourceBarrier(1,&hb[0]); cmd->Close(); ID3D12CommandList *hls[]={cmd}; queue->ExecuteCommandLists(1,hls); queue->Signal(fence,++fence_value); if(fence->GetCompletedValue()<fence_value){fence->SetEventOnCompletion(fence_value,fence_event);WaitForSingleObject(fence_event,5000);}
+        allocator->Reset(); cmd->Reset(allocator,pso); ID3D12DescriptorHeap *hs[]={heap}; cmd->SetDescriptorHeaps(1,hs); cmd->SetComputeRootSignature(root); cmd->SetComputeRoot32BitConstants(0,4,c,0); auto gpu=heap->GetGPUDescriptorHandleForHeapStart(); cmd->SetComputeRootDescriptorTable(1,gpu); cmd->SetComputeRootDescriptorTable(2,{gpu.ptr+cpu*2}); cmd->Dispatch((qw+7)/8,(qh+7)/8,1); D3D12_RESOURCE_BARRIER b[3]{}; b[0].Type=D3D12_RESOURCE_BARRIER_TYPE_UAV; b[0].UAV.pResource=out; b[1].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[1].Transition.pResource=out; b[1].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[1].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[1].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b[2].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[2].Transition.pResource=full_out; b[2].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[2].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[2].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; cmd->ResourceBarrier(3,b); cmd->CopyResource(readback,out); cmd->Close(); ID3D12CommandList *ls[]={cmd}; queue->ExecuteCommandLists(1,ls); queue->Signal(fence,++fence_value); if(fence->GetCompletedValue()<fence_value){fence->SetEventOnCompletion(fence_value,fence_event);WaitForSingleObject(fence_event,5000);}
+        allocator->Reset(); cmd->Reset(allocator,nullptr);
+        D3D12_RESOURCE_BARRIER hb[3]{};
+        hb[0].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        hb[0].Transition.pResource=history;
+        hb[0].Transition.StateBefore=D3D12_RESOURCE_STATE_GENERIC_READ;
+        hb[0].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_DEST;
+        hb[0].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd->ResourceBarrier(1,&hb[0]);
+        cmd->CopyResource(history,full_out);
+        hb[0].Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_DEST;
+        hb[0].Transition.StateAfter=D3D12_RESOURCE_STATE_GENERIC_READ;
+        cmd->ResourceBarrier(1,&hb[0]);
+        hb[2].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        hb[2].Transition.pResource=out;
+        hb[2].Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        hb[2].Transition.StateAfter=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        hb[2].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd->ResourceBarrier(1,&hb[2]);
+        hb[2].Transition.pResource=full_out;
+        hb[2].Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        hb[2].Transition.StateAfter=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        hb[2].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd->ResourceBarrier(1,&hb[2]);
+        cmd->Close(); ID3D12CommandList *hls[]={cmd}; queue->ExecuteCommandLists(1,hls); queue->Signal(fence,++fence_value); if(fence->GetCompletedValue()<fence_value){fence->SetEventOnCompletion(fence_value,fence_event);WaitForSingleObject(fence_event,5000);}
         int *r=nullptr; D3D12_RANGE rr{0,(SIZE_T)qw*qh*8}; if(FAILED(readback->Map(0,&rr,(void**)&r))) return false; flow.resize((size_t)qw*qh*2); for(size_t i=0;i<(size_t)qw*qh;i++){flow[i*2]=(short)r[i*2];flow[i*2+1]=(short)r[i*2+1];} readback->Unmap(0,nullptr); prev_luma=cur_luma; return true;
     }
 };
@@ -1286,9 +1354,16 @@ static int run_main_once(int argc, char **argv) {
     CpuFlow flowgen; // motion-vector estimator for temporal guidance
     GpuFlow gpuflow; // D3D12 compute estimator; CPU remains the fallback
     bool gpu_flow_ready = false;
+    const bool flow_stats = [] {
+        const char *value = std::getenv("DLSS_FLOW_STATS");
+        return value && value[0] && std::strcmp(value, "0") != 0;
+    }();
     if (options.flow) {
         // Keep the flow command queue independent until cross-queue fence
         // handoff is fully validated; this is the stable GPU path.
+        // Keep the flow queue independent from the DLSS queue. Sharing the
+        // queue reuses command execution state owned by the processor and can
+        // corrupt the second frame on ZLUDA when both allocators are reset.
         gpu_flow_ready = gpuflow.init(params.width, params.height,
                                       processor.native_device(), nullptr);
         fprintf(stderr, "[flow] %s\n", gpu_flow_ready ?
@@ -1297,12 +1372,14 @@ static int run_main_once(int argc, char **argv) {
     }
 
     const size_t frame_bytes = (size_t)params.width * params.height * 6;
-    const size_t model_bytes = (size_t)model_w * model_h * 6;
     std::vector<unsigned char> input_frame(frame_bytes);
-    std::vector<unsigned char> model_frame(model_bytes);
-    std::vector<unsigned char> output_frame(frame_bytes);
-    std::vector<unsigned char> model_output(model_bytes);
+    std::vector<unsigned char> model_output((size_t)model_w * model_h * 6);
     enhancer::Image in, out;
+    // Reuse motion buffers across frames.  Flow is optional, but when enabled
+    // these vectors otherwise allocate and release several times per frame.
+    enhancer::Image motion;
+    std::vector<unsigned> flow_luma;
+    std::vector<short> qflow;
     in.width = model_w;
     in.height = model_h;
     in.pixels.resize((size_t)model_w * model_h * 4);
@@ -1350,16 +1427,18 @@ static int run_main_once(int argc, char **argv) {
         if (reset) ++reset_count;
         settings.reset_accumulation = reset;
 
-        memcpy(model_frame.data(), input_frame.data(), frame_bytes);
-        rgb48_to_half_rgba(model_frame.data(), in);
+        // The model currently runs at source resolution, so the decoder's
+        // RGB48 buffer is already the exact input layout needed by both the
+        // neural conversion and optional motion estimation. Avoid copying
+        // the whole frame before every evaluation.
+        rgb48_to_half_rgba(input_frame.data(), in);
         const auto began = std::chrono::steady_clock::now();
 
         // Optional motion-vector guidance: backward flow (where each pixel was
         // in the previous frame, in pixels). Zeroed on reset frames.
-        enhancer::Image motion;
         ID3D12Resource *gpu_motion = nullptr;
         unsigned gpu_motion_pitch = 0;
-    const bool useFlow = options.flow;
+        const bool useFlow = options.flow;
         if (useFlow) {
             motion.width = model_w;
             motion.height = model_h;
@@ -1368,15 +1447,14 @@ static int run_main_once(int argc, char **argv) {
             if (gpu_flow_ready) {
                 if (reset) gpuflow.reset();
                 const unsigned qw = (model_w + 3) / 4, qh = (model_h + 3) / 4;
-                std::vector<unsigned> luma((size_t)qw * qh);
+                flow_luma.resize((size_t)qw * qh);
                 for (unsigned y = 0; y < qh; ++y) for (unsigned x = 0; x < qw; ++x) {
                     unsigned px = std::min(model_w - 1, x * 4u);
                     unsigned py = std::min(model_h - 1, y * 4u);
-                    const uint16_t *p = (const uint16_t *)(model_frame.data() + ((size_t)py * model_w + px) * 6);
-                    luma[(size_t)y * qw + x] = ((unsigned)p[0] * 19595u + (unsigned)p[1] * 38470u + (unsigned)p[2] * 7471u) >> 16;
+                    const uint16_t *p = (const uint16_t *)(input_frame.data() + ((size_t)py * model_w + px) * 6);
+                    flow_luma[(size_t)y * qw + x] = ((unsigned)p[0] * 19595u + (unsigned)p[1] * 38470u + (unsigned)p[2] * 7471u) >> 16;
                 }
-                std::vector<short> qflow;
-                generated = gpuflow.compute(luma, qflow);
+                generated = gpuflow.compute(flow_luma, qflow);
                 if (generated) {
                     CpuFlow::median3(qflow, qw, qh);
                     CpuFlow::upscale4(qflow, qw, qh, model_w, model_h, motion.pixels);
@@ -1388,36 +1466,40 @@ static int run_main_once(int argc, char **argv) {
                         settings.intensity > 1.0f || settings.global_tone > 1.0f ||
                         settings.local_tone > 1.0f || settings.local_structure > 1.0f ||
                         settings.skin_structure > 1.0f || settings.passes > 1;
-                    if (!reset && !high_temporal_risk && gpuflow.gpu_motion()) {
-                        gpu_motion = gpuflow.gpu_motion();
-                        gpu_motion_pitch = gpuflow.gpu_motion_pitch();
-                    }
+                    // `full_out` is a structured buffer used by the flow
+                    // compute pass, not a DLSS texture. Do not hand it to
+                    // NGX as a zero-copy motion resource: ZLUDA accepts the
+                    // pointer but can fault on the next frame. The readback
+                    // above is converted into the validated CPU Image path.
+                    (void)high_temporal_risk;
                 }
             }
-            if (!generated) flowgen.compute(model_frame.data(), model_w, model_h, reset, motion.pixels);
-            double msum = 0.0;
-            size_t mcnt = motion.pixels.size() / 2;
-            const uint16_t *mp = motion.pixels.data();
-            size_t nf = 0;
-            float mn = 0.0f, mx = 0.0f;
-            for (size_t i = 0; i + 1 < motion.pixels.size(); i += 2) {
-                float dx = enhancer::half_to_float(mp[i]);
-                float dy = enhancer::half_to_float(mp[i + 1]);
-                if (!std::isfinite(dx) || !std::isfinite(dy)) {
-                ++nf;
-                if (nf == 1)
-                    fprintf(stderr, "[flow-debug] first nonfinite at px %zu/%zu half=0x%04X,0x%04X\n",
-                            (i / 2) % params.width, (i / 2) / params.width, mp[i], mp[i + 1]);
+            if (!generated) flowgen.compute(input_frame.data(), model_w, model_h, reset, motion.pixels);
+            if (flow_stats) {
+                double msum = 0.0;
+                size_t mcnt = motion.pixels.size() / 2;
+                const uint16_t *mp = motion.pixels.data();
+                size_t nf = 0;
+                float mn = 0.0f, mx = 0.0f;
+                for (size_t i = 0; i + 1 < motion.pixels.size(); i += 2) {
+                    float dx = enhancer::half_to_float(mp[i]);
+                    float dy = enhancer::half_to_float(mp[i + 1]);
+                    if (!std::isfinite(dx) || !std::isfinite(dy)) {
+                        ++nf;
+                        if (nf == 1)
+                            fprintf(stderr, "[flow-debug] first nonfinite at px %zu/%zu half=0x%04X,0x%04X\n",
+                                    (i / 2) % params.width, (i / 2) / params.width, mp[i], mp[i + 1]);
+                    }
+                    msum += fabsf(dx) + fabsf(dy);
+                    float a = fabsf(dx), b = fabsf(dy);
+                    if (a > mx) mx = a; if (b > mx) mx = b;
+                    if (i == 0) { mn = a < b ? a : b; }
+                    if (mn > (a < b ? a : b)) mn = a < b ? a : b;
+                }
+                fprintf(stderr, "[flow] frame %u mean|mv|=%.3f px min=%.2f max=%.2f nonfinite=%zu\n",
+                        frame_index, mcnt ? (float)(msum / (double)mcnt) : 0.0f, mn, mx, nf);
+                fflush(stderr);
             }
-                msum += fabsf(dx) + fabsf(dy);
-                float a = fabsf(dx), b = fabsf(dy);
-                if (a > mx) mx = a; if (b > mx) mx = b;
-                if (i == 0) { mn = a < b ? a : b; }
-                if (mn > (a < b ? a : b)) mn = a < b ? a : b;
-            }
-            fprintf(stderr, "[flow] frame %u mean|mv|=%.3f px min=%.2f max=%.2f nonfinite=%zu\n",
-                    frame_index, mcnt ? (float)(msum / (double)mcnt) : 0.0f, mn, mx, nf);
-            fflush(stderr);
         }
 
         if (!processor.process(in, out, settings, error,
@@ -1456,7 +1538,6 @@ static int run_main_once(int argc, char **argv) {
             failed = true;
             break;
         }
-        memcpy(output_frame.data(), model_output.data(), frame_bytes);
         if (blank) {
             ++blank_count;
             fprintf(stderr, "[warn] frame %u output looks blank\n", frame_index);
@@ -1464,7 +1545,7 @@ static int run_main_once(int argc, char **argv) {
 
         // Feed the encoder; a dead pipe means it gave up (bad args, disk full).
         DWORD written = 0;
-        if (!WriteFile(encoder_stdin.write_end, output_frame.data(), (DWORD)frame_bytes,
+        if (!WriteFile(encoder_stdin.write_end, model_output.data(), (DWORD)frame_bytes,
                        &written, nullptr) || written != frame_bytes) {
             fprintf(stderr, "[FAIL] encoder pipe broke at frame %u\n", frame_index);
             failed = true;

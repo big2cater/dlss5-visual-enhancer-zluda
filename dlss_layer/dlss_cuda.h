@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 struct ID3D12Device;
@@ -128,6 +129,11 @@ struct FrameDesc {
     ID3D12Resource *motion_vectors = nullptr;
     ID3D12Resource *output = nullptr;
 
+    // When true, color is already in the layer's shared CUDA array and no
+    // D3D12 copy is needed. This is used by the video path's host upload fast
+    // path; color may be null in that case.
+    bool color_is_shared = false;
+
     float jitter_x = 0.0f;
     float jitter_y = 0.0f;
     float mv_scale_x = 1.0f;
@@ -147,7 +153,18 @@ bool create_feature(const FeatureDesc &desc);
 
 // Runs one DLSS evaluation. Stalls the D3D12 queue around the CUDA work; see
 // the note on synchronisation in dlss_cuda.cpp.
-bool evaluate(const FrameDesc &frame);
+// Runs one evaluation. When copy_output is false, the network's internal
+// output remains in the shared CUDA array and no D3D12 copy is issued; callers
+// can fetch it with read_shared_output().
+bool evaluate(const FrameDesc &frame, bool copy_output = true);
+
+// Uploads tightly packed half-float RGBA rows directly into the shared colour
+// array. This bypasses the intermediate D3D12 upload texture and queue fence.
+bool upload_shared_colour(const void *src, size_t src_pitch, unsigned rows);
+
+// Copies the internal neural output array directly to host memory after an
+// evaluation. dst_pitch is in bytes and must cover one complete row.
+bool read_shared_output(void *dst, size_t dst_pitch, unsigned rows);
 
 // Runs one evaluation over a swapchain buffer, converting into and out of the
 // half-float colour the network works in: the buffer goes in as colour and the
