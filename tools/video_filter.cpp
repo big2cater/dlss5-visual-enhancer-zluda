@@ -464,7 +464,7 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
 
     std::string actual_encoder = encoder_choice;
     if (actual_encoder == "auto") {
-        if (detect_amf_support(params.width, params.height)) {
+        if (detect_amf_support(output_width, output_height)) {
             actual_encoder = "h264_amf";
         } else {
             actual_encoder = "x264";
@@ -1601,10 +1601,12 @@ static int run_main_once(int argc, char **argv) {
     paths.cuda_driver = options.driver;
     paths.ngx_runtime = options.runtime;
     paths.nvapi = options.nvapi;
-    if (!options.dlss_model_preset.empty() && options.dlss_model_preset != "default")
+    if (!options.dlss_model_preset.empty() && options.dlss_model_preset != "default" && options.dlss_model_preset != "默认") {
         SetEnvironmentVariableA("DLSS_PRESET", options.dlss_model_preset.c_str());
-    else
+        fprintf(stderr, "[model] DLSS model preset: %s\n", options.dlss_model_preset.c_str());
+    } else {
         SetEnvironmentVariableA("DLSS_PRESET", nullptr);
+    }
 
     enhancer::Processor processor;
     if (!processor.start(paths, error, [&](const std::string &message) {

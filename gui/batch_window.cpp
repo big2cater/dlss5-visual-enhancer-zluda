@@ -223,8 +223,8 @@ QWidget *BatchWindow::build_left_column() {
     model_ = new QComboBox;
     model_->addItems({tr("默认"), QStringLiteral("J"), QStringLiteral("K"), QStringLiteral("L"),
                       QStringLiteral("M")});
-    model_->setEnabled(false);
-    model_->setToolTip(tr("当前 lowlatency 视频后端使用 DLL 默认模型预设。"));
+    model_->setEnabled(true);
+    model_->setToolTip(tr("选择 DLSS 模型预设（默认/J/K/L/M）。通过底层环境变量 DLSS_PRESET 传递。"));
     form->addRow(tr("DLSS模型"), model_);
 
     gamma_ = new QDoubleSpinBox;
@@ -314,9 +314,9 @@ QWidget *BatchWindow::build_right_column() {
     upscale_->addItems({tr("DLAA / native (1x)"), tr("Quality (1.5x)"), tr("Balanced (1.724x)"),
                         tr("Performance (2x)"), tr("Ultra Performance (3x)")});
     upscale_->setCurrentIndex(0);
-    upscale_->setEnabled(false);
+    upscale_->setEnabled(true);
     upscale_->setToolTip(
-        tr("当前 lowlatency 视频后端固定使用 native；Upscaling 实验功能暂不启用。"));
+        tr("超分输出模式：经 DLSS 5 神经增强后，超分放大至指定倍率的目标分辨率并进行硬件编码。"));
     form->addRow(tr("Upscaling 输出"), upscale_);
 
     // Three columns rather than one flow row: the path field takes whatever the
@@ -548,6 +548,8 @@ void BatchWindow::reset_effects() {
     skin_structure_->setValue(0);
     style_->setCurrentIndex(0);
     preset_->setCurrentIndex(0);
+    model_->setCurrentIndex(0);
+    upscale_->setCurrentIndex(0);
     auto_mask_->setChecked(true);
     gamma_->setValue(1.0);
     image_passes_->setValue(3);
@@ -630,6 +632,10 @@ QStringList BatchWindow::arguments() const {
         if (!audio_->isChecked()) args << QStringLiteral("--no-audio");
         if (dump_->isChecked() && !dump_dir_->text().trimmed().isEmpty())
             args << QStringLiteral("--dump-frames") << dump_dir_->text().trimmed();
+
+        static const char *upscale_modes[] = {"native", "quality", "balanced", "performance", "ultra"};
+        if (upscale_->currentIndex() > 0 && upscale_->currentIndex() < 5)
+            args << QStringLiteral("--upscale-mode") << QString::fromLatin1(upscale_modes[upscale_->currentIndex()]);
     }
 
     args << QStringLiteral("--intensity") << number(intensity_->value() / 100.0);
@@ -639,6 +645,8 @@ QStringList BatchWindow::arguments() const {
     args << QStringLiteral("--skin-structure") << number(skin_structure_->value() / 100.0);
     args << QStringLiteral("--style") << QString::number(style_->currentIndex());
     args << QStringLiteral("--preset") << QString::number(preset_->currentIndex());
+    if (model_->currentIndex() > 0)
+        args << QStringLiteral("--dlss-model-preset") << model_->currentText();
     args << QStringLiteral("--gamma") << number(gamma_->value());
     if (!auto_mask_->isChecked()) args << QStringLiteral("--no-auto-mask");
     // Translate first, then run: the parallel translation and the first
