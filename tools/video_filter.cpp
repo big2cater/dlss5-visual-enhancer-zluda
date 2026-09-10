@@ -688,7 +688,7 @@ void half_rgba_to_rgb48(const enhancer::Image &image, unsigned char *rgb48, bool
     }
     const double mean = samples ? sum / (double)samples : 0.0;
     const double variance = samples ? sum_sq / (double)samples - mean * mean : 0.0;
-    blank = mean < 0.05 && variance < 0.01;
+    blank = (mean < 0.005 && variance < 0.0001);
 }
 
 void resize_rgb48(const unsigned char *src, unsigned sw, unsigned sh,
@@ -1539,24 +1539,29 @@ int run_image_mode(int argc, char **argv) {
 // Samples every 8th pixel, so a 4K frame costs a few thousand half->float
 // conversions only.
 bool output_is_blank(const enhancer::Image &image) {
+    if (image.empty()) return true;
     const uint16_t *src = image.pixels.data();
     const size_t count = (size_t)image.width * image.height;
     const size_t step = 8;
     double sum = 0.0, sum_sq = 0.0;
     size_t samples = 0;
+    float max_luma = 0.0f;
     for (size_t i = 0; i < count; i += step) {
         const float r = enhancer::half_to_float(src[i * 4 + 0]);
         const float g = enhancer::half_to_float(src[i * 4 + 1]);
         const float b = enhancer::half_to_float(src[i * 4 + 2]);
-        const double luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        const float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+        if (luma > max_luma) max_luma = luma;
         sum += luma;
-        sum_sq += luma * luma;
+        sum_sq += (double)luma * luma;
         ++samples;
     }
     if (samples == 0) return true;
     const double mean = sum / (double)samples;
     const double variance = sum_sq / (double)samples - mean * mean;
-    return mean < 0.05 && variance < 0.01;
+    // A true blank output from a failed GPU launch has max_luma near zero (< 0.005)
+    // and almost zero variance (< 0.0001). A valid dark photograph/screenshot has real highlights.
+    return (max_luma < 0.005f) || (mean < 0.002 && variance < 0.0001);
 }
 
 } // namespace
