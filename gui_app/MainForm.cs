@@ -48,7 +48,7 @@ namespace DlssnrFilter
         // that fires on ordinary motion reads as flicker. 0.30 is a mean luma
         // change only a real cut reaches.
         public string CutThreshold { get; set; } = "0.30";
-        public double Gamma { get; set; } = 1.4;      // 1.4 = optimal balanced tone transfer
+        public double Gamma { get; set; } = 1.0;      // 1.0 = standard IEC 61966-2-1 physical sRGB 1:1
         public int Crf { get; set; } = 18;
         public string Fps { get; set; } = "0";
         public string MaxFrames { get; set; } = "0";
@@ -726,7 +726,7 @@ namespace DlssnrFilter
             _cbStyle.SelectedIndex = 0;
             _cbPreset.SelectedIndex = 0;
             _ckAutoMask.Checked = true;
-            _nGamma.Value = 1.4m;
+            _nGamma.Value = 1.0m;
             _nImagePasses.Value = 3;
             _nPasses.Value = 1;
             _cbReset.SelectedIndex = 0;
@@ -817,8 +817,8 @@ namespace DlssnrFilter
             _tbCut.Text = _s.CutThreshold;
             _tbFps.Text = _s.Fps;
             _tbMaxFrames.Text = _s.MaxFrames;
-            if (Math.Abs(_s.Gamma - 1.0) < 0.05)
-                _s.Gamma = 1.4;
+            if (Math.Abs(_s.Gamma - 1.4) < 0.05)
+                _s.Gamma = 1.0;
             _nGamma.Value = (decimal)Math.Clamp(_s.Gamma, 0.5, 3.0);
             _ckAudio.Checked = _s.Audio;
             _ckFlow.Checked = _s.Flow;
