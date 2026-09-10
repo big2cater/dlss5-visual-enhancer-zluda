@@ -7,10 +7,12 @@
 #include <QColor>
 #include <QComboBox>
 #include <QCoreApplication>
+#include <QDesktopServices>
 #include <QDir>
 #include <QDoubleSpinBox>
 #include <QDragEnterEvent>
 #include <QDropEvent>
+#include <QUrl>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFontMetrics>
@@ -71,7 +73,7 @@ QString settings_path() {
 } // namespace
 
 BatchWindow::BatchWindow() {
-    setWindowTitle(tr("DLSS 5 神经渲染滤镜 (AMD/ZLUDA)"));
+    setWindowTitle(tr("DLSS 5 神经渲染滤镜 (AMD/ZLUDA) - v2026.09.10-multipass"));
     setAcceptDrops(true);
 
     auto *central = new QWidget;
@@ -169,7 +171,18 @@ QWidget *BatchWindow::build_files() {
     mode_layout->addWidget(image_mode_);
     auto *defaults = new QPushButton(tr("恢复默认路径"));
     mode_layout->addWidget(defaults);
+    auto *repo_btn = new QPushButton(tr("GitHub 仓库"));
+    auto *update_btn = new QPushButton(tr("检查更新"));
+    mode_layout->addWidget(repo_btn);
+    mode_layout->addWidget(update_btn);
     mode_layout->addStretch(1);
+
+    connect(repo_btn, &QPushButton::clicked, this, [] {
+        QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/big2cater/dlss5-visual-enhancer-zluda")));
+    });
+    connect(update_btn, &QPushButton::clicked, this, [] {
+        QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/big2cater/dlss5-visual-enhancer-zluda/releases")));
+    });
 
     connect(video_mode_, &QRadioButton::toggled, this, [this](bool on) {
         if (on && !filling_) { auto_fill_output(false); update_mode_ui(); }

@@ -3,9 +3,13 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Linq;
+using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace DlssnrFilter
@@ -70,6 +74,11 @@ namespace DlssnrFilter
     // ---------------------------------------------------------------------
     public class MainForm : Form
     {
+        public const string AppVersion = "v2026.09.10-multipass";
+        public const string RepoUrl = "https://github.com/big2cater/dlss5-visual-enhancer-zluda";
+        public const string ReleasesApiUrl = "https://api.github.com/repos/big2cater/dlss5-visual-enhancer-zluda/releases/latest";
+        public const string ReleasesPageUrl = "https://github.com/big2cater/dlss5-visual-enhancer-zluda/releases";
+
         private readonly string _runDir = AppContext.BaseDirectory;
 
         private readonly GuiSettings _s = new();
@@ -85,7 +94,7 @@ namespace DlssnrFilter
         private CheckBox _ckAutoMask, _ckAudio, _ckDump, _ckFlow;
         private NumericUpDown _nPasses, _nImagePasses, _nEvery, _nCrf, _nGamma;
         private TextBox _tbCut, _tbFps, _tbMaxFrames, _tbDumpDir;
-        private Button _btnStart, _btnStop, _btnFrameHold, _btnDumpBrowse, _btnResetEffects, _btnCompare;
+        private Button _btnStart, _btnStop, _btnFrameHold, _btnDumpBrowse, _btnResetEffects, _btnCompare, _btnRepo, _btnUpdate;
         private readonly ToolTip _tip = new();
         private Panel _videoPanel;
         private FlowLayoutPanel _stillActions;
@@ -114,7 +123,7 @@ namespace DlssnrFilter
 
         public MainForm()
         {
-            Text = "DLSS 5 神经渲染滤镜 (AMD/ZLUDA)";
+            Text = $"DLSS 5 神经渲染滤镜 (AMD/ZLUDA) - {AppVersion}";
             // Layout geometry is computed from the runtime DPI ourselves (S()),
             // so no AutoScaleMode magic is needed on top.
             // Layout sizes are explicitly scaled with DeviceDpi via S();
@@ -143,6 +152,17 @@ namespace DlssnrFilter
             BuildUi();
             ClientSizeChanged += (_, _) => UpdateParameterLayout();
             SyncUiFromSettings();
+
+            // Silent background update check on startup
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(2000);
+                    await CheckForUpdatesAsync(manual: false, _btnUpdate);
+                }
+                catch { }
+            });
 
             // Diagnostic: with DLSSNRFILTER_DUMP_LAYOUT=1 the control tree
             // geometry is written to gui_layout.txt beside the exe, so layout
@@ -334,9 +354,20 @@ namespace DlssnrFilter
             _rbImage.CheckedChanged += (_, _) => UpdateModeUi();
             var btnDefaults = new Button { Text = "恢复默认路径", AutoSize = true };
             btnDefaults.Click += (_, _) => { ApplyDefaults(); SyncUiFromSettings(); };
+
+            _btnRepo = new Button { Text = "GitHub 仓库", AutoSize = true, Margin = new Padding(S(12), S(1), 0, 0) };
+            _btnRepo.Click += (_, _) => OpenUrl(RepoUrl);
+            _tip.SetToolTip(_btnRepo, $"访问 GitHub 开源项目仓库主页:\n{RepoUrl}");
+
+            _btnUpdate = new Button { Text = "检查更新", AutoSize = true, Margin = new Padding(S(6), S(1), 0, 0) };
+            _btnUpdate.Click += async (_, _) => await CheckForUpdatesAsync(manual: true, _btnUpdate);
+            _tip.SetToolTip(_btnUpdate, "检测最新版本发布并提供一键下载与更新日志查看");
+
             modeBar.Controls.Add(_rbVideo);
             modeBar.Controls.Add(_rbImage);
             modeBar.Controls.Add(btnDefaults);
+            modeBar.Controls.Add(_btnRepo);
+            modeBar.Controls.Add(_btnUpdate);
             ft.Controls.Add(modeBar, 0, 7);
             ft.SetColumnSpan(modeBar, 3);
             // rows 6 and 7 have no AddPathRow styles of their own yet
@@ -1529,6 +1560,462 @@ namespace DlssnrFilter
             }
             catch { }
             base.OnFormClosed(e);
+        }
+
+        // -----------------------------------------------------------------
+        // Repository & Update Checking
+        // -----------------------------------------------------------------
+        public static void OpenUrl(string url)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = url,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"无法在浏览器中打开链接:\n{url}\n\n错误: {ex.Message}", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private async Task CheckForUpdatesAsync(bool manual, Button updateBtn)
+        {
+            if (manual)
+            {
+                if (InvokeRequired)
+                    Invoke(new Action(() => { updateBtn.Enabled = false; updateBtn.Text = "检查中..."; }));
+                else
+                {
+                    updateBtn.Enabled = false;
+                    updateBtn.Text = "检查中...";
+                }
+            }
+
+            try
+            {
+                using var client = new HttpClient();
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("DLSSNRFilter-Updater/1.0");
+                client.Timeout = TimeSpan.FromSeconds(10);
+
+                var jsonStr = await client.GetStringAsync(ReleasesApiUrl);
+                using var doc = JsonDocument.Parse(jsonStr);
+                var root = doc.RootElement;
+
+                var tagName = root.TryGetProperty("tag_name", out var tagProp) ? tagProp.GetString() : "";
+                var releaseName = root.TryGetProperty("name", out var nameProp) ? nameProp.GetString() : tagName;
+                var htmlUrl = root.TryGetProperty("html_url", out var urlProp) ? urlProp.GetString() : ReleasesPageUrl;
+                var publishedAt = root.TryGetProperty("published_at", out var pubProp) ? pubProp.GetString() : "";
+                var body = root.TryGetProperty("body", out var bodyProp) ? bodyProp.GetString() : "";
+
+                string downloadUrl = "";
+                string assetName = "";
+                long assetSize = 0;
+
+                if (root.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var asset in assets.EnumerateArray())
+                    {
+                        var name = asset.TryGetProperty("name", out var n) ? n.GetString() : "";
+                        if (name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                        {
+                            assetName = name;
+                            downloadUrl = asset.TryGetProperty("browser_download_url", out var u) ? u.GetString() : "";
+                            assetSize = asset.TryGetProperty("size", out var s) ? s.GetInt64() : 0;
+                            if (name.Contains("nodlssnr", StringComparison.OrdinalIgnoreCase))
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                bool isNewer = !string.IsNullOrEmpty(tagName) &&
+                               !string.Equals(tagName.Trim(), AppVersion.Trim(), StringComparison.OrdinalIgnoreCase);
+
+                Action showDlg = () =>
+                {
+                    updateBtn.Text = "✨ 发现新版本";
+                    updateBtn.ForeColor = Color.ForestGreen;
+                    using var dlg = new UpdateDialog(tagName, releaseName, publishedAt, body, htmlUrl, downloadUrl, assetName, assetSize, _scale);
+                    dlg.ShowDialog(this);
+                };
+
+                if (isNewer)
+                {
+                    if (InvokeRequired) BeginInvoke(showDlg);
+                    else showDlg();
+                }
+                else if (manual)
+                {
+                    Action showUpToDate = () =>
+                    {
+                        var prompt = MessageBox.Show(
+                            $"当前已是最新版本 ({AppVersion})！\n暂无更高版本。\n\n是否仍然查看当前发布日志与下载安装包？",
+                            "检查更新",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Information);
+                        if (prompt == DialogResult.Yes)
+                        {
+                            using var dlg = new UpdateDialog(tagName, releaseName, publishedAt, body, htmlUrl, downloadUrl, assetName, assetSize, _scale);
+                            dlg.ShowDialog(this);
+                        }
+                    };
+                    if (InvokeRequired) BeginInvoke(showUpToDate);
+                    else showUpToDate();
+                }
+            }
+            catch (Exception ex)
+            {
+                if (manual)
+                {
+                    Action showError = () =>
+                    {
+                        var res = MessageBox.Show(
+                            $"检查更新失败: {ex.Message}\n\n是否直接在浏览器中打开 GitHub Releases 发布页面？",
+                            "检查更新",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Warning);
+                        if (res == DialogResult.Yes)
+                        {
+                            OpenUrl(ReleasesPageUrl);
+                        }
+                    };
+                    if (InvokeRequired) BeginInvoke(showError);
+                    else showError();
+                }
+            }
+            finally
+            {
+                if (manual)
+                {
+                    Action resetBtn = () =>
+                    {
+                        updateBtn.Enabled = true;
+                        if (updateBtn.Text == "检查中...")
+                            updateBtn.Text = "检查更新";
+                    };
+                    if (InvokeRequired) BeginInvoke(resetBtn);
+                    else resetBtn();
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Update dialog with Changelog & Download progress
+    // ---------------------------------------------------------------------
+    public class UpdateDialog : Form
+    {
+        private readonly string _tagName;
+        private readonly string _releaseTitle;
+        private readonly string _publishedAt;
+        private readonly string _body;
+        private readonly string _htmlUrl;
+        private readonly string _downloadUrl;
+        private readonly string _assetName;
+        private readonly long _assetSize;
+        private readonly float _scale;
+
+        private ProgressBar _progressBar;
+        private Label _lblStatus;
+        private Button _btnDownload;
+        private Button _btnWeb;
+        private Button _btnClose;
+        private CancellationTokenSource _cts;
+        private string _downloadedFilePath;
+
+        private int S(int v) => (int)MathF.Round(v * _scale);
+
+        public UpdateDialog(string tagName, string releaseTitle, string publishedAt, string body,
+                            string htmlUrl, string downloadUrl, string assetName, long assetSize, float scale)
+        {
+            _tagName = string.IsNullOrEmpty(tagName) ? MainForm.AppVersion : tagName;
+            _releaseTitle = string.IsNullOrEmpty(releaseTitle) ? _tagName : releaseTitle;
+            _publishedAt = publishedAt;
+            _body = string.IsNullOrEmpty(body) ? "(无更新说明)" : body;
+            _htmlUrl = string.IsNullOrEmpty(htmlUrl) ? MainForm.ReleasesPageUrl : htmlUrl;
+            _downloadUrl = downloadUrl;
+            _assetName = assetName;
+            _assetSize = assetSize;
+            _scale = scale > 0.1f ? scale : 1.0f;
+
+            AutoScaleMode = AutoScaleMode.None;
+            Font = new Font("Microsoft YaHei UI", 9F);
+            Text = $"版本更新 - {_tagName}";
+            ClientSize = new Size(S(640), S(540));
+            MinimumSize = new Size(S(500), S(420));
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = false;
+            MinimizeBox = false;
+
+            BuildUi();
+        }
+
+        private void BuildUi()
+        {
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                RowCount = 4,
+                ColumnCount = 1,
+                Padding = new Padding(S(12), S(8), S(12), S(8))
+            };
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, S(58)));   // 0: Header info
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));      // 1: Release notes
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, S(48)));   // 2: Status & Progress
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, S(38)));   // 3: Buttons
+
+            // --- 0. Header ---
+            var headerPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                RowCount = 2,
+                ColumnCount = 1,
+                Margin = Padding.Empty
+            };
+            headerPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, S(28)));
+            headerPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, S(24)));
+
+            var lblTitle = new Label
+            {
+                Text = $"🎉 发现新版本: {_releaseTitle}",
+                Font = new Font("Microsoft YaHei UI", 11F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(0, 102, 204),
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            var sizeMbStr = _assetSize > 0 ? $"{_assetSize / 1048576.0:0.1} MB" : "未知大小";
+            var dateStr = "";
+            if (DateTime.TryParse(_publishedAt, out var dt))
+            {
+                dateStr = dt.ToLocalTime().ToString("yyyy-MM-dd HH:mm");
+            }
+            else
+            {
+                dateStr = _publishedAt;
+            }
+            var lblSub = new Label
+            {
+                Text = $"当前版本: {MainForm.AppVersion}    |    安装包: {_assetName} ({sizeMbStr})" + (string.IsNullOrEmpty(dateStr) ? "" : $"    |    发布: {dateStr}"),
+                ForeColor = Color.DimGray,
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            headerPanel.Controls.Add(lblTitle, 0, 0);
+            headerPanel.Controls.Add(lblSub, 0, 1);
+            root.Controls.Add(headerPanel, 0, 0);
+
+            // --- 1. Release Notes ---
+            var bodyBox = new GroupBox
+            {
+                Text = "更新日志 / Release Notes",
+                Dock = DockStyle.Fill,
+                Margin = new Padding(0, S(2), 0, S(2))
+            };
+            var txtBody = new TextBox
+            {
+                Text = _body.Replace("\r\n", "\n").Replace("\n", "\r\n"),
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Vertical,
+                Dock = DockStyle.Fill,
+                BackColor = Color.FromArgb(250, 250, 252),
+                Font = new Font("Consolas", 9.5F),
+                TabStop = false
+            };
+            bodyBox.Controls.Add(txtBody);
+            root.Controls.Add(bodyBox, 0, 1);
+
+            // --- 2. Progress & Status ---
+            var progressPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                RowCount = 2,
+                ColumnCount = 1,
+                Margin = Padding.Empty
+            };
+            progressPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, S(22)));
+            progressPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, S(22)));
+
+            _lblStatus = new Label
+            {
+                Text = "点击【一键下载更新】直接下载最新发布安装包",
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleLeft,
+                ForeColor = Color.DarkSlateGray
+            };
+            _progressBar = new ProgressBar
+            {
+                Dock = DockStyle.Fill,
+                Minimum = 0,
+                Maximum = 100,
+                Value = 0
+            };
+            progressPanel.Controls.Add(_lblStatus, 0, 0);
+            progressPanel.Controls.Add(_progressBar, 0, 1);
+            root.Controls.Add(progressPanel, 0, 2);
+
+            // --- 3. Action Buttons ---
+            var actionPanel = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                Margin = Padding.Empty,
+                Padding = Padding.Empty
+            };
+            _btnClose = new Button { Text = "关闭", Width = S(80), Height = S(32), Margin = new Padding(S(6), S(2), 0, 0) };
+            _btnClose.Click += (_, _) => Close();
+
+            _btnWeb = new Button { Text = "在浏览器打开", Width = S(110), Height = S(32), Margin = new Padding(S(6), S(2), 0, 0) };
+            _btnWeb.Click += (_, _) => MainForm.OpenUrl(_htmlUrl);
+
+            _btnDownload = new Button
+            {
+                Text = "一键下载更新",
+                Width = S(120),
+                Height = S(32),
+                Margin = new Padding(S(6), S(2), 0, 0),
+                UseVisualStyleBackColor = true
+            };
+            _btnDownload.Click += async (_, _) =>
+            {
+                if (!string.IsNullOrEmpty(_downloadedFilePath) && File.Exists(_downloadedFilePath))
+                {
+                    try { Process.Start("explorer.exe", $"/select,\"{_downloadedFilePath}\""); } catch { }
+                    return;
+                }
+                await StartDownloadAsync();
+            };
+
+            actionPanel.Controls.Add(_btnClose);
+            actionPanel.Controls.Add(_btnWeb);
+            actionPanel.Controls.Add(_btnDownload);
+            root.Controls.Add(actionPanel, 0, 3);
+
+            Controls.Add(root);
+            ActiveControl = _btnDownload;
+        }
+
+        private async Task StartDownloadAsync()
+        {
+            if (string.IsNullOrEmpty(_downloadUrl))
+            {
+                MessageBox.Show("当前发布未附带直接下载链接，请点击【在浏览器打开】前往 GitHub 手动下载。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var defaultName = string.IsNullOrEmpty(_assetName) ? $"DLSSNRFilter-{_tagName}.zip" : _assetName;
+            var downloadsFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+            if (!Directory.Exists(downloadsFolder))
+            {
+                downloadsFolder = AppContext.BaseDirectory;
+            }
+
+            using var sfd = new SaveFileDialog
+            {
+                Title = "保存更新包",
+                FileName = defaultName,
+                Filter = "ZIP 压缩文件 (*.zip)|*.zip|所有文件 (*.*)|*.*",
+                InitialDirectory = downloadsFolder
+            };
+
+            if (sfd.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            var savePath = sfd.FileName;
+            _btnDownload.Enabled = false;
+            _btnDownload.Text = "下载中...";
+            _btnClose.Enabled = false;
+            _progressBar.Value = 0;
+            _lblStatus.Text = "正在连接下载服务器...";
+
+            _cts = new CancellationTokenSource();
+
+            try
+            {
+                using var client = new HttpClient();
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("DLSSNRFilter-Updater/1.0");
+                using var response = await client.GetAsync(_downloadUrl, HttpCompletionOption.ResponseHeadersRead, _cts.Token);
+                response.EnsureSuccessStatusCode();
+
+                var totalBytes = response.Content.Headers.ContentLength ?? _assetSize;
+                using var contentStream = await response.Content.ReadAsStreamAsync(_cts.Token);
+                using var fileStream = new FileStream(savePath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true);
+
+                var buffer = new byte[81920];
+                long totalRead = 0;
+                int read;
+                var sw = Stopwatch.StartNew();
+
+                while ((read = await contentStream.ReadAsync(buffer, 0, buffer.Length, _cts.Token)) > 0)
+                {
+                    await fileStream.WriteAsync(buffer, 0, read, _cts.Token);
+                    totalRead += read;
+
+                    if (totalBytes > 0)
+                    {
+                        var percent = (int)Math.Clamp(totalRead * 100 / totalBytes, 0, 100);
+                        var speed = (totalRead / 1048576.0) / Math.Max(0.1, sw.Elapsed.TotalSeconds);
+                        _progressBar.Value = percent;
+                        _lblStatus.Text = $"正在下载: {totalRead / 1048576.0:0.1} / {totalBytes / 1048576.0:0.1} MB ({percent}%)  -  {speed:0.1} MB/s";
+                    }
+                    else
+                    {
+                        _lblStatus.Text = $"已下载: {totalRead / 1048576.0:0.1} MB";
+                    }
+                }
+
+                _progressBar.Value = 100;
+                _lblStatus.Text = "下载完成！文件已就绪。";
+                _lblStatus.ForeColor = Color.ForestGreen;
+                _downloadedFilePath = savePath;
+                _btnDownload.Text = "打开所在文件夹";
+                _btnDownload.Enabled = true;
+                _btnDownload.BackColor = Color.FromArgb(46, 125, 50);
+
+                var ask = MessageBox.Show(
+                    $"更新包已成功下载至：\n{savePath}\n\n是否立即在文件资源管理器中定位该文件？",
+                    "下载完成",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Information);
+
+                if (ask == DialogResult.Yes)
+                {
+                    try { Process.Start("explorer.exe", $"/select,\"{savePath}\""); } catch { }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                _lblStatus.Text = "下载已取消。";
+                _lblStatus.ForeColor = Color.DimGray;
+                _btnDownload.Text = "重新下载";
+                _btnDownload.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                _lblStatus.Text = $"下载失败: {ex.Message}";
+                _lblStatus.ForeColor = Color.Red;
+                _btnDownload.Text = "重试下载";
+                _btnDownload.Enabled = true;
+                MessageBox.Show($"下载过程中发生错误: {ex.Message}\n\n建议点击【在浏览器打开】手动下载。", "下载失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                _btnClose.Enabled = true;
+            }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (_cts != null && !_cts.IsCancellationRequested)
+            {
+                try { _cts.Cancel(); } catch { }
+            }
+            base.OnFormClosing(e);
         }
     }
 
