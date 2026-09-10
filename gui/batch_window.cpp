@@ -462,9 +462,11 @@ void BatchWindow::load_settings() {
     skin_structure_->setValue(settings.value(QStringLiteral("skinStructure"), 0).toInt());
     style_->setCurrentIndex(settings.value(QStringLiteral("style"), 0).toInt());
     preset_->setCurrentIndex(settings.value(QStringLiteral("preset"), 0).toInt());
-    model_->setCurrentIndex(settings.value(QStringLiteral("model"), 0).toInt());
-    gamma_->setValue(settings.value(QStringLiteral("gamma"), 1.4).toDouble());
-    image_passes_->setValue(settings.value(QStringLiteral("imagePasses"), 3).toInt());
+    double loaded_gamma = settings.value(QStringLiteral("gamma"), 1.4).toDouble();
+    if (std::abs(loaded_gamma - 1.0) < 0.05) {
+        loaded_gamma = 1.4; // 升级旧版遗留的 1.0 默认值至 1.4
+    }
+    gamma_->setValue(loaded_gamma);
     auto_mask_->setChecked(settings.value(QStringLiteral("autoMask"), true).toBool());
 
     reset_->setCurrentIndex(settings.value(QStringLiteral("reset"), 0).toInt());

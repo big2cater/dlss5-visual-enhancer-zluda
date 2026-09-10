@@ -817,6 +817,8 @@ namespace DlssnrFilter
             _tbCut.Text = _s.CutThreshold;
             _tbFps.Text = _s.Fps;
             _tbMaxFrames.Text = _s.MaxFrames;
+            if (Math.Abs(_s.Gamma - 1.0) < 0.05)
+                _s.Gamma = 1.4;
             _nGamma.Value = (decimal)Math.Clamp(_s.Gamma, 0.5, 3.0);
             _ckAudio.Checked = _s.Audio;
             _ckFlow.Checked = _s.Flow;
