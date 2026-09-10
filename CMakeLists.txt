@@ -71,7 +71,7 @@ add_executable(video_filter
     dlss_layer/frame_blit.cpp
 )
 target_include_directories(video_filter PRIVATE dlss_layer gui core)
-target_link_libraries(video_filter PRIVATE d3d12 dxgi d3dcompiler windowscodecs ole32)
+target_link_libraries(video_filter PRIVATE d3d12 dxgi d3dcompiler windowscodecs ole32 shell32)
 target_compile_definitions(video_filter PRIVATE UNICODE _UNICODE NOMINMAX)
 target_compile_options(video_filter PRIVATE /utf-8)
 set_target_properties(video_filter PROPERTIES AUTOMOC OFF)

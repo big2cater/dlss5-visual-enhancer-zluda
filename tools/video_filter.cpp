@@ -49,10 +49,12 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 #include <wincodec.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
+#pragma comment(lib, "shell32.lib")
 
 #include <chrono>
 #include <algorithm>
@@ -305,13 +307,13 @@ struct ChildProcess {
 };
 
 bool spawn(const std::wstring &command, Pipe &feed /*child stdin*/, Pipe &collect /*child stdout*/,
-           ChildProcess &out) {
+           ChildProcess &out, bool redirect_stderr = false) {
     STARTUPINFOW startup{};
     startup.cb = sizeof startup;
     startup.dwFlags = STARTF_USESTDHANDLES;
     startup.hStdInput = feed.read_end ? feed.read_end : GetStdHandle(STD_INPUT_HANDLE);
     startup.hStdOutput = collect.write_end ? collect.write_end : GetStdHandle(STD_OUTPUT_HANDLE);
-    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    startup.hStdError = (redirect_stderr && collect.write_end) ? collect.write_end : GetStdHandle(STD_ERROR_HANDLE);
 
     PROCESS_INFORMATION process{};
     std::wstring mutable_command = command;
@@ -335,9 +337,20 @@ bool wait_exit(HANDLE process, DWORD timeout_ms, DWORD &code) {
 }
 
 std::wstring widen(const char *narrow) {
-    wchar_t buffer[1024] = {};
-    MultiByteToWideChar(CP_UTF8, 0, narrow, -1, buffer, 1024);
-    return buffer;
+    if (!narrow || !*narrow) return L"";
+    int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, narrow, -1, nullptr, 0);
+    if (len > 0) {
+        std::wstring out((size_t)len - 1, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, narrow, -1, out.data(), len);
+        return out;
+    }
+    len = MultiByteToWideChar(CP_ACP, 0, narrow, -1, nullptr, 0);
+    if (len > 0) {
+        std::wstring out((size_t)len - 1, L'\0');
+        MultiByteToWideChar(CP_ACP, 0, narrow, -1, out.data(), len);
+        return out;
+    }
+    return L"";
 }
 
 // True ffmpeg/ffprobe invocation used by the helpers below.
@@ -370,7 +383,7 @@ bool probe_video(const std::wstring &input, VideoParams &params, std::string &er
     std::wstring command = tool_cmd(true) + L" -v error -select_streams v:0 "
                            L"-show_entries stream=width,height,r_frame_rate -of csv=p=0 \"" +
                            input + L"\"";
-    if (!spawn(command, Pipe{}, pipe, child)) {
+    if (!spawn(command, Pipe{}, pipe, child, true)) {
         error = "ffprobe could not be started (is ffmpeg on PATH, or $FFMPEG_PATH set?)";
         pipe.close();
         return false;
@@ -1989,7 +2002,7 @@ static int run_main_once(int argc, char **argv) {
 // this wrapper re-executes it in a fresh process, up to --retries extra times
 // (default 3, i.e. up to 4 attempts in total).
 // ---------------------------------------------------------------------------
-int main(int argc, char **argv) {
+static int real_main(int argc, char **argv) {
     if (argc < 2 || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
         usage();
         return 0;
@@ -2119,3 +2132,28 @@ int main(int argc, char **argv) {
     CloseHandle(pi.hProcess);
     return (int)childCode;
 }
+
+int main(int argc, char **argv) {
+#if defined(_WIN32)
+    int wargc = 0;
+    LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (wargv && wargc > 0) {
+        std::vector<std::string> utf8_args(wargc);
+        std::vector<char *> new_argv(wargc + 1);
+        for (int i = 0; i < wargc; ++i) {
+            int len = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+            if (len > 0) {
+                utf8_args[i].resize((size_t)len - 1);
+                WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, utf8_args[i].data(), len, nullptr, nullptr);
+            }
+            new_argv[i] = utf8_args[i].data();
+        }
+        new_argv[wargc] = nullptr;
+        LocalFree(wargv);
+        return real_main(wargc, new_argv.data());
+    }
+    if (wargv) LocalFree(wargv);
+#endif
+    return real_main(argc, argv);
+}
+
