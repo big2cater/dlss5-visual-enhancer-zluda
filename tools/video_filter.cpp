@@ -494,6 +494,10 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
         }
     };
 
+    const bool is_mkv = output.size() >= 4 &&
+        (_wcsicmp(output.c_str() + output.size() - 4, L".mkv") == 0);
+    const std::wstring sub_args = is_mkv ? L"-map 0:s? -c:s copy " : L"";
+
     auto build_command = [&](const std::wstring &codec_args) -> std::wstring {
         return tool_cmd(false) + L" -nostdin -v error -y -i \"" + input + L"\" " +
                L"-f rawvideo -pix_fmt rgb48le -s " +
@@ -501,6 +505,7 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
                L" -r " + widen(rate) + L" -i - " +
                (audio ? L"-map 0:a? " : L"") +
                L"-map 1:v " +
+               sub_args +
                ((output_width != input_width || output_height != input_height) ?
                 (L"-vf scale=" + std::to_wstring(output_width) + L":" + std::to_wstring(output_height) + L":flags=lanczos ") : L"") +
                codec_args +

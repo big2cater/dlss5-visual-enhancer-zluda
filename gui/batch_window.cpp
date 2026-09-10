@@ -304,6 +304,16 @@ QWidget *BatchWindow::build_right_column() {
     crf_->setValue(18);
     form->addRow(tr("CRF(画质)"), crf_);
 
+    codec_ = new QComboBox;
+    codec_->addItems({tr("自动 (优先 AMF 硬件加速)"),
+                      tr("H.264 (AMD AMF 硬件加速)"),
+                      tr("HEVC / H.265 (AMD AMF 硬件加速 - 推荐)"),
+                      tr("H.264 (CPU libx264 软件编码)")});
+    codec_->setCurrentIndex(0);
+    codec_->setToolTip(
+        tr("选择视频编码器。AMD AMF 提供高速硬件压制；HEVC/H.265 拥有更高压缩率和更小文件体积。"));
+    form->addRow(tr("视频编码格式"), codec_);
+
     fps_ = new QLineEdit(QStringLiteral("0"));
     form->addRow(tr("输出fps(0=原)"), fps_);
 
@@ -383,6 +393,8 @@ QWidget *BatchWindow::build_run() {
     auto *layout = new QHBoxLayout(box);
 
     start_button_ = new QPushButton(tr("开始"));
+    preview_button_ = new QPushButton(tr("预览 3 秒"));
+    preview_button_->setToolTip(tr("仅处理前 3 秒视频快速验证效果，完成后自动打开对比窗口。"));
     stop_button_ = new QPushButton(tr("停止"));
     compare_button_ = new QPushButton(tr("对比结果"));
     stop_button_->setEnabled(false);
@@ -395,12 +407,14 @@ QWidget *BatchWindow::build_run() {
     status_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
 
     layout->addWidget(start_button_);
+    layout->addWidget(preview_button_);
     layout->addWidget(stop_button_);
     layout->addWidget(compare_button_);
     layout->addWidget(progress_, 1);
     layout->addWidget(status_);
 
     connect(start_button_, &QPushButton::clicked, this, &BatchWindow::start_run);
+    connect(preview_button_, &QPushButton::clicked, this, &BatchWindow::start_preview);
     connect(stop_button_, &QPushButton::clicked, this, &BatchWindow::stop_run);
     connect(compare_button_, &QPushButton::clicked, this, &BatchWindow::open_compare);
 
@@ -450,6 +464,7 @@ void BatchWindow::load_settings() {
     cut_->setText(settings.value(QStringLiteral("cut"), QStringLiteral("0.30")).toString());
     passes_->setValue(settings.value(QStringLiteral("passes"), 1).toInt());
     crf_->setValue(settings.value(QStringLiteral("crf"), 18).toInt());
+    codec_->setCurrentIndex(settings.value(QStringLiteral("codec"), 0).toInt());
     fps_->setText(settings.value(QStringLiteral("fps"), QStringLiteral("0")).toString());
     max_frames_->setText(
         settings.value(QStringLiteral("maxFrames"), QStringLiteral("0")).toString());
@@ -490,6 +505,7 @@ void BatchWindow::save_settings() const {
     settings.setValue(QStringLiteral("cut"), cut_->text());
     settings.setValue(QStringLiteral("passes"), passes_->value());
     settings.setValue(QStringLiteral("crf"), crf_->value());
+    settings.setValue(QStringLiteral("codec"), codec_->currentIndex());
     settings.setValue(QStringLiteral("fps"), fps_->text());
     settings.setValue(QStringLiteral("maxFrames"), max_frames_->text());
     settings.setValue(QStringLiteral("modelScale"), model_scale_->currentIndex());
@@ -562,6 +578,7 @@ void BatchWindow::reset_effects() {
     model_->setCurrentIndex(0);
     model_scale_->setCurrentIndex(0);
     upscale_->setCurrentIndex(0);
+    codec_->setCurrentIndex(0);
     auto_mask_->setChecked(true);
     gamma_->setValue(1.0);
     image_passes_->setValue(3);
@@ -605,15 +622,16 @@ bool BatchWindow::validate(QString *problem) const {
 QStringList BatchWindow::arguments() const {
     QStringList args;
     const bool image = image_mode_->isChecked();
+    const QString out_file = (is_preview_ && !preview_output_path_.isEmpty()) ? preview_output_path_ : output_->text();
 
     if (image) {
-        args << QStringLiteral("--image") << input_->text() << output_->text()
+        args << QStringLiteral("--image") << input_->text() << out_file
              << snippet_->text() << driver_->text() << runtime_->text() << nvapi_->text();
         // A still has no neighbours to disagree with, so repeating the
         // evaluation only deepens the blend -- which is what makes it settle.
         args << QStringLiteral("--passes") << QString::number(image_passes_->value());
     } else {
-        args << input_->text() << output_->text() << snippet_->text() << driver_->text()
+        args << input_->text() << out_file << snippet_->text() << driver_->text()
              << runtime_->text() << nvapi_->text();
 
         static const char *reset_modes[] = {"auto", "always", "never", "every"};
@@ -637,9 +655,19 @@ QStringList BatchWindow::arguments() const {
         const double fps = fps_->text().trimmed().toDouble(&ok);
         if (ok && fps > 0) args << QStringLiteral("--fps") << number(fps);
 
-        const int max_frames = max_frames_->text().trimmed().toInt(&ok);
-        if (ok && max_frames > 0)
-            args << QStringLiteral("--max-frames") << QString::number(max_frames);
+        if (is_preview_) {
+            const double eff_fps = (ok && fps > 0) ? fps : 30.0;
+            const int preview_frames = (frames_total_ > 0) ? (int)frames_total_ : qMax(30, (int)std::round(eff_fps * 3.0));
+            args << QStringLiteral("--max-frames") << QString::number(preview_frames);
+        } else {
+            const int max_frames = max_frames_->text().trimmed().toInt(&ok);
+            if (ok && max_frames > 0)
+                args << QStringLiteral("--max-frames") << QString::number(max_frames);
+        }
+
+        static const char *codecs[] = {"auto", "h264_amf", "hevc_amf", "x264"};
+        if (codec_->currentIndex() > 0 && codec_->currentIndex() < 4)
+            args << QStringLiteral("--encoder") << QString::fromLatin1(codecs[codec_->currentIndex()]);
 
         if (!audio_->isChecked()) args << QStringLiteral("--no-audio");
         if (dump_->isChecked() && !dump_dir_->text().trimmed().isEmpty())
@@ -672,6 +700,8 @@ QStringList BatchWindow::arguments() const {
 }
 
 void BatchWindow::start_run() {
+    is_preview_ = false;
+    preview_output_path_.clear();
     QString problem;
     if (!validate(&problem)) {
         log_line(problem, QColor(255, 90, 60));
@@ -704,6 +734,7 @@ void BatchWindow::start_run() {
 
     running_ = true;
     start_button_->setEnabled(false);
+    if (preview_button_) preview_button_->setEnabled(false);
     stop_button_->setEnabled(true);
     timer_->start();
     log_line(tr(">>> 开始%1处理").arg(image_mode_->isChecked() ? tr("图片") : tr("视频")),
@@ -711,9 +742,91 @@ void BatchWindow::start_run() {
     if (video_mode_->isChecked()) probe_total();
 }
 
+void BatchWindow::start_preview() {
+    if (image_mode_->isChecked()) {
+        start_run();
+        return;
+    }
+    QString problem;
+    if (!validate(&problem)) {
+        log_line(problem, QColor(255, 90, 60));
+        return;
+    }
+    save_settings();
+
+    const QString exe = application_dir() + QStringLiteral("/video_filter.exe");
+    if (!QFileInfo::exists(exe)) {
+        log_line(tr("找不到 video_filter.exe：%1").arg(exe), QColor(255, 90, 60));
+        return;
+    }
+
+    const QFileInfo out_fi(output_->text().trimmed());
+    preview_output_path_ = out_fi.path() + QStringLiteral("/")
+                         + out_fi.completeBaseName() + QStringLiteral("_preview3s.")
+                         + out_fi.suffix();
+
+    double rate = 0;
+    bool ok = false;
+    const double user_fps = fps_->text().trimmed().toDouble(&ok);
+    if (ok && user_fps > 0) {
+        rate = user_fps;
+    } else {
+        QProcess probe;
+        probe.start(QStringLiteral("ffprobe"),
+                    {QStringLiteral("-v"), QStringLiteral("error"),
+                     QStringLiteral("-select_streams"), QStringLiteral("v:0"),
+                     QStringLiteral("-show_entries"), QStringLiteral("stream=r_frame_rate"),
+                     QStringLiteral("-of"), QStringLiteral("default=noprint_wrappers=1:nokey=1"),
+                     input_->text().trimmed()});
+        if (probe.waitForFinished(2000)) {
+            const QString out = QString::fromUtf8(probe.readAllStandardOutput()).trimmed();
+            if (out.contains(QLatin1Char('/'))) {
+                const QStringList bits = out.split(QLatin1Char('/'));
+                bool n_ok = false, d_ok = false;
+                const double num = bits.value(0).toDouble(&n_ok);
+                const double den = bits.value(1).toDouble(&d_ok);
+                if (n_ok && d_ok && den > 0) rate = num / den;
+            } else {
+                rate = out.toDouble();
+            }
+        }
+    }
+    const double eff_fps = (rate > 0) ? rate : 30.0;
+    const int preview_frames = qMax(30, (int)std::round(eff_fps * 3.0));
+
+    frames_done_ = 0;
+    frames_total_ = preview_frames;
+    seconds_ = 0;
+    error_buffer_.clear();
+    progress_->setValue(0);
+    status_->setText(tr("启动快速预览中…"));
+
+    is_preview_ = true;
+
+    process_.setProgram(exe);
+    process_.setArguments(arguments());
+    process_.setWorkingDirectory(application_dir());
+    process_.start();
+
+    if (!process_.waitForStarted(5000)) {
+        log_line(tr("启动失败：%1").arg(process_.errorString()), QColor(255, 90, 60));
+        is_preview_ = false;
+        return;
+    }
+
+    running_ = true;
+    start_button_->setEnabled(false);
+    if (preview_button_) preview_button_->setEnabled(false);
+    stop_button_->setEnabled(true);
+    timer_->start();
+    log_line(tr(">>> 开始 3 秒快速预览（共 %1 帧）-> %2").arg(frames_total_).arg(preview_output_path_),
+             QColor(135, 206, 250));
+}
+
 void BatchWindow::stop_run() {
     if (!running_) return;
     process_.kill();
+    is_preview_ = false;
     log_line(tr(">>> 已请求停止"), QColor(255, 165, 0));
 }
 
@@ -816,6 +929,7 @@ void BatchWindow::on_finished(int code, QProcess::ExitStatus) {
 
     running_ = false;
     start_button_->setEnabled(true);
+    if (preview_button_) preview_button_->setEnabled(true);
     stop_button_->setEnabled(false);
     timer_->stop();
 
@@ -825,6 +939,17 @@ void BatchWindow::on_finished(int code, QProcess::ExitStatus) {
     if (code != 0) status_->setText(tr("处理失败（exit=%1），见日志").arg(code));
     log_line(tr(">>> 结束 exit=%1").arg(code),
              code == 0 ? QColor(144, 238, 144) : QColor(255, 90, 60));
+
+    if (is_preview_) {
+        const QString prev_out = preview_output_path_;
+        is_preview_ = false;
+        if (code == 0 && QFileInfo::exists(prev_out)) {
+            log_line(tr(">>> 3 秒快速预览完成，正在自动打开对比窗口..."), QColor(144, 238, 144));
+            auto *dialog = new CompareDialog(input_->text().trimmed(), prev_out, this);
+            dialog->setAttribute(Qt::WA_DeleteOnClose);
+            dialog->show();
+        }
+    }
 }
 
 void BatchWindow::on_second_tick() {

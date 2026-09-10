@@ -66,6 +66,7 @@ private:
     void reset_effects();
 
     void start_run();
+    void start_preview();
     void stop_run();
     void open_compare();
     void probe_total();
@@ -117,6 +118,7 @@ private:
     QLineEdit *cut_ = nullptr;
     QSpinBox *passes_ = nullptr;
     QSpinBox *crf_ = nullptr;
+    QComboBox *codec_ = nullptr;
     QLineEdit *fps_ = nullptr;
     QLineEdit *max_frames_ = nullptr;
     QComboBox *model_scale_ = nullptr;
@@ -132,6 +134,7 @@ private:
 
     // ---- run ------------------------------------------------------------
     QPushButton *start_button_ = nullptr;
+    QPushButton *preview_button_ = nullptr;
     QPushButton *stop_button_ = nullptr;
     QPushButton *compare_button_ = nullptr;
     QProgressBar *progress_ = nullptr;
@@ -141,6 +144,8 @@ private:
     QProcess process_;
     QTimer *timer_ = nullptr;
     bool running_ = false;
+    bool is_preview_ = false;
+    QString preview_output_path_;
     long frames_done_ = 0;
     long frames_total_ = -1;
     int seconds_ = 0;
