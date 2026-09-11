@@ -1693,6 +1693,14 @@ int run_image_mode(int argc, char **argv) {
         return 1;
     }
     fprintf(stderr, "[info] image %ux%u, %d passes\n", in.width, in.height, settings.passes);
+    if (comp_opts.is_active()) {
+        fprintf(stderr, "[composite] 画面合成与防起雾已开启: 混合=%.0f%%, 细节=%.0f%%, 暗部保护=%.0f%%, 高光=%.0f%%\n",
+                comp_opts.output_mix * 100.0f,
+                comp_opts.detail_boost * 100.0f,
+                comp_opts.shadow_protect * 100.0f,
+                comp_opts.glow_control * 100.0f);
+        fflush(stderr);
+    }
 
     enhancer::Processor processor;
     std::string error;
@@ -1971,6 +1979,14 @@ static int run_main_once(int argc, char **argv) {
     if (settings.passes >= 2) {
         fprintf(stderr, "[multipass] 2-pass cascaded dual-engine enabled (flicker-free independent temporal features)\n");
     }
+    if (options.comp_opts.is_active()) {
+        fprintf(stderr, "[composite] 画面合成与防起雾已开启: 混合=%.0f%%, 细节=%.0f%%, 暗部保护=%.0f%%, 高光=%.0f%%\n",
+                options.comp_opts.output_mix * 100.0f,
+                options.comp_opts.detail_boost * 100.0f,
+                options.comp_opts.shadow_protect * 100.0f,
+                options.comp_opts.glow_control * 100.0f);
+        fflush(stderr);
+    }
 
     std::vector<unsigned> flow_luma;
     std::vector<short> qflow;
@@ -2007,7 +2023,7 @@ static int run_main_once(int argc, char **argv) {
                 }
             }
         }
-        if (!in_f->mapped_ptr) {
+        if (!in_f->mapped_ptr || options.comp_opts.is_active()) {
             in_f->in.width = model_w;
             in_f->in.height = model_h;
             in_f->in.pixels.resize((size_t)model_w * model_h * 4);
@@ -2027,7 +2043,11 @@ static int run_main_once(int argc, char **argv) {
         free_output_pool.push(out_f);
     }
     if (zero_copy_in) {
-        fprintf(stderr, "[zero-copy] D3D12 mapped upload heap enabled (direct pipe-to-GPU, CPU LUT bypass)\n");
+        if (options.comp_opts.is_active()) {
+            fprintf(stderr, "[zero-copy] D3D12 mapped upload heap enabled (GPU Direct Pipe + CPU Composite Channel)\n");
+        } else {
+            fprintf(stderr, "[zero-copy] D3D12 mapped upload heap enabled (direct pipe-to-GPU, CPU LUT bypass)\n");
+        }
     }
 
 
@@ -2091,9 +2111,11 @@ static int run_main_once(int argc, char **argv) {
             frame->reset = reset;
 
             // Format conversion: GPU Compute Shader handles format conversion if upload_buf is mapped.
-            // Only run CPU rgb48_to_half_rgba if falling back to CPU host staging.
-            if (!frame->mapped_ptr) {
-                rgb48_to_half_rgba(frame->raw_bytes.data(), frame->in);
+            // When post-composite is active, CPU also needs in_frame->in in linear half-float RGBA
+            // to composite with out_frame->out.
+            if (!frame->mapped_ptr || options.comp_opts.is_active()) {
+                const unsigned char *src_raw = frame->mapped_ptr ? (const unsigned char *)frame->mapped_ptr : frame->raw_bytes.data();
+                rgb48_to_half_rgba(src_raw, frame->in);
             }
 
             // If CPU flow is used, compute it in worker thread

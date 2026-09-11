@@ -1131,6 +1131,8 @@ void BatchWindow::read_error() {
 
         if (line.startsWith(QStringLiteral("[info]")))
             log_line(line, QColor(192, 192, 192));
+        else if (line.startsWith(QStringLiteral("[composite]")))
+            log_line(line, QColor(100, 220, 255));
         else if (line.contains(QStringLiteral("[warn]")))
             log_line(line, QColor(255, 165, 0));
         else if (line.startsWith(QStringLiteral("[FAIL]")))
