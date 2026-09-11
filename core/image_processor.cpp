@@ -159,6 +159,15 @@ bool looks_like_blank_result(const Image &in, const Image &out) {
     return output_max <= blank;
 }
 
+bool looks_like_blank_output(const Image &out) {
+    if (out.empty()) return false;
+    constexpr uint16_t blank = 0x0250;  // approximately 0.0186 in binary16
+    for (size_t i = 0; i < out.pixels.size(); ++i) {
+        if ((out.pixels[i] & 0x7fff) > blank) return false;
+    }
+    return true;
+}
+
 } // namespace
 
 struct Processor::State {
@@ -445,10 +454,12 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
                         ID3D12Resource *motion_gpu, unsigned motion_gpu_row_pitch) {
     if (!s->started) {
         error = "the DLSS layer has not been started";
+        out.pixels.clear();
         return false;
     }
-    if (in.empty()) {
-        error = "no image to work on";
+    if (in.empty() || in.pixels.size() != (size_t)in.width * in.height * 4) {
+        error = "no image to work on or invalid pixel buffer size";
+        out.pixels.clear();
         return false;
     }
 
@@ -726,6 +737,7 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     if (direct_readback) {
         if (!dlss_cuda::read_shared_output(out.pixels.data(), out_row_bytes, output_height)) {
             error = dlss_cuda::last_error();
+            out.pixels.clear();
             return false;
         }
     } else {
@@ -763,6 +775,7 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         D3D12_RANGE whole{0, (SIZE_T)out_padded * output_height};
         if (FAILED(s->readback->Map(0, &whole, (void **)&mapped))) {
             error = "the result could not be read back";
+            out.pixels.clear();
             return false;
         }
         unsigned char *destination = (unsigned char *)out.pixels.data();
@@ -778,6 +791,7 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
 
     if (looks_like_blank_result(in, out)) {
         error = "DLSS returned a blank image (the GPU launch produced no pixels)";
+        out.pixels.clear();
         return false;
     }
 
@@ -994,6 +1008,7 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
     if (direct_readback) {
         if (!dlss_cuda::read_shared_output(out.pixels.data(), out_row_bytes, output_height)) {
             error = dlss_cuda::last_error();
+            out.pixels.clear();
             return false;
         }
     } else {
@@ -1031,6 +1046,7 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
         D3D12_RANGE whole{0, (SIZE_T)out_padded * output_height};
         if (FAILED(s->readback->Map(0, &whole, (void **)&mapped))) {
             error = "the result could not be read back";
+            out.pixels.clear();
             return false;
         }
         unsigned char *destination = (unsigned char *)out.pixels.data();
@@ -1042,6 +1058,12 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
                        mapped + (size_t)y * out_padded, out_row_bytes);
         }
         s->readback->Unmap(0, nullptr);
+    }
+
+    if (looks_like_blank_output(out)) {
+        error = "DLSS returned a blank image (the GPU launch produced no pixels)";
+        out.pixels.clear();
+        return false;
     }
 
     s->last_ms =

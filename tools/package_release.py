@@ -2,6 +2,15 @@
 import os
 import shutil
 import zipfile
+import sys
+
+try:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 
 root_dir = r"d:\Downloads\dlss5-image-enhancer-zluda"
 release_name = "DLSSNRFilter-v2026.09.11-multipass-nodlssnr"

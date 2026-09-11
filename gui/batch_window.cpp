@@ -30,6 +30,7 @@
 #include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
+#include <QStandardPaths>
 #include <QTextCharFormat>
 #include <QTextCursor>
 #include <QTimer>
@@ -133,6 +134,7 @@ BatchWindow::BatchWindow() {
     connect(timer_, &QTimer::timeout, this, &BatchWindow::on_second_tick);
 
     connect(&process_, &QProcess::readyReadStandardError, this, &BatchWindow::read_error);
+    connect(&process_, &QProcess::readyReadStandardOutput, this, [this]() { process_.readAllStandardOutput(); });
     connect(&process_, &QProcess::finished, this, &BatchWindow::on_finished);
 
     load_settings();
@@ -592,6 +594,7 @@ void BatchWindow::load_settings() {
     const bool image = settings.value(QStringLiteral("image"), false).toBool();
     image_mode_->setChecked(image);
     video_mode_->setChecked(!image);
+    auto_output_ = settings.value(QStringLiteral("autoOutput"), true).toBool();
 
     intensity_->setValue(settings.value(QStringLiteral("intensity"), 100).toInt());
     global_tone_->setValue(settings.value(QStringLiteral("globalTone"), 0).toInt());
@@ -637,6 +640,7 @@ void BatchWindow::save_settings() const {
     QSettings settings(settings_path(), QSettings::IniFormat);
     settings.setValue(QStringLiteral("input"), input_->text());
     settings.setValue(QStringLiteral("output"), output_->text());
+    settings.setValue(QStringLiteral("autoOutput"), auto_output_);
     settings.setValue(QStringLiteral("snippet"), snippet_->text());
     settings.setValue(QStringLiteral("driver"), driver_->text());
     settings.setValue(QStringLiteral("runtime"), runtime_->text());
@@ -749,7 +753,7 @@ void BatchWindow::reset_effects() {
     flow_->setChecked(false);
     if (output_mix_) output_mix_->setValue(100);
     if (detail_boost_) detail_boost_->setValue(100);
-    if (shadow_protect_) shadow_protect_->setValue(50);
+    if (shadow_protect_) shadow_protect_->setValue(100);
     if (glow_control_) glow_control_->setValue(100);
 }
 
@@ -797,23 +801,27 @@ bool BatchWindow::validate(QString *problem) const {
 QStringList BatchWindow::arguments() const {
     QStringList args;
     const bool image = image_mode_->isChecked();
-    const QString out_file = (is_preview_ && !preview_output_path_.isEmpty()) ? preview_output_path_ : output_->text();
+    const QString in_path = input_->text().trimmed();
+    const QString out_file = (is_preview_ && !preview_output_path_.isEmpty()) ? preview_output_path_ : output_->text().trimmed();
+    const QString snip = snippet_->text().trimmed();
+    const QString driv = driver_->text().trimmed();
+    const QString runt = runtime_->text().trimmed();
+    const QString nvap = nvapi_->text().trimmed();
 
     if (is_frame_hold_) {
         args << QStringLiteral("--image") << frame_hold_in_ << frame_hold_out_
-             << snippet_->text() << driver_->text() << runtime_->text() << nvapi_->text();
+             << snip << driv << runt << nvap;
         args << QStringLiteral("--passes") << QString::number(image_passes_->value());
         args << QStringLiteral("--retries") << QStringLiteral("3");
     } else if (image) {
-        args << QStringLiteral("--image") << input_->text() << out_file
-             << snippet_->text() << driver_->text() << runtime_->text() << nvapi_->text();
+        args << QStringLiteral("--image") << in_path << out_file
+             << snip << driv << runt << nvap;
         // A still has no neighbours to disagree with, so repeating the
         // evaluation only deepens the blend -- which is what makes it settle.
         args << QStringLiteral("--passes") << QString::number(image_passes_->value());
         args << QStringLiteral("--retries") << QStringLiteral("3");
     } else {
-        args << input_->text() << out_file << snippet_->text() << driver_->text()
-             << runtime_->text() << nvapi_->text();
+        args << in_path << out_file << snip << driv << runt << nvap;
 
         static const char *reset_modes[] = {"auto", "always", "never", "every"};
         int r_idx = reset_->currentIndex();
@@ -880,9 +888,9 @@ QStringList BatchWindow::arguments() const {
     args << QStringLiteral("--local-tone") << number(local_tone_->value() / 100.0);
     args << QStringLiteral("--local-structure") << number(local_structure_->value() / 100.0);
     args << QStringLiteral("--skin-structure") << number(skin_structure_->value() / 100.0);
-    args << QStringLiteral("--style") << QString::number(style_->currentIndex());
-    args << QStringLiteral("--preset") << QString::number(preset_->currentIndex());
-    if (model_->currentIndex() > 0)
+    args << QStringLiteral("--style") << QString::number(qMax(0, style_->currentIndex()));
+    args << QStringLiteral("--preset") << QString::number(qMax(0, preset_->currentIndex()));
+    if (model_ && model_->currentIndex() > 0)
         args << QStringLiteral("--dlss-model-preset") << model_->currentText();
     args << QStringLiteral("--gamma") << number(gamma_->value());
     if (!auto_mask_->isChecked()) args << QStringLiteral("--no-auto-mask");
@@ -921,6 +929,7 @@ void BatchWindow::start_run() {
     chunk1_max_ = 0;
     frames_total_ = -1;
     seconds_ = 0;
+    last_frame_detail_.clear();
     error_buffer_.clear();
     progress_->setValue(0);
     status_->setText(tr("启动中…"));
@@ -1003,6 +1012,7 @@ void BatchWindow::start_preview() {
     chunk1_max_ = 0;
     frames_total_ = preview_frames;
     seconds_ = 0;
+    last_frame_detail_.clear();
     error_buffer_.clear();
     progress_->setValue(0);
     status_->setText(tr("启动快速预览中…"));
@@ -1045,12 +1055,13 @@ void BatchWindow::start_frame_hold_compare() {
     }
 
     const QString source = input_->text().trimmed();
-    frame_hold_out_ = application_dir() + QStringLiteral("/frame_hold_out.png");
+    const QString temp_dir = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+    frame_hold_out_ = temp_dir + QStringLiteral("/dlssnr_frame_hold_out.png");
 
     if (image_mode_->isChecked() || is_image(source)) {
         frame_hold_in_ = source;
     } else {
-        frame_hold_in_ = application_dir() + QStringLiteral("/frame_hold_in.png");
+        frame_hold_in_ = temp_dir + QStringLiteral("/dlssnr_frame_hold_in.png");
         log_line(tr(">>> 正在从视频截取单帧..."), QColor(135, 206, 250));
         QProcess extract;
         extract.start(QStringLiteral("ffmpeg"),
@@ -1075,6 +1086,7 @@ void BatchWindow::start_frame_hold_compare() {
     chunk1_max_ = 0;
     frames_total_ = 1;
     seconds_ = 0;
+    last_frame_detail_.clear();
     error_buffer_.clear();
     progress_->setValue(0);
     status_->setText(tr("单帧画质增强中…"));
@@ -1121,7 +1133,7 @@ void BatchWindow::probe_total() {
                  QStringLiteral("-show_entries"),
                  QStringLiteral("stream=r_frame_rate:format=duration"),
                  QStringLiteral("-of"), QStringLiteral("default=noprint_wrappers=1:nokey=1"),
-                 input_->text()});
+                 input_->text().trimmed()});
     if (!probe.waitForFinished(5000)) return;
 
     // Parse values independently. CSV output can combine them on one line,
@@ -1173,10 +1185,11 @@ void BatchWindow::read_error() {
             } else {
                 frames_done_ = qMax(frames_done_, reported_frame + 1);
             }
-            status_->setText(tr("帧 %1 · 本帧 %2 ms · 平均 %3 ms · 复位 %4 · 空白 %5")
+            last_frame_detail_ = tr("帧 %1 · 本帧 %2 ms · 平均 %3 ms · 复位 %4 · 空白 %5")
                                  .arg(frames_done_)
                                  .arg(frame.captured(2), frame.captured(3), frame.captured(4),
-                                      frame.captured(5)));
+                                      frame.captured(5));
+            status_->setText(tr("已用 %1 秒 · %2").arg(seconds_).arg(last_frame_detail_));
             if (frames_total_ > 0)
                 progress_->setValue(qMin(100, (int)(100.0 * frames_done_ / frames_total_)));
             log_line(line, QColor(245, 245, 245));
@@ -1258,10 +1271,14 @@ void BatchWindow::on_finished(int code, QProcess::ExitStatus) {
 void BatchWindow::on_second_tick() {
     if (!running_) return;
     seconds_++;
-    status_->setText(tr("处理中… 已用 %1 秒 · 帧 %2%3")
-                         .arg(seconds_)
-                         .arg(frames_done_)
-                         .arg(frames_total_ > 0 ? tr(" / ~%1").arg(frames_total_) : QString()));
+    if (!last_frame_detail_.isEmpty()) {
+        status_->setText(tr("已用 %1 秒 · %2").arg(seconds_).arg(last_frame_detail_));
+    } else {
+        status_->setText(tr("处理中… 已用 %1 秒 · 帧 %2%3")
+                             .arg(seconds_)
+                             .arg(frames_done_)
+                             .arg(frames_total_ > 0 ? tr(" / ~%1").arg(frames_total_) : QString()));
+    }
 }
 
 void BatchWindow::log_line(const QString &line, const QColor &colour) {

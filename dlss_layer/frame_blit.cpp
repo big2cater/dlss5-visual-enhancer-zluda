@@ -104,11 +104,21 @@ struct State {
     ID3D12DescriptorHeap *view_heap = nullptr; // shader visible: SRV then UAV
     ID3D12DescriptorHeap *rtv_heap = nullptr;
     UINT view_stride = 0;
+    UINT view_cursor = 0;
+    static constexpr UINT kViewHeapCapacity = 64;
     bool ready = false;
 };
 
-
 State g;
+
+inline UINT allocate_view_slots(UINT count) {
+    if (g.view_cursor + count > State::kViewHeapCapacity) {
+        g.view_cursor = 0;
+    }
+    UINT slot = g.view_cursor;
+    g.view_cursor += count;
+    return slot;
+}
 
 bool compile(const char *source, size_t length, const char *entry, const char *target,
              ID3DBlob **out) {
@@ -186,14 +196,16 @@ bool init(ID3D12Device *device) {
     if (!compile(kGraphicsSource, sizeof kGraphicsSource - 1, "vs_main", "vs_5_0", &g.vs) ||
         !compile(kGraphicsSource, sizeof kGraphicsSource - 1, "ps_main", "ps_5_0", &g.ps)) {
         cs->Release();
+        if (g.vs) { g.vs->Release(); g.vs = nullptr; }
+        if (g.ps) { g.ps->Release(); g.ps = nullptr; }
         return false;
     }
 
     ID3DBlob *raw_cs = nullptr;
     if (!compile(kRawComputeSource, sizeof kRawComputeSource - 1, "main", "cs_5_0", &raw_cs)) {
         cs->Release();
-        g.vs->Release();
-        g.ps->Release();
+        if (g.vs) { g.vs->Release(); g.vs = nullptr; }
+        if (g.ps) { g.ps->Release(); g.ps = nullptr; }
         return false;
     }
 
@@ -290,21 +302,24 @@ bool init(ID3D12Device *device) {
     graphics_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     if (!make_root_signature(graphics_desc, &g.graphics_root)) return false;
 
-    // View heap with 8 slots for overlapping passes
+    // View heap with 64 slots for circular allocation across multiple dispatches
     D3D12_DESCRIPTOR_HEAP_DESC view_heap{};
     view_heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    view_heap.NumDescriptors = 8;
+    view_heap.NumDescriptors = State::kViewHeapCapacity;
     view_heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&view_heap, IID_PPV_ARGS(&g.view_heap)))) {
+        shutdown();
         set_error("CreateDescriptorHeap (views) failed");
         return false;
     }
     g.view_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g.view_cursor = 0;
 
     D3D12_DESCRIPTOR_HEAP_DESC rtv_heap{};
     rtv_heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     rtv_heap.NumDescriptors = 1;
     if (FAILED(device->CreateDescriptorHeap(&rtv_heap, IID_PPV_ARGS(&g.rtv_heap)))) {
+        shutdown();
         set_error("CreateDescriptorHeap (render targets) failed");
         return false;
     }
@@ -313,7 +328,6 @@ bool init(ID3D12Device *device) {
     return true;
 }
 
-
 bool to_shared(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src, ID3D12Resource *dst,
                unsigned width, unsigned height) {
     if (!g.ready) {
@@ -321,7 +335,9 @@ bool to_shared(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src, ID3D12Resour
         return false;
     }
 
+    UINT slot = allocate_view_slots(2);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g.view_heap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += (size_t)slot * g.view_stride;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = src->GetDesc().Format;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -339,7 +355,9 @@ bool to_shared(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src, ID3D12Resour
     cmd->SetDescriptorHeaps(1, heaps);
     cmd->SetComputeRootSignature(g.compute_root);
     cmd->SetPipelineState(g.compute_pso);
-    cmd->SetComputeRootDescriptorTable(0, g.view_heap->GetGPUDescriptorHandleForHeapStart());
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g.view_heap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += (size_t)slot * g.view_stride;
+    cmd->SetComputeRootDescriptorTable(0, gpu);
     const UINT extent[2] = {width, height};
     cmd->SetComputeRoot32BitConstants(1, 2, extent, 0);
     cmd->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
@@ -355,7 +373,9 @@ bool to_backbuffer(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src, ID3D12Re
     ID3D12PipelineState *pso = graphics_pipeline_for(dst_format);
     if (!pso) return false;
 
+    UINT slot = allocate_view_slots(1);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g.view_heap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += (size_t)slot * g.view_stride;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = src->GetDesc().Format;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -373,7 +393,9 @@ bool to_backbuffer(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src, ID3D12Re
     cmd->SetDescriptorHeaps(1, heaps);
     cmd->SetGraphicsRootSignature(g.graphics_root);
     cmd->SetPipelineState(pso);
-    cmd->SetGraphicsRootDescriptorTable(0, g.view_heap->GetGPUDescriptorHandleForHeapStart());
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g.view_heap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += (size_t)slot * g.view_stride;
+    cmd->SetGraphicsRootDescriptorTable(0, gpu);
 
     D3D12_VIEWPORT viewport{0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f};
     D3D12_RECT scissor{0, 0, (LONG)width, (LONG)height};
@@ -397,7 +419,9 @@ bool raw_rgb48_to_shared(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src_buf
         return false;
     }
 
+    UINT slot = allocate_view_slots(3);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g.view_heap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += (size_t)slot * g.view_stride;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = DXGI_FORMAT_R32_TYPELESS;
     srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -416,16 +440,18 @@ bool raw_rgb48_to_shared(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src_buf
 
     cpu.ptr += g.view_stride;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav1{};
-    ID3D12Resource *target_back = dst_backbuffer ? dst_backbuffer : dst_color;
-    uav1.Format = target_back->GetDesc().Format;
+    uav1.Format = dst_backbuffer ? dst_backbuffer->GetDesc().Format : DXGI_FORMAT_R16G16B16A16_FLOAT;
     uav1.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    g.device->CreateUnorderedAccessView(target_back, nullptr, &uav1, cpu);
+    // If dst_backbuffer is nullptr, bind a valid null UAV to avoid alias feedback with dst_color
+    g.device->CreateUnorderedAccessView(dst_backbuffer, nullptr, &uav1, cpu);
 
     ID3D12DescriptorHeap *heaps[] = {g.view_heap};
     cmd->SetDescriptorHeaps(1, heaps);
     cmd->SetComputeRootSignature(g.raw_compute_root);
     cmd->SetPipelineState(g.raw_compute_pso);
-    cmd->SetComputeRootDescriptorTable(0, g.view_heap->GetGPUDescriptorHandleForHeapStart());
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g.view_heap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += (size_t)slot * g.view_stride;
+    cmd->SetComputeRootDescriptorTable(0, gpu);
     const UINT constants[4] = {width, height, dst_backbuffer ? 1u : 0u, 0u};
     cmd->SetComputeRoot32BitConstants(1, 4, constants, 0);
     cmd->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
@@ -436,15 +462,15 @@ void shutdown() {
     for (auto &entry : g.graphics_pso)
         if (entry.second) entry.second->Release();
     g.graphics_pso.clear();
-    if (g.raw_compute_pso) g.raw_compute_pso->Release();
-    if (g.raw_compute_root) g.raw_compute_root->Release();
-    if (g.compute_pso) g.compute_pso->Release();
-    if (g.compute_root) g.compute_root->Release();
-    if (g.graphics_root) g.graphics_root->Release();
-    if (g.vs) g.vs->Release();
-    if (g.ps) g.ps->Release();
-    if (g.view_heap) g.view_heap->Release();
-    if (g.rtv_heap) g.rtv_heap->Release();
+    if (g.raw_compute_pso) { g.raw_compute_pso->Release(); g.raw_compute_pso = nullptr; }
+    if (g.raw_compute_root) { g.raw_compute_root->Release(); g.raw_compute_root = nullptr; }
+    if (g.compute_pso) { g.compute_pso->Release(); g.compute_pso = nullptr; }
+    if (g.compute_root) { g.compute_root->Release(); g.compute_root = nullptr; }
+    if (g.graphics_root) { g.graphics_root->Release(); g.graphics_root = nullptr; }
+    if (g.vs) { g.vs->Release(); g.vs = nullptr; }
+    if (g.ps) { g.ps->Release(); g.ps = nullptr; }
+    if (g.view_heap) { g.view_heap->Release(); g.view_heap = nullptr; }
+    if (g.rtv_heap) { g.rtv_heap->Release(); g.rtv_heap = nullptr; }
     g = State{};
 }
 

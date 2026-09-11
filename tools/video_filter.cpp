@@ -107,6 +107,25 @@ struct Pipe {
     HANDLE read_end = nullptr;
     HANDLE write_end = nullptr;
 
+    Pipe() = default;
+    ~Pipe() { close(); }
+    Pipe(const Pipe &) = delete;
+    Pipe &operator=(const Pipe &) = delete;
+    Pipe(Pipe &&o) noexcept : read_end(o.read_end), write_end(o.write_end) {
+        o.read_end = nullptr;
+        o.write_end = nullptr;
+    }
+    Pipe &operator=(Pipe &&o) noexcept {
+        if (this != &o) {
+            close();
+            read_end = o.read_end;
+            write_end = o.write_end;
+            o.read_end = nullptr;
+            o.write_end = nullptr;
+        }
+        return *this;
+    }
+
     bool make(bool inheritable_read, bool inheritable_write, DWORD buffer_size = 16 << 20) {
         SECURITY_ATTRIBUTES attributes{};
         attributes.nLength = sizeof attributes;
@@ -311,6 +330,25 @@ struct ChildProcess {
     HANDLE stdout_read = nullptr;
     HANDLE stderr_share = nullptr;
 
+    ChildProcess() = default;
+    ~ChildProcess() { close(); }
+    ChildProcess(const ChildProcess &) = delete;
+    ChildProcess &operator=(const ChildProcess &) = delete;
+    ChildProcess(ChildProcess &&o) noexcept
+        : process(o.process), thread(o.thread), stdin_write(o.stdin_write),
+          stdout_read(o.stdout_read), stderr_share(o.stderr_share) {
+        o.process = o.thread = o.stdin_write = o.stdout_read = o.stderr_share = nullptr;
+    }
+    ChildProcess &operator=(ChildProcess &&o) noexcept {
+        if (this != &o) {
+            close();
+            process = o.process; thread = o.thread; stdin_write = o.stdin_write;
+            stdout_read = o.stdout_read; stderr_share = o.stderr_share;
+            o.process = o.thread = o.stdin_write = o.stdout_read = o.stderr_share = nullptr;
+        }
+        return *this;
+    }
+
     void close() {
         if (stdin_write) { CloseHandle(stdin_write); stdin_write = nullptr; }
         if (stdout_read) { CloseHandle(stdout_read); stdout_read = nullptr; }
@@ -320,14 +358,14 @@ struct ChildProcess {
     }
 };
 
-bool spawn(const std::wstring &command, Pipe &feed /*child stdin*/, Pipe &collect /*child stdout*/,
+bool spawn(const std::wstring &command, Pipe *feed /*child stdin*/, Pipe *collect /*child stdout*/,
            ChildProcess &out, bool redirect_stderr = false) {
     STARTUPINFOW startup{};
     startup.cb = sizeof startup;
     startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdInput = feed.read_end ? feed.read_end : GetStdHandle(STD_INPUT_HANDLE);
-    startup.hStdOutput = collect.write_end ? collect.write_end : GetStdHandle(STD_OUTPUT_HANDLE);
-    startup.hStdError = (redirect_stderr && collect.write_end) ? collect.write_end : GetStdHandle(STD_ERROR_HANDLE);
+    startup.hStdInput = (feed && feed->read_end) ? feed->read_end : GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = (collect && collect->write_end) ? collect->write_end : GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.hStdError = (redirect_stderr && collect && collect->write_end) ? collect->write_end : GetStdHandle(STD_ERROR_HANDLE);
 
     PROCESS_INFORMATION process{};
     std::wstring mutable_command = command;
@@ -338,9 +376,14 @@ bool spawn(const std::wstring &command, Pipe &feed /*child stdin*/, Pipe &collec
     out.process = process.hProcess;
     out.thread = process.hThread;
     // The halves handed to the child are no longer ours.
-    if (feed.read_end) { CloseHandle(feed.read_end); feed.read_end = nullptr; }
-    if (collect.write_end) { CloseHandle(collect.write_end); collect.write_end = nullptr; }
+    if (feed && feed->read_end) { CloseHandle(feed->read_end); feed->read_end = nullptr; }
+    if (collect && collect->write_end) { CloseHandle(collect->write_end); collect->write_end = nullptr; }
     return true;
+}
+
+bool spawn(const std::wstring &command, Pipe &feed /*child stdin*/, Pipe &collect /*child stdout*/,
+           ChildProcess &out, bool redirect_stderr = false) {
+    return spawn(command, &feed, &collect, out, redirect_stderr);
 }
 
 bool wait_exit(HANDLE process, DWORD timeout_ms, DWORD &code) {
@@ -477,7 +520,8 @@ bool probe_video(const std::wstring &input, VideoParams &params, std::string &er
 // Decoder: ffmpeg -i in -an -f rawvideo -pix_fmt rgb48le -
 bool start_decoder(const std::wstring &input, Pipe &collect, ChildProcess &child,
                    unsigned decode_w = 0, unsigned decode_h = 0,
-                   double start_sec = 0.0, double duration_sec = 0.0, int ffmpeg_threads = 0) {
+                   double start_sec = 0.0, double duration_sec = 0.0, int ffmpeg_threads = 0,
+                   std::string *error = nullptr) {
     Pipe empty;
     std::wstring scale_filter;
     if (decode_w > 0 && decode_h > 0) {
@@ -494,9 +538,12 @@ bool start_decoder(const std::wstring &input, Pipe &collect, ChildProcess &child
     if (ffmpeg_threads > 0) {
         thread_args = L"-threads " + std::to_wstring(ffmpeg_threads) + L" ";
     }
-    std::wstring command = tool_cmd(false) + L" -nostdin -v error " + time_args + L"-i \"" + input +
-                           L"\" -an " + thread_args + scale_filter + L"-f rawvideo -pix_fmt rgb48le -";
-    if (!spawn(command, empty, collect, child)) return false;
+    std::wstring command = tool_cmd(false) + L" -nostdin -v error " + thread_args + time_args + L"-i \"" + input +
+                           L"\" -an " + scale_filter + L"-f rawvideo -pix_fmt rgb48le -";
+    if (!spawn(command, empty, collect, child)) {
+        if (error) *error = "failed to spawn ffmpeg decoder process";
+        return false;
+    }
     return true;
 }
 
@@ -608,7 +655,6 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
             : L"";
 
         return tool_cmd(false) + L" -nostdin -v error -y -i \"" + input + L"\" " +
-               thread_args +
                L"-f rawvideo -pix_fmt rgb48le -s " +
                std::to_wstring(input_width) + L"x" + std::to_wstring(input_height) +
                L" -r " + widen(rate) + L" -i - " +
@@ -616,6 +662,7 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
                audio_args +
                sub_args +
                vf_args +
+               thread_args +
                codec_args +
                L"\"" + output + L"\"";
     };
@@ -1670,7 +1717,16 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
     bool compute(const std::vector<unsigned> &cur_luma, std::vector<short> &flow) {
         if(!ready || cur_luma.size()!=(size_t)qw*qh) return false;
         if(!has_prev) { prev_luma=cur_luma; has_prev=true; flow.assign((size_t)qw*qh*2,0); return true; }
-        unsigned *p=nullptr; D3D12_RANGE z{0,0}; prev->Map(0,&z,(void**)&p); memcpy(p,prev_luma.data(),prev_luma.size()*4); prev->Unmap(0,nullptr); cur->Map(0,&z,(void**)&p); memcpy(p,cur_luma.data(),cur_luma.size()*4); cur->Unmap(0,nullptr);
+        if (!prev || !cur) return false;
+        unsigned *p = nullptr;
+        D3D12_RANGE z{0, 0};
+        if (FAILED(prev->Map(0, &z, (void**)&p)) || !p) return false;
+        memcpy(p, prev_luma.data(), prev_luma.size() * 4);
+        prev->Unmap(0, nullptr);
+        p = nullptr;
+        if (FAILED(cur->Map(0, &z, (void**)&p)) || !p) return false;
+        memcpy(p, cur_luma.data(), cur_luma.size() * 4);
+        cur->Unmap(0, nullptr);
         const uint32_t constants[4] = {qw, qh, fw, fh};
         auto cpu=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV); auto base=heap->GetCPUDescriptorHandleForHeapStart();
         D3D12_SHADER_RESOURCE_VIEW_DESC sv{}; sv.ViewDimension=D3D12_SRV_DIMENSION_BUFFER; sv.Format=DXGI_FORMAT_UNKNOWN; sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Buffer.NumElements=qw*qh; sv.Buffer.StructureByteStride=4;
@@ -1781,9 +1837,23 @@ int run_image_mode(int argc, char **argv) {
         else if (arg == "--detail-boost") { const char *v = need("--detail-boost"); if (!v) return 1; comp_opts.detail_boost = (float)atof(v); }
         else if (arg == "--shadow-protect") { const char *v = need("--shadow-protect"); if (!v) return 1; comp_opts.shadow_protect = (float)atof(v); }
         else if (arg == "--glow-control") { const char *v = need("--glow-control"); if (!v) return 1; comp_opts.glow_control = (float)atof(v); }
-        else if (arg == "--precompile-wait" || arg == "--retry-delay") {
-            if (arg == "--retry-delay") need("--retry-delay"); // 外壳标志，忽略
-        }
+        else if (arg == "--precompile-wait") { /* shell flag, ignore */ }
+        else if (arg == "--retry-delay") { need("--retry-delay"); }
+        else if (arg == "--upscale-mode" || arg == "--upscale") { need(arg.c_str()); }
+        else if (arg == "--model-scale") { need("--model-scale"); }
+        else if (arg == "--flow" || arg == "--no-flow" || arg == "--flow-only") { /* ignore */ }
+        else if (arg == "--cut-threshold") { need("--cut-threshold"); }
+        else if (arg == "--crf") { need("--crf"); }
+        else if (arg == "--fps") { need("--fps"); }
+        else if (arg == "--no-audio") { /* ignore */ }
+        else if (arg == "--max-frames") { need("--max-frames"); }
+        else if (arg == "--parallel") { need("--parallel"); }
+        else if (arg == "--yield-ms") { need("--yield-ms"); }
+        else if (arg == "--dump-frames" || arg == "--dry-run") { /* ignore */ }
+        else if (arg == "--ffmpeg-threads") { need("--ffmpeg-threads"); }
+        else if (arg == "--encoder") { need("--encoder"); }
+        else if (arg == "--warmup-sec") { need("--warmup-sec"); }
+        else if (arg == "--chunk-sec") { need("--chunk-sec"); }
         else { fprintf(stderr, "unknown option: %s\n", arg.c_str()); return 1; }
     }
 
@@ -1982,11 +2052,25 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
     }
 
     HANDLE handles[2] = { pi0.hProcess, pi1.hProcess };
-    WaitForMultipleObjects(2, handles, TRUE, INFINITE);
-
-    DWORD code0 = 1, code1 = 1;
-    GetExitCodeProcess(pi0.hProcess, &code0);
-    GetExitCodeProcess(pi1.hProcess, &code1);
+    DWORD code0 = STILL_ACTIVE, code1 = STILL_ACTIVE;
+    while (true) {
+        WaitForMultipleObjects(2, handles, FALSE, 500);
+        GetExitCodeProcess(pi0.hProcess, &code0);
+        GetExitCodeProcess(pi1.hProcess, &code1);
+        if (code0 != STILL_ACTIVE && code0 != 0) {
+            fprintf(stderr, "[FAIL] 分片工作进程 0 异常失败 (退出码 %lu)，终止分片 1...\n", code0);
+            TerminateProcess(pi1.hProcess, 1);
+            break;
+        }
+        if (code1 != STILL_ACTIVE && code1 != 0) {
+            fprintf(stderr, "[FAIL] 分片工作进程 1 异常失败 (退出码 %lu)，终止分片 0...\n", code1);
+            TerminateProcess(pi0.hProcess, 1);
+            break;
+        }
+        if (code0 != STILL_ACTIVE && code1 != STILL_ACTIVE) {
+            break;
+        }
+    }
 
     CloseHandle(pi0.hProcess);
     CloseHandle(pi0.hThread);
@@ -2124,8 +2208,8 @@ static int run_main_once(int argc, char **argv) {
     }
     if (options.fps_override > 0.0) params.fps = options.fps_override;
     fprintf(stderr, "[info] %ux%u %.3f fps\n", params.width, params.height, params.fps);
-    unsigned model_w = params.width;
-    unsigned model_h = params.height;
+    unsigned model_w = params.width & ~1u;
+    unsigned model_h = params.height & ~1u;
     if (options.model_scale > 0.0 && options.model_scale < 1.0) {
         model_w = (unsigned)std::lround(params.width * options.model_scale);
         model_h = (unsigned)std::lround(params.height * options.model_scale);
@@ -2173,7 +2257,8 @@ static int run_main_once(int argc, char **argv) {
     if (!start_decoder(options.input, decoder_stdout, decoder,
                        need_decode_scale ? model_w : 0,
                        need_decode_scale ? model_h : 0,
-                       start_s, dur_s, options.ffmpeg_threads)) {
+                       start_s, dur_s, options.ffmpeg_threads,
+                       &error)) {
         fprintf(stderr, "[FAIL] decoder: %s\n", error.c_str());
         decoder_stdout.close();
         return 1;
@@ -2347,6 +2432,8 @@ static int run_main_once(int argc, char **argv) {
                     IID_PPV_ARGS(&in_f->upload_buf))) && in_f->upload_buf) {
                 if (SUCCEEDED(in_f->upload_buf->Map(0, nullptr, &in_f->mapped_ptr)) && in_f->mapped_ptr) {
                     zero_copy_in = true;
+                    in_f->raw_bytes.clear();
+                    in_f->raw_bytes.shrink_to_fit();
                 }
             }
         }
@@ -2562,6 +2649,8 @@ static int run_main_once(int argc, char **argv) {
             if (generated) {
                 CpuFlow::median3(qflow, qw, qh);
                 CpuFlow::upscale4(qflow, qw, qh, model_w, model_h, in_frame->motion.pixels);
+            } else {
+                in_frame->motion.pixels.assign((size_t)model_w * model_h * 2, 0);
             }
         }
 
@@ -2633,6 +2722,10 @@ static int run_main_once(int argc, char **argv) {
     if (abort_pipeline.load()) {
         if (decoder.process) TerminateProcess(decoder.process, 1);
         if (encoder.process) TerminateProcess(encoder.process, 1);
+        decoder_stdout.close();
+        encoder_stdin.close();
+        if (decode_thread.native_handle()) CancelSynchronousIo((HANDLE)decode_thread.native_handle());
+        if (encode_thread.native_handle()) CancelSynchronousIo((HANDLE)encode_thread.native_handle());
         free_input_pool.close();
         ready_input_channel.close();
         free_output_pool.close();
@@ -2659,6 +2752,10 @@ static int run_main_once(int argc, char **argv) {
     decoder.close();
     encoder.close();
 
+    if (!failed.load() && decoder_code != 0) {
+        fprintf(stderr, "[FAIL] ffmpeg decoder exited with code %u\n", decoder_code);
+        failed.store(true);
+    }
     if (!failed.load() && encoder_code != 0) {
         fprintf(stderr, "[FAIL] ffmpeg encoder exited with code %u\n", encoder_code);
         failed.store(true);

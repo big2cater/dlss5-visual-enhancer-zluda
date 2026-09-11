@@ -39,8 +39,11 @@ inline HardwareInfo detect_hardware_budget(double video_duration_sec = 0.0, int 
     // 3. GPU VRAM via DXGI
     IDXGIFactory1 *factory = nullptr;
     if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory)) && factory) {
-        IDXGIAdapter1 *adapter = nullptr;
-        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        for (UINT i = 0; ; ++i) {
+            IDXGIAdapter1 *adapter = nullptr;
+            HRESULT hr = factory->EnumAdapters1(i, &adapter);
+            if (FAILED(hr) || !adapter) break;
+
             DXGI_ADAPTER_DESC1 desc{};
             if (SUCCEEDED(adapter->GetDesc1(&desc))) {
                 // Skip Microsoft Basic Render Driver
@@ -51,7 +54,7 @@ inline HardwareInfo detect_hardware_budget(double video_duration_sec = 0.0, int 
                 size_t vram_mb = (size_t)(desc.DedicatedVideoMemory / (1024 * 1024));
                 if (vram_mb > info.total_vram_mb) {
                     info.total_vram_mb = vram_mb;
-                    info.avail_vram_mb = vram_mb; // baseline fallback
+                    info.avail_vram_mb = vram_mb / 2; // conservative fallback if QueryVideoMemoryInfo unavailable
 
                     // Check for DXGI 1.4 memory info
                     IDXGIAdapter3 *adapter3 = nullptr;

@@ -241,19 +241,25 @@ __declspec(dllexport) const char *ngxrt_load(const wchar_t *snippet_path) {
         return asked;
     }
 
+    auto fail = [&](const char *missing) -> const char * {
+        FreeLibrary(g_snippet);
+        g_snippet = nullptr;
+        return missing;
+    };
+
     // NVSDK_NGX_CUDA_Init is deliberately not resolved: that export is a stub
     // returning 0xBAD00001, shared with D3D11_Init and D3D12_Init.
-    if (!resolve(s_init_ext, "NVSDK_NGX_CUDA_Init_Ext")) return "NVSDK_NGX_CUDA_Init_Ext";
+    if (!resolve(s_init_ext, "NVSDK_NGX_CUDA_Init_Ext")) return fail("NVSDK_NGX_CUDA_Init_Ext");
     // Optional: only the _Ext1 form registers the feature under a usable key,
     // but keep working if a snippet build lacks it.
     resolve(s_init_ext1, "NVSDK_NGX_CUDA_Init_Ext1");
-    if (!resolve(s_create, "NVSDK_NGX_CUDA_CreateFeature")) return "NVSDK_NGX_CUDA_CreateFeature";
+    if (!resolve(s_create, "NVSDK_NGX_CUDA_CreateFeature")) return fail("NVSDK_NGX_CUDA_CreateFeature");
     resolve(s_create1, "NVSDK_NGX_CUDA_CreateFeature1");
-    if (!resolve(s_evaluate, "NVSDK_NGX_CUDA_EvaluateFeature")) return "NVSDK_NGX_CUDA_EvaluateFeature";
-    if (!resolve(s_release, "NVSDK_NGX_CUDA_ReleaseFeature")) return "NVSDK_NGX_CUDA_ReleaseFeature";
-    if (!resolve(s_shutdown, "NVSDK_NGX_CUDA_Shutdown")) return "NVSDK_NGX_CUDA_Shutdown";
+    if (!resolve(s_evaluate, "NVSDK_NGX_CUDA_EvaluateFeature")) return fail("NVSDK_NGX_CUDA_EvaluateFeature");
+    if (!resolve(s_release, "NVSDK_NGX_CUDA_ReleaseFeature")) return fail("NVSDK_NGX_CUDA_ReleaseFeature");
+    if (!resolve(s_shutdown, "NVSDK_NGX_CUDA_Shutdown")) return fail("NVSDK_NGX_CUDA_Shutdown");
     if (!resolve(s_populate, "NVSDK_NGX_CUDA_PopulateParameters_Impl"))
-        return "NVSDK_NGX_CUDA_PopulateParameters_Impl";
+        return fail("NVSDK_NGX_CUDA_PopulateParameters_Impl");
     // Optional: not every snippet build exports it, and nothing else depends on
     // it -- it is only used to identify which feature id a snippet implements.
     resolve(s_scratch_size, "NVSDK_NGX_CUDA_GetScratchBufferSize");

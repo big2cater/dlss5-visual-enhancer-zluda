@@ -174,6 +174,7 @@ private:
     long chunk1_max_ = 0;
     long frames_total_ = -1;
     int seconds_ = 0;
+    QString last_frame_detail_;
     // The output path was derived from the input, so it follows it until the
     // user types one of their own.
     bool auto_output_ = true;

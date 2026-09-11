@@ -149,6 +149,25 @@ Write-Host "`n[3] Testing C:\Windows\System32 DLLs:" -ForegroundColor Yellow
     }
 }
 
+# 3b. DLL Files in Application Directory or PATH
+Write-Host "`n[3b] Testing Application Directory and PATH HIP DLLs:" -ForegroundColor Yellow
+$appHip = Get-ChildItem -Path $currentDir -Filter "amdhip64*.dll" -ErrorAction SilentlyContinue
+if ($appHip) {
+    $appHip | ForEach-Object {
+        Write-Host "    [Local Override Found] $($_.FullName) (Size: $($_.Length))" -ForegroundColor Magenta
+        $testRes = [HipDiag]::TestHip($_.FullName)
+        Write-Host "            $testRes"
+    }
+} else {
+    Write-Host "    No local amdhip64*.dll in application directory (normal, uses system driver)" -ForegroundColor Gray
+}
+
+$whereHip = where.exe amdhip64_7.dll 2>$null
+if ($whereHip) {
+    Write-Host "    [where.exe amdhip64_7.dll]:" -ForegroundColor White
+    $whereHip | ForEach-Object { Write-Host "        $_" -ForegroundColor Gray }
+}
+
 # 4. DLL in HIP_PATH if exists
 if ($hipPath) {
     Write-Host "`n[4] Testing HIP_PATH bin DLLs:" -ForegroundColor Yellow

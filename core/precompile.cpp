@@ -151,12 +151,9 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
     }
     if (ceiling == 0) {
         ceiling = logical_processors();
-        // A 16-process simultaneous HIP/driver bring-up on one GPU is what
-        // made translation children hang for minutes with zero CPU progress
-        // (they park in driver/cache locks). Cap the default; serial stays
-        // reachable via DLSSNR_PRECOMPILE_JOBS=1.
         if (ceiling > 4) ceiling = 4;
     }
+    if (ceiling > 32) ceiling = 32;
     const bool adaptive = jobs == 0;
 
     Progress progress;
@@ -298,6 +295,12 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
         }
         report(progress);
     }
+
+    for (HANDLE h : running) {
+        TerminateProcess(h, 1);
+        CloseHandle(h);
+    }
+    running.clear();
 
     for (const std::wstring &path : files) DeleteFileW(path.c_str());
     RemoveDirectoryW(directory.c_str());

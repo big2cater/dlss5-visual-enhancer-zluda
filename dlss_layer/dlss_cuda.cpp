@@ -1542,6 +1542,7 @@ bool read_shared_output(void *dst, size_t dst_pitch, unsigned rows) {
         set_error("read_shared_output: invalid destination or output");
         return false;
     }
+    if (g.ctx && g.cu.cuCtxSetCurrent) g.cu.cuCtxSetCurrent(g.ctx);
     CUDA_ARRAY_DESCRIPTOR ad{};
     if (!g.cu.cuArrayGetDescriptor ||
         g.cu.cuArrayGetDescriptor(&ad, g.output.level0) != CUDA_SUCCESS) {
@@ -1572,6 +1573,7 @@ bool debug_read_shared_colour(void *rows, size_t row_bytes, unsigned row_count) 
         set_error("debug_read_shared_colour: nothing to read");
         return false;
     }
+    if (g.ctx && g.cu.cuCtxSetCurrent) g.cu.cuCtxSetCurrent(g.ctx);
     CUDA_MEMCPY2D copy{};
     copy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
     copy.srcArray = g.color.level0;

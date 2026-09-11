@@ -15,8 +15,18 @@ inline uint16_t float_to_half(float value) {
     uint32_t bits;
     std::memcpy(&bits, &value, 4);
     const uint32_t sign = (bits >> 16) & 0x8000u;
-    int exponent = (int)((bits >> 23) & 0xFF) - 127 + 15;
+    const uint32_t f_exp = (bits >> 23) & 0xFFu;
     uint32_t mantissa = bits & 0x7FFFFFu;
+
+    if (f_exp == 0xFFu) {
+        // NaN or Infinity
+        if (mantissa == 0) return (uint16_t)(sign | 0x7C00u); // Infinity
+        uint16_t nan_mant = (uint16_t)(mantissa >> 13);
+        if (nan_mant == 0) nan_mant = 1;
+        return (uint16_t)(sign | 0x7C00u | nan_mant);
+    }
+
+    int exponent = (int)f_exp - 127 + 15;
 
     if (exponent <= 0) {
         // Too small for a normal half: either zero or subnormal.
