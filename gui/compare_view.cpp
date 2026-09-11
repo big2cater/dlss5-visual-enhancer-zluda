@@ -121,9 +121,10 @@ QString CompareDialog::frame_of(const QString &video, const QString &stem) {
     QProcess ffmpeg;
     ffmpeg.start(QStringLiteral("ffmpeg"),
                  {QStringLiteral("-nostdin"), QStringLiteral("-v"), QStringLiteral("error"),
+                  QStringLiteral("-ss"), QStringLiteral("0"),
                   QStringLiteral("-i"), video, QStringLiteral("-frames:v"), QStringLiteral("1"),
                   QStringLiteral("-y"), png});
-    if (!ffmpeg.waitForFinished(60000) || ffmpeg.exitCode() != 0) {
+    if (!ffmpeg.waitForFinished(5000) || ffmpeg.exitCode() != 0) {
         QFile::remove(png);
         return {};
     }

@@ -138,18 +138,24 @@ void release(IUnknown *&object) {
 
 // A successful DLSS call can occasionally return a near-zero texture when the
 // underlying HIP/ZLUDA launch was a no-op. Treat that as failure only when the
-// input contains real signal, so genuinely dark photographs remain valid.
 bool looks_like_blank_result(const Image &in, const Image &out) {
-    if (in.empty() || out.empty() || in.pixels.size() != out.pixels.size()) return false;
+    if (in.empty() || out.empty()) return false;
     constexpr uint16_t signal = 0x2a00; // approximately 0.0469 in binary16
     constexpr uint16_t blank = 0x0250;  // approximately 0.0186 in binary16
     bool input_has_signal = false;
-    uint16_t output_max = 0;
     for (size_t i = 0; i < in.pixels.size(); ++i) {
-        if ((in.pixels[i] & 0x7fff) > signal) input_has_signal = true;
+        if ((in.pixels[i] & 0x7fff) > signal) {
+            input_has_signal = true;
+            break;
+        }
+    }
+    if (!input_has_signal) return false;
+
+    uint16_t output_max = 0;
+    for (size_t i = 0; i < out.pixels.size(); ++i) {
         output_max = (std::max)(output_max, (uint16_t)(out.pixels[i] & 0x7fff));
     }
-    return input_has_signal && output_max <= blank;
+    return output_max <= blank;
 }
 
 } // namespace
@@ -221,8 +227,7 @@ bool Processor::start(const Paths &paths, std::string &error,
     // time. So a retry starts from a clean state rather than on top of the
     // wreckage.
     if (s->attempted) {
-        dlss_cuda::shutdown();
-        s->release_images();
+        stop();
     }
     s->attempted = true;
 
@@ -232,6 +237,7 @@ bool Processor::start(const Paths &paths, std::string &error,
     IDXGIFactory4 *factory = nullptr;
     if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
         error = "DXGI could not be started";
+        stop();
         return false;
     }
     IDXGIAdapter1 *adapter = nullptr;
@@ -249,6 +255,7 @@ bool Processor::start(const Paths &paths, std::string &error,
     factory->Release();
     if (!s->device) {
         error = "no Direct3D 12 device could be created";
+        stop();
         return false;
     }
 
@@ -261,6 +268,7 @@ bool Processor::start(const Paths &paths, std::string &error,
                                             nullptr, IID_PPV_ARGS(&s->cmd))) ||
         FAILED(s->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s->fence)))) {
         error = "the Direct3D command objects could not be created";
+        stop();
         return false;
     }
     s->cmd->Close();
@@ -380,6 +388,7 @@ bool Processor::start(const Paths &paths, std::string &error,
     init.nvidia_driver = real_nvidia;
     if (!dlss_cuda::init(init)) {
         error = dlss_cuda::last_error();
+        stop();
         return false;
     }
 
@@ -998,7 +1007,7 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
 
 
 void Processor::stop() {
-    if (s->started) dlss_cuda::shutdown();
+    dlss_cuda::shutdown();
     s->started = false;
     s->attempted = false;
     s->release_images();

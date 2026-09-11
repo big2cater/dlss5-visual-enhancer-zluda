@@ -328,8 +328,8 @@ QWidget *BatchWindow::build_composite_column() {
     form->addRow(tr("细节清晰度"), slider_percent_row(200, 100, detail_boost_, detail_boost_value_));
     detail_boost_->setToolTip(tr("细节清晰度与高频提取增强 (方案 4)。100% 为原生 AI 细节；>100% 锐化睫毛和发丝，<100% 柔化画面。视频与单图均生效。"));
 
-    form->addRow(tr("暗部保护"), slider_percent_row(200, 50, shadow_protect_, shadow_protect_value_));
-    shadow_protect_->setToolTip(tr("针对暗部被 AI 抬升的压制强度 (方案 3)。推荐 50%；拉到 0% 锁定纯黑底色，彻底杜绝任何泛灰起雾。视频与单图均生效。"));
+    form->addRow(tr("暗部保护"), slider_percent_row(200, 100, shadow_protect_, shadow_protect_value_));
+    shadow_protect_->setToolTip(tr("针对暗部被 AI 抬升的压制强度 (方案 3)。默认 100% 保持原生对比度；拉到 0% 锁定纯黑底色，彻底杜绝任何泛灰起雾。视频与单图均生效。"));
 
     form->addRow(tr("高光辉光"), slider_percent_row(200, 100, glow_control_, glow_control_value_));
     glow_control_->setToolTip(tr("高光反射和眼神光的 AI 表现调节 (方案 3)。100% 为标准高光表现。视频与单图均生效。"));
@@ -494,7 +494,7 @@ QWidget *BatchWindow::build_video_column() {
     upscale_->setCurrentIndex(0);
     upscale_->setEnabled(true);
     upscale_->setToolTip(
-        tr("超分输出模式：经 DLSS 5 神经增强后，超分放大至指定倍率的目标分辨率并进行硬件编码。"));
+        tr("输出放大模式：经 DLSS 5 神经增强后，通过高质量 Lanczos-3 算法放大至指定倍率的目标分辨率并进行硬件编码。"));
     form->addRow(tr("Upscaling 输出"), upscale_);
 
     dump_ = new QCheckBox(tr("抽帧到目录"));
@@ -600,6 +600,8 @@ void BatchWindow::load_settings() {
     skin_structure_->setValue(settings.value(QStringLiteral("skinStructure"), 10).toInt());
     style_->setCurrentIndex(settings.value(QStringLiteral("style"), 2).toInt());
     preset_->setCurrentIndex(settings.value(QStringLiteral("preset"), 0).toInt());
+    if (model_) model_->setCurrentIndex(settings.value(QStringLiteral("model"), 0).toInt());
+    if (image_passes_) image_passes_->setValue(settings.value(QStringLiteral("imagePasses"), 1).toInt());
     double loaded_gamma = settings.value(QStringLiteral("gamma"), 1.0).toDouble();
     if (std::abs(loaded_gamma - 1.4) < 0.05) {
         loaded_gamma = 1.0; // 升级旧版临时 1.4 补偿值回正至物理正确的 1.0
@@ -609,7 +611,7 @@ void BatchWindow::load_settings() {
 
     if (output_mix_) output_mix_->setValue(settings.value(QStringLiteral("outputMix"), 100).toInt());
     if (detail_boost_) detail_boost_->setValue(settings.value(QStringLiteral("detailBoost"), 100).toInt());
-    if (shadow_protect_) shadow_protect_->setValue(settings.value(QStringLiteral("shadowProtect"), 50).toInt());
+    if (shadow_protect_) shadow_protect_->setValue(settings.value(QStringLiteral("shadowProtect"), 100).toInt());
     if (glow_control_) glow_control_->setValue(settings.value(QStringLiteral("glowControl"), 100).toInt());
 
     reset_->setCurrentIndex(settings.value(QStringLiteral("reset"), 0).toInt());
@@ -814,7 +816,9 @@ QStringList BatchWindow::arguments() const {
              << runtime_->text() << nvapi_->text();
 
         static const char *reset_modes[] = {"auto", "always", "never", "every"};
-        QString mode = QString::fromLatin1(reset_modes[reset_->currentIndex()]);
+        int r_idx = reset_->currentIndex();
+        if (r_idx < 0 || r_idx >= 4) r_idx = 0;
+        QString mode = QString::fromLatin1(reset_modes[r_idx]);
         if (mode == QStringLiteral("every"))
             mode += QStringLiteral("=") + QString::number(reset_every_->value());
         args << QStringLiteral("--reset") << mode;
@@ -882,10 +886,14 @@ QStringList BatchWindow::arguments() const {
         args << QStringLiteral("--dlss-model-preset") << model_->currentText();
     args << QStringLiteral("--gamma") << number(gamma_->value());
     if (!auto_mask_->isChecked()) args << QStringLiteral("--no-auto-mask");
-    if (output_mix_) args << QStringLiteral("--output-mix") << number(output_mix_->value() / 100.0);
-    if (detail_boost_) args << QStringLiteral("--detail-boost") << number(detail_boost_->value() / 100.0);
-    if (shadow_protect_) args << QStringLiteral("--shadow-protect") << number(shadow_protect_->value() / 100.0);
-    if (glow_control_) args << QStringLiteral("--glow-control") << number(glow_control_->value() / 100.0);
+    if (output_mix_ && output_mix_->value() != 100)
+        args << QStringLiteral("--output-mix") << number(output_mix_->value() / 100.0);
+    if (detail_boost_ && detail_boost_->value() != 100)
+        args << QStringLiteral("--detail-boost") << number(detail_boost_->value() / 100.0);
+    if (shadow_protect_ && shadow_protect_->value() != 100)
+        args << QStringLiteral("--shadow-protect") << number(shadow_protect_->value() / 100.0);
+    if (glow_control_ && glow_control_->value() != 100)
+        args << QStringLiteral("--glow-control") << number(glow_control_->value() / 100.0);
     // Translate first, then run: the parallel translation and the first
     // evaluation contending on the GPU is what produced black frames.
     args << QStringLiteral("--precompile-wait");
@@ -991,6 +999,8 @@ void BatchWindow::start_preview() {
     const int preview_frames = qMax(30, (int)std::round(eff_fps * 3.0));
 
     frames_done_ = 0;
+    chunk0_max_ = 0;
+    chunk1_max_ = 0;
     frames_total_ = preview_frames;
     seconds_ = 0;
     error_buffer_.clear();
@@ -1061,6 +1071,8 @@ void BatchWindow::start_frame_hold_compare() {
     }
 
     frames_done_ = 0;
+    chunk0_max_ = 0;
+    chunk1_max_ = 0;
     frames_total_ = 1;
     seconds_ = 0;
     error_buffer_.clear();

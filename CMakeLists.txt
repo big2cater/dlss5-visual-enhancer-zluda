@@ -42,7 +42,7 @@ if(Qt6_FOUND)
     # something is refused.
     target_compile_definitions(dlss5-image-enhancer PRIVATE UNICODE _UNICODE NOMINMAX)
 
-    # The batch front end: the same window as the C# DLSSNRFilter, in Qt. It
+    # The batch front end: Qt 6 modern unified GUI (dlssnr_gui). It
     # holds no processing of its own -- it builds the command line and drives
     # video_filter.exe, which is why it needs none of the D3D or DLSS libraries
     # the other target links.

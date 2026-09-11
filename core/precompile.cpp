@@ -233,6 +233,17 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
         // it stall the whole pipeline (and the GUI) forever.
         const DWORD which = WaitForMultipleObjects((DWORD)running.size(), running.data(), FALSE,
                                                    60000);
+        if (which == WAIT_FAILED) {
+            DWORD err = GetLastError();
+            error = "WaitForMultipleObjects failed with error " + std::to_string(err);
+            for (HANDLE h : running) {
+                TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
+            failures += (unsigned)running.size() + (unsigned)(files.size() - next);
+            running.clear();
+            break;
+        }
         if (which == WAIT_TIMEOUT) {
             for (size_t j = 0; j < running.size(); ++j) {
                 FILETIME created{}, exited{}, kernel{}, user{};

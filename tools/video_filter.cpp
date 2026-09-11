@@ -1747,7 +1747,7 @@ int run_image_mode(int argc, char **argv) {
                 "[runtime] [nvapi] [--passes N] [--retries N] [--intensity F] [--global-tone F] "
                 "[--local-tone F] [--local-structure F] [--skin-structure F] [--style N] "
                 "[--preset N] [--no-auto-mask]\n");
-        return 2;
+        return 1;
     }
     enhancer::Settings settings;
     settings.passes = 3; // stills settle over a few evaluations
@@ -1764,26 +1764,26 @@ int run_image_mode(int argc, char **argv) {
             if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", name); return nullptr; }
             return argv[++i];
         };
-        if (arg == "--passes") { const char *v = need("--passes"); if (!v) return 2; settings.passes = atoi(v); }
-        else if (arg == "--retries") { const char *v = need("--retries"); if (!v) return 2; retries = atoi(v); if (retries < 0) retries = 0; }
-        else if (arg == "--gamma") { const char *v = need("--gamma"); if (!v) return 2; g_gamma = atof(v); if (g_gamma < 0.1) g_gamma = 0.1; }
-        else if (arg == "--intensity") { const char *v = need("--intensity"); if (!v) return 2; settings.intensity = (float)atof(v); }
-        else if (arg == "--global-tone") { const char *v = need("--global-tone"); if (!v) return 2; settings.global_tone = (float)atof(v); }
-        else if (arg == "--local-tone") { const char *v = need("--local-tone"); if (!v) return 2; settings.local_tone = (float)atof(v); }
-        else if (arg == "--local-structure") { const char *v = need("--local-structure"); if (!v) return 2; settings.local_structure = (float)atof(v); }
-        else if (arg == "--skin-structure") { const char *v = need("--skin-structure"); if (!v) return 2; settings.skin_structure = (float)atof(v); }
-        else if (arg == "--style") { const char *v = need("--style"); if (!v) return 2; settings.style = atoi(v); }
-        else if (arg == "--preset") { const char *v = need("--preset"); if (!v) return 2; settings.preset = atoi(v); }
-        else if (arg == "--dlss-model-preset") { const char *v = need("--dlss-model-preset"); if (!v) return 2; SetEnvironmentVariableA("DLSS_PRESET", v); }
+        if (arg == "--passes") { const char *v = need("--passes"); if (!v) return 1; settings.passes = atoi(v); }
+        else if (arg == "--retries") { const char *v = need("--retries"); if (!v) return 1; retries = atoi(v); if (retries < 0) retries = 0; }
+        else if (arg == "--gamma") { const char *v = need("--gamma"); if (!v) return 1; g_gamma = atof(v); if (g_gamma < 0.1) g_gamma = 0.1; }
+        else if (arg == "--intensity") { const char *v = need("--intensity"); if (!v) return 1; settings.intensity = (float)atof(v); }
+        else if (arg == "--global-tone") { const char *v = need("--global-tone"); if (!v) return 1; settings.global_tone = (float)atof(v); }
+        else if (arg == "--local-tone") { const char *v = need("--local-tone"); if (!v) return 1; settings.local_tone = (float)atof(v); }
+        else if (arg == "--local-structure") { const char *v = need("--local-structure"); if (!v) return 1; settings.local_structure = (float)atof(v); }
+        else if (arg == "--skin-structure") { const char *v = need("--skin-structure"); if (!v) return 1; settings.skin_structure = (float)atof(v); }
+        else if (arg == "--style") { const char *v = need("--style"); if (!v) return 1; settings.style = atoi(v); }
+        else if (arg == "--preset") { const char *v = need("--preset"); if (!v) return 1; settings.preset = atoi(v); }
+        else if (arg == "--dlss-model-preset") { const char *v = need("--dlss-model-preset"); if (!v) return 1; SetEnvironmentVariableA("DLSS_PRESET", v); }
         else if (arg == "--no-auto-mask") { settings.auto_mask = false; }
-        else if (arg == "--output-mix") { const char *v = need("--output-mix"); if (!v) return 2; comp_opts.output_mix = (float)atof(v); }
-        else if (arg == "--detail-boost") { const char *v = need("--detail-boost"); if (!v) return 2; comp_opts.detail_boost = (float)atof(v); }
-        else if (arg == "--shadow-protect") { const char *v = need("--shadow-protect"); if (!v) return 2; comp_opts.shadow_protect = (float)atof(v); }
-        else if (arg == "--glow-control") { const char *v = need("--glow-control"); if (!v) return 2; comp_opts.glow_control = (float)atof(v); }
+        else if (arg == "--output-mix") { const char *v = need("--output-mix"); if (!v) return 1; comp_opts.output_mix = (float)atof(v); }
+        else if (arg == "--detail-boost") { const char *v = need("--detail-boost"); if (!v) return 1; comp_opts.detail_boost = (float)atof(v); }
+        else if (arg == "--shadow-protect") { const char *v = need("--shadow-protect"); if (!v) return 1; comp_opts.shadow_protect = (float)atof(v); }
+        else if (arg == "--glow-control") { const char *v = need("--glow-control"); if (!v) return 1; comp_opts.glow_control = (float)atof(v); }
         else if (arg == "--precompile-wait" || arg == "--retry-delay") {
             if (arg == "--retry-delay") need("--retry-delay"); // 外壳标志，忽略
         }
-        else { fprintf(stderr, "unknown option: %s\n", arg.c_str()); return 2; }
+        else { fprintf(stderr, "unknown option: %s\n", arg.c_str()); return 1; }
     }
 
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -2111,7 +2111,7 @@ static int run_main_once(int argc, char **argv) {
         return run_image_mode(argc, argv);
 
     Options options;
-    if (!parse_args(argc, argv, options)) return 2;
+    if (!parse_args(argc, argv, options)) return 1;
     g_gamma = options.gamma;
 
     // --- probe the source -------------------------------------------------
@@ -2382,8 +2382,8 @@ static int run_main_once(int argc, char **argv) {
     std::atomic<int> blank_count{0};
     std::atomic<double> elapsed_total{0.0};
     std::atomic<unsigned> frames_written{0};
-    bool failed = false;
-    bool retryable = false;
+    std::atomic<bool> failed{false};
+    std::atomic<bool> retryable{false};
     const auto pipeline_began = std::chrono::steady_clock::now();
 
     // Stage 1: Decoder reader & preprocessor thread
@@ -2458,7 +2458,6 @@ static int run_main_once(int argc, char **argv) {
         auto eos_frame = std::make_shared<InputFrame>();
         eos_frame->is_eos = true;
         ready_input_channel.push(eos_frame);
-        decoder_stdout.close();
     });
 
     // Stage 3: Encoder writer & postprocessor thread
@@ -2631,14 +2630,12 @@ static int run_main_once(int argc, char **argv) {
     }
 
     if (abort_pipeline.load()) {
+        if (decoder.process) TerminateProcess(decoder.process, 1);
+        if (encoder.process) TerminateProcess(encoder.process, 1);
         free_input_pool.close();
         ready_input_channel.close();
         free_output_pool.close();
         ready_output_channel.close();
-        decoder_stdout.close();
-        encoder_stdin.close();
-        if (decoder.process) TerminateProcess(decoder.process, 1);
-        if (encoder.process) TerminateProcess(encoder.process, 1);
     }
 
     if (decode_thread.joinable()) decode_thread.join();
@@ -2661,9 +2658,9 @@ static int run_main_once(int argc, char **argv) {
     decoder.close();
     encoder.close();
 
-    if (!failed && encoder_code != 0) {
+    if (!failed.load() && encoder_code != 0) {
         fprintf(stderr, "[FAIL] ffmpeg encoder exited with code %u\n", encoder_code);
-        failed = true;
+        failed.store(true);
     }
 
     const unsigned total_done = frames_written.load();
@@ -2674,9 +2671,9 @@ static int run_main_once(int argc, char **argv) {
             wall_ms > 0 ? (1000.0 * total_done / wall_ms) : 0.0,
             total_done ? (total_eval_ms / total_done) : 0.0,
             reset_count.load(), blank_count.load(),
-            failed ? " -- FAILED" : "");
+            failed.load() ? " -- FAILED" : "");
     // 2 = retryable failure (blank race) -> outer main() re-runs this program.
-    return failed ? (retryable ? 2 : 1) : 0;
+    return failed.load() ? (retryable.load() ? 2 : 1) : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2806,8 +2803,12 @@ static int real_main(int argc, char **argv) {
     }
     STARTUPINFOW si{};
     si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+    if (!CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
                         nullptr, nullptr, &si, &pi)) {
         fprintf(stderr, "[FAIL] 无法启动重跑进程（错误 %lu）\n", GetLastError());
         return 2;

@@ -1584,6 +1584,7 @@ bool debug_read_shared_colour(void *rows, size_t row_bytes, unsigned row_count) 
 }
 
 void shutdown() {
+    frame_blit::shutdown();
     for (int i = 0; i < kMaxPasses; ++i) {
         if (g.features[i] && g.ngx_release) g.ngx_release(g.features[i]);
         g.features[i] = nullptr;

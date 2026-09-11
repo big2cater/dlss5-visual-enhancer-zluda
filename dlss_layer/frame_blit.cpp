@@ -177,7 +177,8 @@ ID3D12PipelineState *graphics_pipeline_for(int format) {
 } // namespace
 
 bool init(ID3D12Device *device) {
-    if (g.ready) return true;
+    if (g.ready && g.device == device) return true;
+    if (g.ready) shutdown();
     g.device = device;
 
     ID3DBlob *cs = nullptr;
