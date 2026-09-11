@@ -4,7 +4,7 @@ import shutil
 import zipfile
 
 root_dir = r"d:\Downloads\dlss5-image-enhancer-zluda"
-release_name = "DLSSNRFilter-v2026.09.10-multipass-nodlssnr"
+release_name = "DLSSNRFilter-v2026.09.11-multipass-nodlssnr"
 staging_dir = os.path.join(root_dir, release_name)
 zip_filename = os.path.join(root_dir, f"{release_name}.zip")
 

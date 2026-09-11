@@ -104,7 +104,7 @@
 - **FFmpeg 支持**：视频处理需要 `ffmpeg.exe` 与 `ffprobe.exe`，请将其所在目录添加至系统环境变量 `PATH`。
 
 ### 2. 使用方法
-1. 从 [Releases 页面](https://github.com/big2cater/dlss5-visual-enhancer-zluda/releases) 下载最新的发布包（例如 `DLSSNRFilter-v2026.09.10-multipass-nodlssnr.zip`）；
+1. 从 [Releases 页面](https://github.com/big2cater/dlss5-visual-enhancer-zluda/releases) 下载最新的发布包（例如 `DLSSNRFilter-v2026.09.11-multipass-nodlssnr.zip`）；
 2. 解压整个文件夹（**请解压至全英文路径**，不要单独拷贝某个 DLL）；
 3. **放置专有模型文件**：将合法的 `nvngx_dlssnr.dll`（推荐 Build 310.8.0）放入解压后的根目录（与 `video_filter.exe` / `dlssnr_gui.exe` 同级目录）；
 4. 双击运行 `dlssnr_gui.exe`（Qt 6 统一现代图形界面；原 WinForms 界面已正式退役）即可开始处理！
