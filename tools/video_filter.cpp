@@ -385,6 +385,7 @@ struct VideoParams {
     unsigned width = 0;
     unsigned height = 0;
     double fps = 0.0;
+    std::string audio_codec;
 };
 
 // ffprobe -> "width,height,r_frame_rate" csv line ("1920,1080,30000/1001").
@@ -426,6 +427,34 @@ bool probe_video(const std::wstring &input, VideoParams &params, std::string &er
     unsigned num = 0, den = 1;
     if (sscanf(rate, "%u/%u", &num, &den) == 2 && num && den) params.fps = (double)num / den;
     else if (sscanf(rate, "%u", &num) == 1 && num) params.fps = (double)num;
+
+    // Probe primary audio stream codec
+    Pipe apipe;
+    if (apipe.make(false, true)) {
+        ChildProcess achild;
+        std::wstring acommand = tool_cmd(true) + L" -v error -select_streams a:0 "
+                                L"-show_entries stream=codec_name -of csv=p=0 \"" +
+                                input + L"\"";
+        if (spawn(acommand, Pipe{}, apipe, achild, true)) {
+            std::string atext;
+            char abuf[128];
+            DWORD aread = 0;
+            while (ReadFile(apipe.read_end, abuf, sizeof abuf, &aread, nullptr) && aread) {
+                atext.append(abuf, aread);
+            }
+            apipe.close();
+            DWORD acode = 1;
+            wait_exit(achild.process, 5000, acode);
+            achild.close();
+            while (!atext.empty() && (atext.back() == '\r' || atext.back() == '\n' || atext.back() == ' ')) {
+                atext.pop_back();
+            }
+            params.audio_codec = atext;
+        } else {
+            apipe.close();
+        }
+    }
+
     return true;
 }
 
@@ -524,6 +553,20 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
         (_wcsicmp(output.c_str() + output.size() - 4, L".mkv") == 0);
     const std::wstring sub_args = is_mkv ? L"-map 0:s? -c:s copy " : L"";
 
+    std::wstring audio_args;
+    if (audio) {
+        const std::string &ac = params.audio_codec;
+        const bool can_copy_in_mp4 = (ac == "aac" || ac == "mp3" || ac == "ac3" || ac == "eac3");
+        if (is_mkv || can_copy_in_mp4 || ac.empty()) {
+            audio_args = L"-map 0:a? -c:a copy ";
+        } else {
+            fprintf(stderr, "[audio] Input audio '%s' cannot be copied into MP4; transcoding to AAC (192 kbps)\n", ac.c_str());
+            audio_args = L"-map 0:a? -c:a aac -b:a 192k ";
+        }
+    } else {
+        audio_args = L"-an ";
+    }
+
     auto build_command = [&](const std::wstring &codec_args) -> std::wstring {
         const std::wstring vf_args = (output_width != input_width || output_height != input_height)
             ? (L"-vf scale=" + std::to_wstring(output_width) + L":" + std::to_wstring(output_height) +
@@ -534,12 +577,11 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
                L"-f rawvideo -pix_fmt rgb48le -s " +
                std::to_wstring(input_width) + L"x" + std::to_wstring(input_height) +
                L" -r " + widen(rate) + L" -i - " +
-               (audio ? L"-map 0:a? " : L"") +
                L"-map 1:v " +
+               audio_args +
                sub_args +
                vf_args +
                codec_args +
-               (audio ? L"-c:a copy " : L"-an ") +
                L"\"" + output + L"\"";
     };
 
