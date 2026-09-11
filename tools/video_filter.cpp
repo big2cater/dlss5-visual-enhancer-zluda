@@ -671,61 +671,52 @@ void apply_post_composite(const enhancer::Image &in, enhancer::Image &out, const
     uint16_t *src_out = out.pixels.data();
 
     const bool need_high_freq = (std::abs(opts.detail_boost - 1.0f) > 0.001f);
-    std::vector<float> blur_dlss;
+    std::vector<float> blur_luma;
 
     if (need_high_freq) {
-        // Separable Gaussian blur (ksize=9, sigma=2.0)
-        // 9 taps: [-4, -3, -2, -1, 0, 1, 2, 3, 4]
+        // Extract Luma from src_out
+        std::vector<float> luma_out(total_pixels);
+        WorkerPool::instance().parallel_for(total_pixels, [&](size_t start, size_t end, size_t) {
+            for (size_t i = start; i < end; ++i) {
+                const size_t idx4 = i * 4;
+                const float r = enhancer::half_to_float(src_out[idx4 + 0]);
+                const float g = enhancer::half_to_float(src_out[idx4 + 1]);
+                const float b = enhancer::half_to_float(src_out[idx4 + 2]);
+                luma_out[i] = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            }
+        });
+
+        // Separable Gaussian blur (ksize=9, sigma=2.0) on single-channel Luminance
         static const float weights[5] = {0.204164f, 0.180174f, 0.123832f, 0.066282f, 0.027631f};
+        std::vector<float> temp_h(total_pixels);
+        blur_luma.resize(total_pixels);
 
-        // Intermediate buffer: float RGB (3 floats per pixel)
-        std::vector<float> temp_h(total_pixels * 3);
-        blur_dlss.resize(total_pixels * 3);
-
-        // Pass 1: Horizontal blur from src_out -> temp_h
-        WorkerPool::instance().parallel_for(height, [&](size_t y_start, size_t y_end, size_t /*tid*/) {
+        // Pass 1: Horizontal blur
+        WorkerPool::instance().parallel_for(height, [&](size_t y_start, size_t y_end, size_t) {
             for (size_t y = y_start; y < y_end; ++y) {
                 const size_t row_offset = y * width;
                 for (size_t x = 0; x < width; ++x) {
-                    float sum_r = 0.0f, sum_g = 0.0f, sum_b = 0.0f;
+                    float sum = 0.0f;
                     for (int dx = -4; dx <= 4; ++dx) {
-                        int sx = (int)x + dx;
-                        if (sx < 0) sx = 0;
-                        else if (sx >= (int)width) sx = (int)width - 1;
-                        const float w = weights[std::abs(dx)];
-                        const size_t idx = (row_offset + (size_t)sx) * 4;
-                        sum_r += enhancer::half_to_float(src_out[idx + 0]) * w;
-                        sum_g += enhancer::half_to_float(src_out[idx + 1]) * w;
-                        sum_b += enhancer::half_to_float(src_out[idx + 2]) * w;
+                        int sx = std::clamp((int)x + dx, 0, (int)width - 1);
+                        sum += luma_out[row_offset + sx] * weights[std::abs(dx)];
                     }
-                    const size_t out_idx = (row_offset + x) * 3;
-                    temp_h[out_idx + 0] = sum_r;
-                    temp_h[out_idx + 1] = sum_g;
-                    temp_h[out_idx + 2] = sum_b;
+                    temp_h[row_offset + x] = sum;
                 }
             }
         });
 
-        // Pass 2: Vertical blur from temp_h -> blur_dlss
-        WorkerPool::instance().parallel_for(height, [&](size_t y_start, size_t y_end, size_t /*tid*/) {
+        // Pass 2: Vertical blur
+        WorkerPool::instance().parallel_for(height, [&](size_t y_start, size_t y_end, size_t) {
             for (size_t y = y_start; y < y_end; ++y) {
                 const size_t row_offset = y * width;
                 for (size_t x = 0; x < width; ++x) {
-                    float sum_r = 0.0f, sum_g = 0.0f, sum_b = 0.0f;
+                    float sum = 0.0f;
                     for (int dy = -4; dy <= 4; ++dy) {
-                        int sy = (int)y + dy;
-                        if (sy < 0) sy = 0;
-                        else if (sy >= (int)height) sy = (int)height - 1;
-                        const float w = weights[std::abs(dy)];
-                        const size_t idx = ((size_t)sy * width + x) * 3;
-                        sum_r += temp_h[idx + 0] * w;
-                        sum_g += temp_h[idx + 1] * w;
-                        sum_b += temp_h[idx + 2] * w;
+                        int sy = std::clamp((int)y + dy, 0, (int)height - 1);
+                        sum += temp_h[(size_t)sy * width + x] * weights[std::abs(dy)];
                     }
-                    const size_t out_idx = (row_offset + x) * 3;
-                    blur_dlss[out_idx + 0] = sum_r;
-                    blur_dlss[out_idx + 1] = sum_g;
-                    blur_dlss[out_idx + 2] = sum_b;
+                    blur_luma[row_offset + x] = sum;
                 }
             }
         });
@@ -735,8 +726,8 @@ void apply_post_composite(const enhancer::Image &in, enhancer::Image &out, const
     const float out_mix = std::clamp(opts.output_mix, 0.0f, 1.0f);
     const float one_minus_mix = 1.0f - out_mix;
     const float detail_delta = opts.detail_boost - 1.0f;
-    const float shadow_prot = opts.shadow_protect;
-    const float glow_ctrl = opts.glow_control;
+    const float shadow_prot = std::clamp(opts.shadow_protect, 0.0f, 2.0f);
+    const float glow_ctrl = std::clamp(opts.glow_control, 0.0f, 2.0f);
 
     const float scale_x = same_dim ? 1.0f : ((float)in.width / (float)width);
     const float scale_y = same_dim ? 1.0f : ((float)in.height / (float)height);
@@ -787,31 +778,43 @@ void apply_post_composite(const enhancer::Image &in, enhancer::Image &out, const
             const float y_dlss = 0.2126f * r_dlss + 0.7152f * g_dlss + 0.0722f * b_dlss;
             const float delta_y = y_dlss - y_orig;
 
-            // Directional multiplier (Magpie logic)
-            const bool is_shadow = (delta_y < 0.0f) || (y_orig < 0.20f && delta_y > 0.0f);
-            const float mult = is_shadow ? shadow_prot : glow_ctrl;
+            // Continuous, seamless shadow & highlight gating (zero threshold artifacts, zero posterization/color blocks):
+            // 1. Deep shadow fog protection:
+            //    Only deep blacks (y_orig < y_knee) lifted by DLSS (delta_y > 0) are suppressed.
+            //    Midtones (human skin, face, clothing at y >= y_knee) have dark_weight = 0.0, completely untouched!
+            constexpr float y_knee = 0.06f; // threshold where deep black transitions to midtone
+            float eff_mult = 1.0f;
+            if (delta_y > 0.0f) {
+                if (y_orig < y_knee) {
+                    const float t = y_orig / y_knee;
+                    const float dark_weight = (1.0f - t) * (1.0f - t); // quadratic smooth falloff: 1.0 at 0, 0.0 at y_knee
+                    eff_mult = 1.0f - dark_weight * (1.0f - shadow_prot);
+                } else if (y_orig > 0.50f) {
+                    const float t = std::clamp((y_orig - 0.50f) / 0.50f, 0.0f, 1.0f);
+                    const float glow_weight = t * t * (3.0f - 2.0f * t); // smoothstep
+                    eff_mult = 1.0f + glow_weight * (glow_ctrl - 1.0f);
+                }
+            }
 
-            // Controlled base candidate
-            float r_cand = r_orig + (r_dlss - r_orig) * mult;
-            float g_cand = g_orig + (g_dlss - g_orig) * mult;
-            float b_cand = b_orig + (b_dlss - b_orig) * mult;
+            // Apply smooth multiplier to the delta
+            float r_cand = r_orig + (r_dlss - r_orig) * eff_mult;
+            float g_cand = g_orig + (g_dlss - g_orig) * eff_mult;
+            float b_cand = b_orig + (b_dlss - b_orig) * eff_mult;
 
-            // High frequency detail modulation
+            // High frequency detail modulation (pure luminance, 100% chromaticity preserving)
             if (need_high_freq) {
-                const size_t idx3 = i * 3;
-                const float hf_r = r_dlss - blur_dlss[idx3 + 0];
-                const float hf_g = g_dlss - blur_dlss[idx3 + 1];
-                const float hf_b = b_dlss - blur_dlss[idx3 + 2];
-                r_cand += detail_delta * hf_r;
-                g_cand += detail_delta * hf_g;
-                b_cand += detail_delta * hf_b;
+                const float hf_luma = y_dlss - blur_luma[i];
+                const float hf_boost = std::clamp(detail_delta * hf_luma, -0.15f, 0.15f);
+                r_cand += hf_boost;
+                g_cand += hf_boost;
+                b_cand += hf_boost;
             }
 
             if (r_cand < 0.0f) r_cand = 0.0f;
             if (g_cand < 0.0f) g_cand = 0.0f;
             if (b_cand < 0.0f) b_cand = 0.0f;
 
-            // Output mix with original
+            // Final output mix with original
             float r_final = one_minus_mix * r_orig + out_mix * r_cand;
             float g_final = one_minus_mix * g_orig + out_mix * g_cand;
             float b_final = one_minus_mix * b_orig + out_mix * b_cand;
