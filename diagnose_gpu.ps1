@@ -1,3 +1,13 @@
+param(
+    [string]$TestOverride = "",
+    [switch]$IsolatedOnly
+)
+
+if ($TestOverride) {
+    [System.Environment]::SetEnvironmentVariable("HSA_OVERRIDE_GFX_VERSION", $TestOverride, "Process")
+    $env:HSA_OVERRIDE_GFX_VERSION = $TestOverride
+}
+
 $code = @"
 using System;
 using System.Runtime.InteropServices;
@@ -79,6 +89,21 @@ public class HipDiag {
 "@
 
 Add-Type -TypeDefinition $code -ErrorAction Stop
+
+if ($IsolatedOnly) {
+    $p = "C:\Windows\System32\amdhip64_7.dll"
+    if (-not (Test-Path $p)) { $p = "C:\Windows\System32\amdhip64_6.dll" }
+    $hipRes = if (Test-Path $p) { [HipDiag]::TestHip($p) } else { "HIP DLL not found" }
+    
+    $currentDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    if (-not $currentDir) { $currentDir = Get-Location }
+    $zludaDll = Join-Path $currentDir "run\nvcuda.dll"
+    if (-not (Test-Path $zludaDll)) { $zludaDll = Join-Path $currentDir "nvcuda.dll" }
+    $zRes = if (Test-Path $zludaDll) { [HipDiag]::TestZluda($zludaDll) } else { "" }
+    
+    Write-Output "$hipRes | ZLUDA: $zRes"
+    exit 0
+}
 
 Write-Host "===============================================================" -ForegroundColor Cyan
 Write-Host "         AMD GPU / HIP / ZLUDA Diagnostic Tool (RX 9070 XT)    " -ForegroundColor Cyan
@@ -162,15 +187,17 @@ if (Test-Path $zludaDll) {
 }
 
 # 6. Test with HSA_OVERRIDE_GFX_VERSION if current test failed
-Write-Host "`n[6] Overrides Simulation Test:" -ForegroundColor Yellow
-@("12.0.0", "12.0.1", "11.0.0") | ForEach-Object {
+Write-Host "`n[6] Overrides Simulation Test (Running in Clean Isolated Processes):" -ForegroundColor Yellow
+$scriptPath = $PSCommandPath
+if (-not $scriptPath) { $scriptPath = Join-Path (Get-Location) "diagnose_gpu.ps1" }
+
+@("12.0.1", "12.0.0", "11.0.0") | ForEach-Object {
     $ver = $_
-    [System.Environment]::SetEnvironmentVariable("HSA_OVERRIDE_GFX_VERSION", $ver, "Process")
-    $p = "C:\Windows\System32\amdhip64_7.dll"
-    if (-not (Test-Path $p)) { $p = "C:\Windows\System32\amdhip64_6.dll" }
-    if (Test-Path $p) {
-        $res = [HipDiag]::TestHip($p)
-        Write-Host "    HSA_OVERRIDE_GFX_VERSION=$ver -> $res"
+    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptPath -TestOverride $ver -IsolatedOnly
+    if ($output -like "*SUCCESS*") {
+        Write-Host "    [OK] HSA_OVERRIDE_GFX_VERSION=$ver -> $output" -ForegroundColor Green
+    } else {
+        Write-Host "    [FAIL] HSA_OVERRIDE_GFX_VERSION=$ver -> $output" -ForegroundColor Red
     }
 }
 

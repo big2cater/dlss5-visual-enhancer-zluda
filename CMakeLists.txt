@@ -53,7 +53,8 @@ if(Qt6_FOUND)
         gui/compare_view.cpp
         gui/compare_view.h
     )
-    target_link_libraries(dlssnr_gui PRIVATE Qt6::Widgets)
+    target_include_directories(dlssnr_gui PRIVATE core)
+    target_link_libraries(dlssnr_gui PRIVATE Qt6::Widgets dxgi)
     target_compile_definitions(dlssnr_gui PRIVATE UNICODE _UNICODE NOMINMAX)
 endif()
 

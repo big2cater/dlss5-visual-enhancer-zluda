@@ -11,6 +11,7 @@
 
 #include "dlss_cuda.h"
 #include "precompile.h"
+#include "gpu_detection.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -231,33 +232,76 @@ bool Processor::start(const Paths &paths, std::string &error,
     }
     s->attempted = true;
 
-    // A device on the first hardware adapter. No window and no swapchain: this
-    // program never presents anything, it only needs Direct3D because that is
-    // what the DLSS layer shares its images through.
+    // Ensure environment is correctly configured for GPU architecture (e.g. RDNA 4 self-healing)
+    dlssnr::auto_configure_gpu_environment();
+
+    // Select the best discrete high-performance GPU:
+    // 1. Enumerate all adapters, filtering out software and virtual adapters (GameViewer, ToDesk, etc.).
+    // 2. Prioritize discrete GPUs with the largest dedicated VRAM that support D3D12 FL 12_0.
     IDXGIFactory4 *factory = nullptr;
     if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
         error = "DXGI could not be started";
         stop();
         return false;
     }
+
+    IDXGIAdapter1 *best_adapter = nullptr;
+    DXGI_ADAPTER_DESC1 best_desc{};
+    size_t best_vram = 0;
+
     IDXGIAdapter1 *adapter = nullptr;
     for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
         DXGI_ADAPTER_DESC1 desc{};
-        adapter->GetDesc1(&desc);
-        if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-            SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0,
-                                        IID_PPV_ARGS(&s->device)))) {
-            adapter->Release();
-            break;
+        if (SUCCEEDED(adapter->GetDesc1(&desc))) {
+            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && !dlssnr::is_virtual_adapter(desc.Description)) {
+                ID3D12Device *test_device = nullptr;
+                if (SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&test_device)))) {
+                    test_device->Release();
+                    size_t vram = (size_t)(desc.DedicatedVideoMemory / (1024 * 1024));
+                    if (!best_adapter || vram > best_vram) {
+                        if (best_adapter) best_adapter->Release();
+                        best_adapter = adapter;
+                        best_adapter->AddRef();
+                        best_desc = desc;
+                        best_vram = vram;
+                    }
+                }
+            }
         }
         adapter->Release();
     }
+
+    // Fallback if all non-virtual adapters failed: try any non-software adapter
+    if (!best_adapter) {
+        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+            DXGI_ADAPTER_DESC1 desc{};
+            if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+                if (SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&s->device)))) {
+                    best_desc = desc;
+                    adapter->Release();
+                    break;
+                }
+            }
+            adapter->Release();
+        }
+    } else {
+        D3D12CreateDevice(best_adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&s->device));
+        best_adapter->Release();
+    }
     factory->Release();
+
     if (!s->device) {
         error = "no Direct3D 12 device could be created";
         stop();
         return false;
     }
+
+    char gpu_msg[384];
+    snprintf(gpu_msg, sizeof(gpu_msg), "[DXGI] Selected GPU: %ls (Dedicated VRAM: %zu MB)\n",
+             best_desc.Description, (size_t)(best_desc.DedicatedVideoMemory / (1024 * 1024)));
+    OutputDebugStringA(gpu_msg);
+    fputs(gpu_msg, stderr);
+    if (log) log(gpu_msg);
 
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;

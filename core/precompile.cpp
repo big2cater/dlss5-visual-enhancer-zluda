@@ -1,4 +1,5 @@
 #include "precompile.h"
+#include "gpu_detection.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -102,6 +103,7 @@ std::vector<std::vector<unsigned char>> extract_modules(const std::wstring &libr
 }
 
 int compile_one(const std::wstring &module_file, const std::wstring &driver) {
+    dlssnr::auto_configure_gpu_environment();
     HMODULE cuda = LoadLibraryW(driver.c_str());
     if (!cuda) return 1;
 

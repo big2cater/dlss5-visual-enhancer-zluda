@@ -1,10 +1,14 @@
 #include "batch_window.h"
+#include "gpu_detection.h"
 
 #include <QApplication>
 #include <QGuiApplication>
 #include <QIcon>
 
 int main(int argc, char **argv) {
+    // Detect GPU architecture and inject RDNA 4 environment if needed
+    dlssnr::auto_configure_gpu_environment();
+
     // Windows reports fractional scaling -- 125 %, 150 % -- and Qt rounds those
     // to whole numbers unless told otherwise. Rounded, the window is laid out
     // at one scale and drawn at another. Has to be set before the application

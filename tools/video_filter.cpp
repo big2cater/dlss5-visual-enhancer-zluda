@@ -74,6 +74,7 @@
 
 #include "../core/image_processor.h"
 #include "../core/precompile.h"
+#include "../core/gpu_detection.h"
 #include "half_float.h"
 #include "hardware_budget.h"
 
@@ -2822,6 +2823,9 @@ static int real_main(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    // Detect GPU architecture and inject RDNA 4 environment if needed
+    dlssnr::auto_configure_gpu_environment();
+
 #if defined(_WIN32)
     int wargc = 0;
     LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);

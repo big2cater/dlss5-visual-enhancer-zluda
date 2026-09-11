@@ -30,6 +30,7 @@ os.makedirs(os.path.join(staging_dir, "styles"), exist_ok=True)
 # Copy core binaries & dependencies
 # Search directories for binaries and runtimes
 bin_dirs = [
+    os.path.join(root_dir, "build"),
     os.path.join(root_dir, "dist"),
     os.path.join(root_dir, "run"),
     r"D:\aiwork\DLSSNRFilter-ZLUDA",
