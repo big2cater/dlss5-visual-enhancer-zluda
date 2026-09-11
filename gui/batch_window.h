@@ -64,6 +64,7 @@ private:
     void auto_fill_output(bool follow_input);
     void update_mode_ui();
     void reset_effects();
+    void apply_composite_preset(int mix, int detail, int shadow, int glow);
 
     void start_run();
     void start_preview();
@@ -132,6 +133,20 @@ private:
     QWidget *video_panel_ = nullptr;
     QWidget *image_panel_ = nullptr;
     QWidget *image_passes_row_ = nullptr;
+
+    // ---- composite (schemes 3, 4, 5) ------------------------------------
+    QSlider *output_mix_ = nullptr;
+    QSlider *detail_boost_ = nullptr;
+    QSlider *shadow_protect_ = nullptr;
+    QSlider *glow_control_ = nullptr;
+    QLabel *output_mix_value_ = nullptr;
+    QLabel *detail_boost_value_ = nullptr;
+    QLabel *shadow_protect_value_ = nullptr;
+    QLabel *glow_control_value_ = nullptr;
+    QPushButton *btn_preset_film_ = nullptr;
+    QPushButton *btn_preset_soft_ = nullptr;
+    QPushButton *btn_preset_macro_ = nullptr;
+    QPushButton *btn_preset_black_ = nullptr;
 
     // ---- run ------------------------------------------------------------
     QPushButton *start_button_ = nullptr;

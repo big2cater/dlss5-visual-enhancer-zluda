@@ -66,6 +66,30 @@ QWidget *slider_row(int maximum, int value, QSlider *&slider, QLabel *&readout) 
     return row;
 }
 
+QWidget *slider_percent_row(int maximum, int value, QSlider *&slider, QLabel *&readout) {
+    auto *row = new QWidget;
+    auto *layout = new QHBoxLayout(row);
+    layout->setContentsMargins(0, 0, 0, 0);
+
+    slider = new QSlider(Qt::Horizontal);
+    slider->setRange(0, maximum);
+    slider->setValue(value);
+    slider->setTickPosition(QSlider::NoTicks);
+
+    readout = new QLabel(QString::number(value) + QStringLiteral("%"));
+    readout->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    readout->setMinimumWidth(
+        readout->fontMetrics().horizontalAdvance(QStringLiteral("200%")) + 10);
+
+    layout->addWidget(slider, 1);
+    layout->addWidget(readout);
+
+    QObject::connect(slider, &QSlider::valueChanged, readout, [readout](int v) {
+        readout->setText(QString::number(v) + QStringLiteral("%"));
+    });
+    return row;
+}
+
 QString settings_path() {
     return QCoreApplication::applicationDirPath() + QStringLiteral("/dlssnr_gui.ini");
 }
@@ -218,14 +242,15 @@ QWidget *BatchWindow::build_left_column() {
 
     form->addRow(tr("强度"), slider_row(200, 100, intensity_, intensity_value_));
     form->addRow(tr("全局色调"), slider_row(100, 0, global_tone_, global_tone_value_));
-    form->addRow(tr("局部色调"), slider_row(200, 100, local_tone_, local_tone_value_));
+    form->addRow(tr("局部色调"), slider_row(200, 0, local_tone_, local_tone_value_));
     form->addRow(tr("局部结构"), slider_row(200, 100, local_structure_, local_structure_value_));
-    form->addRow(tr("皮肤结构 (防塑料感)"), slider_row(100, 0, skin_structure_, skin_structure_value_));
+    form->addRow(tr("皮肤结构 (防塑料感)"), slider_row(100, 10, skin_structure_, skin_structure_value_));
     skin_structure_->setToolTip(
         tr("人脸/皮肤纹理防过度平滑保护：调高此项可在强力降噪的同时保护人像面部微毛孔与天然皮肤质感，避免塑料脸或假面感。"));
 
     style_ = new QComboBox;
     style_->addItems({tr("0 - 默认"), tr("1 - 自然"), tr("2 - 电影")});
+    style_->setCurrentIndex(2); // 默认电影风格 (Cinematic)
     form->addRow(tr("风格"), style_);
 
     preset_ = new QComboBox;
@@ -253,7 +278,7 @@ QWidget *BatchWindow::build_left_column() {
     // the video panel is hidden in single-image mode, which had left the
     // checkbox out of reach there. The backend takes --no-auto-mask either way.
     auto_mask_ = new QCheckBox(tr("自动遮罩"));
-    auto_mask_->setChecked(true);
+    auto_mask_->setChecked(false);
     auto_mask_->setToolTip(
         tr("自动生成遮罩，只对被识别为画面的区域施加滤镜，保留字幕/UI 等。视频和单图模式都生效。"));
     form->addRow(QString(), auto_mask_);
@@ -393,12 +418,70 @@ QWidget *BatchWindow::build_right_column() {
     image_panel_ = new QWidget;
     auto *image_layout = new QVBoxLayout(image_panel_);
     image_layout->setContentsMargins(0, 0, 0, 0);
-    auto *note = new QLabel(tr("单图模式\r\n重复处理次数和左侧参数会应用到当前图片。\r\n"
-                               "输出格式：PNG。"));
-    note->setTextFormat(Qt::PlainText);
-    note->setWordWrap(true);
-    note->setAlignment(Qt::AlignTop);
-    image_layout->addWidget(note);
+    image_layout->setSpacing(6);
+
+    auto *image_form = new QFormLayout;
+    image_form->setContentsMargins(0, 0, 0, 0);
+
+    image_form->addRow(tr("AI混合浓度"), slider_percent_row(100, 100, output_mix_, output_mix_value_));
+    output_mix_->setToolTip(tr("AI 画面与原图的全局混合浓度 (方案 5)。100% 为完全 AI 输出；80% 或更低能带来柔美的真实写真感，化解数码过度锐化。"));
+
+    image_form->addRow(tr("细节清晰度"), slider_percent_row(200, 100, detail_boost_, detail_boost_value_));
+    detail_boost_->setToolTip(tr("细节清晰度与高频提取增强 (方案 4)。100% 为原生 AI 细节；>100% 锐化睫毛和发丝，<100% 柔化画面。"));
+
+    image_form->addRow(tr("暗部保护"), slider_percent_row(200, 50, shadow_protect_, shadow_protect_value_));
+    shadow_protect_->setToolTip(tr("针对暗部被 AI 抬升的压制强度 (方案 3)。推荐 50%；拉到 0% 锁定纯黑底色，彻底杜绝任何泛灰起雾。"));
+
+    image_form->addRow(tr("高光辉光"), slider_percent_row(200, 100, glow_control_, glow_control_value_));
+    glow_control_->setToolTip(tr("高光反射和眼神光的 AI 表现调节 (方案 3)。100% 为标准高光表现。"));
+
+    image_layout->addLayout(image_form);
+
+    // Preset buttons row
+    auto *preset_row = new QWidget;
+    auto *preset_layout = new QHBoxLayout(preset_row);
+    preset_layout->setContentsMargins(0, 0, 0, 0);
+    preset_layout->setSpacing(4);
+
+    btn_preset_film_ = new QPushButton(tr("原生电影(推荐)"));
+    btn_preset_soft_ = new QPushButton(tr("柔和写真"));
+    btn_preset_macro_ = new QPushButton(tr("极致微距"));
+    btn_preset_black_ = new QPushButton(tr("纯黑无雾"));
+
+    btn_preset_film_->setToolTip(tr("【原生电影 (推荐)】：混合 100% | 细节 100% | 暗部保护 50% | 局部色调 0 | 风格 电影"));
+    btn_preset_soft_->setToolTip(tr("【柔和写真 (防发脆)】：混合 80% | 细节 90% | 暗部保护 50% | 消除过度数码锐化，自然写真质感"));
+    btn_preset_macro_->setToolTip(tr("【极致微距 (锐利)】：混合 100% | 细节 115% | 暗部保护 20% | 睫毛发丝根根分明，高频微距锐化"));
+    btn_preset_black_->setToolTip(tr("【纯黑强化 (绝对无雾)】：混合 100% | 细节 100% | 暗部保护 0% | 彻底锁定原图纯黑，零灰雾"));
+
+    preset_layout->addWidget(btn_preset_film_);
+    preset_layout->addWidget(btn_preset_soft_);
+    preset_layout->addWidget(btn_preset_macro_);
+    preset_layout->addWidget(btn_preset_black_);
+    preset_layout->addStretch(1);
+    image_layout->addWidget(preset_row);
+
+    connect(btn_preset_film_, &QPushButton::clicked, this, [this] {
+        apply_composite_preset(100, 100, 50, 100);
+    });
+    connect(btn_preset_soft_, &QPushButton::clicked, this, [this] {
+        apply_composite_preset(80, 90, 50, 100);
+    });
+    connect(btn_preset_macro_, &QPushButton::clicked, this, [this] {
+        apply_composite_preset(100, 115, 20, 110);
+    });
+    connect(btn_preset_black_, &QPushButton::clicked, this, [this] {
+        apply_composite_preset(100, 100, 0, 100);
+    });
+
+    auto *desc_label = new QLabel(tr(
+        "【画面合成说明 (方案3/4/5协同运作，互不冲突)】\n"
+        "• 方案 3 (暗部保护): 抑制暗部灰雾，0%锁定纯黑\n"
+        "• 方案 4 (细节清晰): 频域高频分离增强，>100%睫毛发丝锐利\n"
+        "• 方案 5 (AI混合浓度): 原图与AI柔和融合，80%呈现胶片感"));
+    desc_label->setStyleSheet(QStringLiteral("color: #888899; font-size: 11px;"));
+    desc_label->setWordWrap(true);
+    image_layout->addWidget(desc_label);
+
     image_layout->addStretch(1);
 
     stack->addWidget(image_panel_);
@@ -470,17 +553,22 @@ void BatchWindow::load_settings() {
 
     intensity_->setValue(settings.value(QStringLiteral("intensity"), 100).toInt());
     global_tone_->setValue(settings.value(QStringLiteral("globalTone"), 0).toInt());
-    local_tone_->setValue(settings.value(QStringLiteral("localTone"), 100).toInt());
+    local_tone_->setValue(settings.value(QStringLiteral("localTone"), 0).toInt());
     local_structure_->setValue(settings.value(QStringLiteral("localStructure"), 100).toInt());
-    skin_structure_->setValue(settings.value(QStringLiteral("skinStructure"), 0).toInt());
-    style_->setCurrentIndex(settings.value(QStringLiteral("style"), 0).toInt());
+    skin_structure_->setValue(settings.value(QStringLiteral("skinStructure"), 10).toInt());
+    style_->setCurrentIndex(settings.value(QStringLiteral("style"), 2).toInt());
     preset_->setCurrentIndex(settings.value(QStringLiteral("preset"), 0).toInt());
     double loaded_gamma = settings.value(QStringLiteral("gamma"), 1.0).toDouble();
     if (std::abs(loaded_gamma - 1.4) < 0.05) {
         loaded_gamma = 1.0; // 升级旧版临时 1.4 补偿值回正至物理正确的 1.0
     }
     gamma_->setValue(loaded_gamma);
-    auto_mask_->setChecked(settings.value(QStringLiteral("autoMask"), true).toBool());
+    auto_mask_->setChecked(settings.value(QStringLiteral("autoMask"), false).toBool());
+
+    if (output_mix_) output_mix_->setValue(settings.value(QStringLiteral("outputMix"), 100).toInt());
+    if (detail_boost_) detail_boost_->setValue(settings.value(QStringLiteral("detailBoost"), 100).toInt());
+    if (shadow_protect_) shadow_protect_->setValue(settings.value(QStringLiteral("shadowProtect"), 50).toInt());
+    if (glow_control_) glow_control_->setValue(settings.value(QStringLiteral("glowControl"), 100).toInt());
 
     reset_->setCurrentIndex(settings.value(QStringLiteral("reset"), 0).toInt());
     reset_every_->setValue(settings.value(QStringLiteral("resetEvery"), 60).toInt());
@@ -522,6 +610,10 @@ void BatchWindow::save_settings() const {
     settings.setValue(QStringLiteral("gamma"), gamma_->value());
     settings.setValue(QStringLiteral("imagePasses"), image_passes_->value());
     settings.setValue(QStringLiteral("autoMask"), auto_mask_->isChecked());
+    if (output_mix_) settings.setValue(QStringLiteral("outputMix"), output_mix_->value());
+    if (detail_boost_) settings.setValue(QStringLiteral("detailBoost"), detail_boost_->value());
+    if (shadow_protect_) settings.setValue(QStringLiteral("shadowProtect"), shadow_protect_->value());
+    if (glow_control_) settings.setValue(QStringLiteral("glowControl"), glow_control_->value());
 
     settings.setValue(QStringLiteral("reset"), reset_->currentIndex());
     settings.setValue(QStringLiteral("resetEvery"), reset_every_->value());
@@ -593,16 +685,16 @@ void BatchWindow::update_mode_ui() {
 void BatchWindow::reset_effects() {
     intensity_->setValue(100);
     global_tone_->setValue(0);
-    local_tone_->setValue(100);
+    local_tone_->setValue(0);
     local_structure_->setValue(100);
-    skin_structure_->setValue(0);
-    style_->setCurrentIndex(0);
+    skin_structure_->setValue(10);
+    style_->setCurrentIndex(2);
     preset_->setCurrentIndex(0);
     model_->setCurrentIndex(0);
     model_scale_->setCurrentIndex(0);
     upscale_->setCurrentIndex(0);
     codec_->setCurrentIndex(0);
-    auto_mask_->setChecked(true);
+    auto_mask_->setChecked(false);
     gamma_->setValue(1.0);
     image_passes_->setValue(3);
     passes_->setValue(1);
@@ -610,6 +702,21 @@ void BatchWindow::reset_effects() {
     reset_every_->setValue(60);
     cut_->setText(QStringLiteral("0.30"));
     flow_->setChecked(false);
+    if (output_mix_) output_mix_->setValue(100);
+    if (detail_boost_) detail_boost_->setValue(100);
+    if (shadow_protect_) shadow_protect_->setValue(50);
+    if (glow_control_) glow_control_->setValue(100);
+}
+
+void BatchWindow::apply_composite_preset(int mix, int detail, int shadow, int glow) {
+    if (output_mix_) output_mix_->setValue(mix);
+    if (detail_boost_) detail_boost_->setValue(detail);
+    if (shadow_protect_) shadow_protect_->setValue(shadow);
+    if (glow_control_) glow_control_->setValue(glow);
+    if (local_tone_) local_tone_->setValue(0);
+    if (style_) style_->setCurrentIndex(2); // 电影
+    if (skin_structure_) skin_structure_->setValue(10); // 0.10
+    if (auto_mask_) auto_mask_->setChecked(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +829,10 @@ QStringList BatchWindow::arguments() const {
         args << QStringLiteral("--dlss-model-preset") << model_->currentText();
     args << QStringLiteral("--gamma") << number(gamma_->value());
     if (!auto_mask_->isChecked()) args << QStringLiteral("--no-auto-mask");
+    if (output_mix_) args << QStringLiteral("--output-mix") << number(output_mix_->value() / 100.0);
+    if (detail_boost_) args << QStringLiteral("--detail-boost") << number(detail_boost_->value() / 100.0);
+    if (shadow_protect_) args << QStringLiteral("--shadow-protect") << number(shadow_protect_->value() / 100.0);
+    if (glow_control_) args << QStringLiteral("--glow-control") << number(glow_control_->value() / 100.0);
     // Translate first, then run: the parallel translation and the first
     // evaluation contending on the GPU is what produced black frames.
     args << QStringLiteral("--precompile-wait");
