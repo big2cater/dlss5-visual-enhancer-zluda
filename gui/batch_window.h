@@ -148,6 +148,7 @@ private:
     QPushButton *btn_preset_soft_ = nullptr;
     QPushButton *btn_preset_macro_ = nullptr;
     QPushButton *btn_preset_black_ = nullptr;
+    QPushButton *btn_preset_motion_ = nullptr;
 
     // ---- run ------------------------------------------------------------
     QPushButton *start_button_ = nullptr;

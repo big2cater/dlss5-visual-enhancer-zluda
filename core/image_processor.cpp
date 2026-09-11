@@ -608,8 +608,11 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     frame.color = direct_upload ? nullptr : s->colour;
     frame.color_is_shared = direct_upload;
     frame.output = s->result;
-    if ((motion_gpu || (motion && !motion->empty())) && s->motion_tex)
+    if ((motion_gpu || (motion && !motion->empty())) && s->motion_tex) {
         frame.motion_vectors = s->motion_tex;
+        frame.mv_scale_x = -1.0f / (float)in.width;
+        frame.mv_scale_y = -1.0f / (float)in.height;
+    }
     // Depth and motion vectors are left out for stills: the layer accepts
     // their absence (zero motion then).
     //
@@ -885,8 +888,11 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
     frame.color = nullptr;
     frame.color_is_shared = true;
     frame.output = s->result;
-    if ((motion_gpu || (motion && !motion->empty())) && s->motion_tex)
+    if ((motion_gpu || (motion && !motion->empty())) && s->motion_tex) {
         frame.motion_vectors = s->motion_tex;
+        frame.mv_scale_x = -1.0f / (float)width;
+        frame.mv_scale_y = -1.0f / (float)height;
+    }
     frame.reset_accumulation = settings.reset_accumulation;
     const int passes = settings.passes < 1 ? 1 : settings.passes;
 

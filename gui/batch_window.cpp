@@ -264,8 +264,13 @@ QWidget *BatchWindow::build_left_column() {
         tr("人脸/皮肤纹理防过度平滑保护：调高此项可在强力降噪的同时保护人像面部微毛孔与天然皮肤质感，避免塑料脸或假面感。"));
 
     style_ = new QComboBox;
-    style_->addItems({tr("0 - 默认"), tr("1 - 自然"), tr("2 - 电影")});
+    style_->addItems({tr("0 - 默认 (平衡)"), tr("1 - 自然 (低时序延迟·紧跟人物)"), tr("2 - 电影 (高平滑稳定)")});
     style_->setCurrentIndex(2); // 默认电影风格 (Cinematic)
+    style_->setToolTip(tr(
+        "风格选择与时序响应特性：\n"
+        "· 0 - 默认：标准时序累积平衡，适合普通视频。\n"
+        "· 1 - 自然 (推荐解决拖影)：极低时序惯性与衰减延迟，紧贴人物动作与转头面部，杜绝慢半拍拖影不跟人现象！\n"
+        "· 2 - 电影：重度时序平滑与胶片降噪（静态或微动场景质感极佳，但大动作时容易产生历史帧拖尾滞后感）。"));
     form->addRow(tr("风格"), style_);
 
     preset_ = new QComboBox;
@@ -355,16 +360,20 @@ QWidget *BatchWindow::build_composite_column() {
     btn_preset_soft_ = new QPushButton(tr("柔和写真"));
     btn_preset_macro_ = new QPushButton(tr("极致微距"));
     btn_preset_black_ = new QPushButton(tr("纯黑无雾"));
+    btn_preset_motion_ = new QPushButton(tr("⚡ 灵动跟人 (防拖影·极速响应)"));
 
     btn_preset_film_->setToolTip(tr("【原生电影 (推荐)】：混合 100% | 细节 100% | 暗部保护 50% | 局部色调 0 | 风格 电影"));
     btn_preset_soft_->setToolTip(tr("【柔和写真 (防发脆)】：混合 80% | 细节 90% | 暗部保护 50% | 消除过度数码锐化，自然写真质感"));
     btn_preset_macro_->setToolTip(tr("【极致微距 (锐利)】：混合 100% | 细节 115% | 暗部保护 20% | 睫毛发丝根根分明，高频微距锐化"));
     btn_preset_black_->setToolTip(tr("【纯黑强化 (绝对无雾)】：混合 100% | 细节 100% | 暗部保护 0% | 彻底锁定原图纯黑，零灰雾"));
+    btn_preset_motion_->setToolTip(tr("【灵动跟人 (防拖影/低延迟)】：风格 自然 | 强度 85% | 混合 90% | 细节 105% | 自动开启运动向量引导 | 专治人物转头/大幅度动作时滤镜慢半拍或拖影滞后问题"));
+    btn_preset_motion_->setStyleSheet(QStringLiteral("font-weight: bold; color: #4da6ff;"));
 
     grid->addWidget(btn_preset_film_, 0, 0);
     grid->addWidget(btn_preset_soft_, 0, 1);
     grid->addWidget(btn_preset_macro_, 1, 0);
     grid->addWidget(btn_preset_black_, 1, 1);
+    grid->addWidget(btn_preset_motion_, 2, 0, 1, 2);
     col_layout->addWidget(preset_grid_widget);
 
     connect(btn_preset_film_, &QPushButton::clicked, this, [this] {
@@ -378,6 +387,12 @@ QWidget *BatchWindow::build_composite_column() {
     });
     connect(btn_preset_black_, &QPushButton::clicked, this, [this] {
         apply_composite_preset(100, 100, 0, 100);
+    });
+    connect(btn_preset_motion_, &QPushButton::clicked, this, [this] {
+        apply_composite_preset(90, 105, 50, 100);
+        style_->setCurrentIndex(1); // 1 - 自然 (低时序惯性)
+        intensity_->setValue(85);   // 85% 灵动响应
+        if (flow_) flow_->setChecked(true); // 开启运动向量光流引导
     });
 
     auto *desc_label = new QLabel(tr(
@@ -485,8 +500,9 @@ QWidget *BatchWindow::build_video_column() {
     });
     form->addRow(dump_row);
 
-    flow_ = new QCheckBox(tr("运动向量引导"));
-    flow_->setToolTip(tr("优先使用 D3D12 GPU 计算运动向量，再自动回退 CPU。默认关。"));
+    flow_ = new QCheckBox(tr("运动向量引导 (光流对齐·防拖影)"));
+    flow_->setToolTip(tr("启用 D3D12 GPU 运动向量引导（光流时间对齐）。\n"
+                         "神经网络根据人物运动轨迹动态对齐历史帧，解决人物转头或快速运动时滤镜不跟人与重影问题。"));
     audio_ = new QCheckBox(tr("音轨直通"));
     auto *switches = new QWidget;
     auto *switch_layout = new QHBoxLayout(switches);
