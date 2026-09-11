@@ -122,6 +122,7 @@ private:
     QSpinBox *passes_ = nullptr;
     QSpinBox *crf_ = nullptr;
     QComboBox *codec_ = nullptr;
+    QComboBox *parallel_ = nullptr;
     QLineEdit *fps_ = nullptr;
     QLineEdit *max_frames_ = nullptr;
     QComboBox *model_scale_ = nullptr;

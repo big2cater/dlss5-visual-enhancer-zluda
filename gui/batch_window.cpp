@@ -461,6 +461,18 @@ QWidget *BatchWindow::build_video_column() {
         tr("选择视频编码器。AMD AMF 提供高速硬件压制；HEVC/H.265 拥有更高压缩率和更小文件体积。"));
     form->addRow(tr("视频编码格式"), codec_);
 
+    parallel_ = new QComboBox;
+    parallel_->addItems({tr("🚀 自动 (智能硬件守护·显存/CPU防卡死)"),
+                         tr("2 进程分片并行 (加速~2倍·需12G+显存)"),
+                         tr("关闭 (单进程标准模式)")});
+    parallel_->setCurrentIndex(0);
+    parallel_->setToolTip(
+        tr("视频分段切片并行加速：\n"
+           "· 自动：根据显卡显存、系统内存和 CPU 核心数自动评估并分配安全并发度，杜绝爆显存与 CPU 100% 死机；\n"
+           "· 2 进程并行：将长视频分段双实例并发处理，完成后无损拼合，耗时减半；\n"
+           "· 关闭：单进程标准逐帧处理。"));
+    form->addRow(tr("🚀 并行加速"), parallel_);
+
     fps_ = new QLineEdit(QStringLiteral("0"));
     form->addRow(tr("输出fps(0=原)"), fps_);
 
@@ -606,6 +618,7 @@ void BatchWindow::load_settings() {
     passes_->setValue(settings.value(QStringLiteral("passes"), 1).toInt());
     crf_->setValue(settings.value(QStringLiteral("crf"), 18).toInt());
     codec_->setCurrentIndex(settings.value(QStringLiteral("codec"), 0).toInt());
+    if (parallel_) parallel_->setCurrentIndex(settings.value(QStringLiteral("parallel"), 0).toInt());
     fps_->setText(settings.value(QStringLiteral("fps"), QStringLiteral("0")).toString());
     max_frames_->setText(
         settings.value(QStringLiteral("maxFrames"), QStringLiteral("0")).toString());
@@ -651,6 +664,7 @@ void BatchWindow::save_settings() const {
     settings.setValue(QStringLiteral("passes"), passes_->value());
     settings.setValue(QStringLiteral("crf"), crf_->value());
     settings.setValue(QStringLiteral("codec"), codec_->currentIndex());
+    if (parallel_) settings.setValue(QStringLiteral("parallel"), parallel_->currentIndex());
     settings.setValue(QStringLiteral("fps"), fps_->text());
     settings.setValue(QStringLiteral("maxFrames"), max_frames_->text());
     settings.setValue(QStringLiteral("modelScale"), model_scale_->currentIndex());
@@ -824,10 +838,20 @@ QStringList BatchWindow::arguments() const {
             const double eff_fps = (ok && fps > 0) ? fps : 30.0;
             const int preview_frames = (frames_total_ > 0) ? (int)frames_total_ : qMax(30, (int)std::round(eff_fps * 3.0));
             args << QStringLiteral("--max-frames") << QString::number(preview_frames);
+            args << QStringLiteral("--parallel") << QStringLiteral("off");
         } else {
             const int max_frames = max_frames_->text().trimmed().toInt(&ok);
             if (ok && max_frames > 0)
                 args << QStringLiteral("--max-frames") << QString::number(max_frames);
+            if (parallel_) {
+                const int p_idx = parallel_->currentIndex();
+                if (p_idx == 0)
+                    args << QStringLiteral("--parallel") << QStringLiteral("auto");
+                else if (p_idx == 1)
+                    args << QStringLiteral("--parallel") << QStringLiteral("2");
+                else if (p_idx == 2)
+                    args << QStringLiteral("--parallel") << QStringLiteral("off");
+            }
         }
 
         static const char *codecs[] = {"auto", "h264_amf", "hevc_amf", "x264"};

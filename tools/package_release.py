@@ -22,12 +22,6 @@ files_to_copy = [
     (os.path.join(root_dir, "run", "dlssnr_gui.exe"), os.path.join(staging_dir, "dlssnr_gui.exe")),
     (os.path.join(root_dir, "run", "video_filter.exe"), os.path.join(staging_dir, "video_filter.exe")),
     
-    # C# WinForms GUI
-    (os.path.join(root_dir, "run", "DLSSNRFilter.exe"), os.path.join(staging_dir, "DLSSNRFilter.exe")),
-    (os.path.join(root_dir, "run", "DLSSNRFilter.dll"), os.path.join(staging_dir, "DLSSNRFilter.dll")),
-    (os.path.join(root_dir, "run", "DLSSNRFilter.runtimeconfig.json"), os.path.join(staging_dir, "DLSSNRFilter.runtimeconfig.json")),
-    (os.path.join(root_dir, "run", "DLSSNRFilter.deps.json"), os.path.join(staging_dir, "DLSSNRFilter.deps.json")),
-    
     # ZLUDA / Drivers / Runtimes
     (os.path.join(root_dir, "run", "nvcuda.dll"), os.path.join(staging_dir, "nvcuda.dll")),
     (os.path.join(root_dir, "run", "nvapi64.dll"), os.path.join(staging_dir, "nvapi64.dll")),

@@ -75,6 +75,7 @@
 #include "../core/image_processor.h"
 #include "../core/precompile.h"
 #include "half_float.h"
+#include "hardware_budget.h"
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "windowscodecs.lib")
@@ -385,6 +386,7 @@ struct VideoParams {
     unsigned width = 0;
     unsigned height = 0;
     double fps = 0.0;
+    double duration = 0.0;
     std::string audio_codec;
 };
 
@@ -394,7 +396,7 @@ bool probe_video(const std::wstring &input, VideoParams &params, std::string &er
     if (!pipe.make(false, true)) { error = "pipe creation failed"; return false; }
     ChildProcess child;
     std::wstring command = tool_cmd(true) + L" -v error -select_streams v:0 "
-                           L"-show_entries stream=width,height,r_frame_rate -of csv=p=0 \"" +
+                           L"-show_entries stream=width,height,r_frame_rate:format=duration -of csv=p=0 \"" +
                            input + L"\"";
     if (!spawn(command, Pipe{}, pipe, child, true)) {
         error = "ffprobe could not be started (is ffmpeg on PATH, or $FFMPEG_PATH set?)";
@@ -418,15 +420,24 @@ bool probe_video(const std::wstring &input, VideoParams &params, std::string &er
 
     unsigned w = 0, h = 0;
     char rate[64] = {};
-    if (sscanf(text.c_str(), "%u,%u,%63s", &w, &h, rate) != 3 || !w || !h) {
+    double dur = 0.0;
+    if (sscanf(text.c_str(), "%u,%u,%63s\n%lf", &w, &h, rate, &dur) >= 3 && w && h) {
+        params.width = w;
+        params.height = h;
+        params.duration = dur;
+        unsigned num = 0, den = 1;
+        if (sscanf(rate, "%u/%u", &num, &den) == 2 && num && den) params.fps = (double)num / den;
+        else if (sscanf(rate, "%u", &num) == 1 && num) params.fps = (double)num;
+    } else if (sscanf(text.c_str(), "%u,%u,%63s", &w, &h, rate) == 3 && w && h) {
+        params.width = w;
+        params.height = h;
+        unsigned num = 0, den = 1;
+        if (sscanf(rate, "%u/%u", &num, &den) == 2 && num && den) params.fps = (double)num / den;
+        else if (sscanf(rate, "%u", &num) == 1 && num) params.fps = (double)num;
+    } else {
         error = "could not parse ffprobe output: " + text;
         return false;
     }
-    params.width = w;
-    params.height = h;
-    unsigned num = 0, den = 1;
-    if (sscanf(rate, "%u/%u", &num, &den) == 2 && num && den) params.fps = (double)num / den;
-    else if (sscanf(rate, "%u", &num) == 1 && num) params.fps = (double)num;
 
     // Probe primary audio stream codec
     Pipe apipe;
@@ -460,14 +471,26 @@ bool probe_video(const std::wstring &input, VideoParams &params, std::string &er
 
 // Decoder: ffmpeg -i in -an -f rawvideo -pix_fmt rgb48le -
 bool start_decoder(const std::wstring &input, Pipe &collect, ChildProcess &child,
-                   unsigned decode_w = 0, unsigned decode_h = 0) {
+                   unsigned decode_w = 0, unsigned decode_h = 0,
+                   double start_sec = 0.0, double duration_sec = 0.0, int ffmpeg_threads = 0) {
     Pipe empty;
     std::wstring scale_filter;
     if (decode_w > 0 && decode_h > 0) {
         scale_filter = L"-vf scale=" + std::to_wstring(decode_w) + L":" + std::to_wstring(decode_h) + L":flags=bicubic ";
     }
-    std::wstring command = tool_cmd(false) + L" -nostdin -v error -i \"" + input +
-                           L"\" -an " + scale_filter + L"-f rawvideo -pix_fmt rgb48le -";
+    std::wstring time_args;
+    if (start_sec > 0.001) {
+        time_args += L"-ss " + std::to_wstring(start_sec) + L" ";
+    }
+    if (duration_sec > 0.001) {
+        time_args += L"-t " + std::to_wstring(duration_sec) + L" ";
+    }
+    std::wstring thread_args;
+    if (ffmpeg_threads > 0) {
+        thread_args = L"-threads " + std::to_wstring(ffmpeg_threads) + L" ";
+    }
+    std::wstring command = tool_cmd(false) + L" -nostdin -v error " + time_args + L"-i \"" + input +
+                           L"\" -an " + thread_args + scale_filter + L"-f rawvideo -pix_fmt rgb48le -";
     if (!spawn(command, empty, collect, child)) return false;
     return true;
 }
@@ -503,7 +526,8 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
                    const VideoParams &params, int crf, bool audio, Pipe &feed,
                    ChildProcess &child, unsigned input_width = 0, unsigned input_height = 0,
                    unsigned output_width = 0, unsigned output_height = 0,
-                   const std::string &encoder_choice = "auto") {
+                   const std::string &encoder_choice = "auto",
+                   int ffmpeg_threads = 0, bool video_only = false) {
     Pipe empty;
     char rate[64];
     if (params.fps > 0.0) {
@@ -554,7 +578,9 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
     const std::wstring sub_args = is_mkv ? L"-map 0:s? -c:s copy " : L"";
 
     std::wstring audio_args;
-    if (audio) {
+    if (video_only) {
+        audio_args = L"-an ";
+    } else if (audio) {
         const std::string &ac = params.audio_codec;
         const bool can_copy_in_mp4 = (ac == "aac" || ac == "mp3" || ac == "ac3" || ac == "eac3");
         if (is_mkv || can_copy_in_mp4 || ac.empty()) {
@@ -572,8 +598,12 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
             ? (L"-vf scale=" + std::to_wstring(output_width) + L":" + std::to_wstring(output_height) +
                L":flags=lanczos:in_color_matrix=bt709:out_color_matrix=bt709:in_range=full:out_range=limited ")
             : L"-vf scale=in_color_matrix=bt709:out_color_matrix=bt709:in_range=full:out_range=limited ";
+        const std::wstring thread_args = (ffmpeg_threads > 0)
+            ? (L"-threads " + std::to_wstring(ffmpeg_threads) + L" ")
+            : L"";
 
         return tool_cmd(false) + L" -nostdin -v error -y -i \"" + input + L"\" " +
+               thread_args +
                L"-f rawvideo -pix_fmt rgb48le -s " +
                std::to_wstring(input_width) + L"x" + std::to_wstring(input_height) +
                L" -r " + widen(rate) + L" -i - " +
@@ -1094,6 +1124,14 @@ struct Options {
     std::string encoder = "auto";
     int yield_ms = 1; // ms to yield per frame to prevent TDR and keep DWM responsive
     CompositeOptions comp_opts;
+    std::string parallel_mode = "auto";
+    bool is_child_chunk = false;
+    double chunk_start_sec = 0.0;
+    double chunk_duration_sec = 0.0;
+    double warmup_sec = 0.0;
+    unsigned warmup_discard_frames = 0;
+    unsigned frame_index_offset = 0;
+    int ffmpeg_threads = 0;
 };
 
 void usage() {
@@ -1126,6 +1164,7 @@ void usage() {
         "  --fps N               override output frame rate\n"
         "  --no-audio            don't copy the source audio\n"
         "  --max-frames N        stop after N frames\n"
+        "  --parallel auto|2|off multi-process temporal chunk parallelization (auto default, with hardware guard)\n"
         "  --yield-ms N          GPU scheduling yield per frame in ms for TDR prevention (1 default)\n"
         "  --dump-frames DIR     write each output frame as PNG into DIR\n");
 }
@@ -1244,6 +1283,23 @@ bool parse_args(int argc, char **argv, Options &options) {
             options.yield_ms = atoi(v);
             if (options.yield_ms < 0) options.yield_ms = 0;
             options.settings.yield_ms = options.yield_ms;
+        } else if (arg == "--parallel") {
+            const char *v = need("--parallel"); if (!v) return false;
+            options.parallel_mode = v;
+        } else if (arg == "--child-chunk") {
+            const char *v1 = need("--child-chunk (start)"); if (!v1) return false;
+            const char *v2 = need("--child-chunk (duration)"); if (!v2) return false;
+            const char *v3 = need("--child-chunk (warmup)"); if (!v3) return false;
+            options.is_child_chunk = true;
+            options.chunk_start_sec = atof(v1);
+            options.chunk_duration_sec = atof(v2);
+            options.warmup_sec = atof(v3);
+        } else if (arg == "--frame-index-offset") {
+            const char *v = need("--frame-index-offset"); if (!v) return false;
+            options.frame_index_offset = (unsigned)atoi(v);
+        } else if (arg == "--ffmpeg-threads") {
+            const char *v = need("--ffmpeg-threads"); if (!v) return false;
+            options.ffmpeg_threads = atoi(v);
         } else if (arg == "--dump-frames") {
             const char *v = need("--dump-frames"); if (!v) return false;
             options.dump_dir = widen(v);
@@ -1829,6 +1885,189 @@ bool output_is_blank(const enhancer::Image &image) {
     return (max_luma < 0.005f) || (mean < 0.002 && variance < 0.0001);
 }
 
+static int run_parallel_orchestrator(int argc, char **argv, const Options &options,
+                                     const VideoParams &params,
+                                     const dlssnr_budget::HardwareInfo &budget,
+                                     int concurrency) {
+    fprintf(stderr, "[parallel] 启动 %d 进程分片并发加速 (时长: %.1fs, 帧率: %.2f fps, 显存/CPU安全分流)\n",
+            concurrency, params.duration, params.fps);
+    fflush(stderr);
+
+    const double total_dur = params.duration;
+    const double split_sec = total_dur / 2.0;
+    double warmup_sec = 1.0;
+    if (split_sec < 3.0) warmup_sec = 0.5;
+
+    std::wstring self_exe(MAX_PATH, L'\0');
+    DWORD len = GetModuleFileNameW(nullptr, self_exe.data(), MAX_PATH);
+    self_exe.resize(len);
+
+    std::wstring out_part0 = options.output + L".part0.mp4";
+    std::wstring out_part1 = options.output + L".part1.mp4";
+    std::wstring concat_list_path = options.output + L".concat.txt";
+
+    _wremove(out_part0.c_str());
+    _wremove(out_part1.c_str());
+    _wremove(concat_list_path.c_str());
+
+    auto build_worker_cmd = [&](const std::wstring &chunk_out, double start_s, double dur_s,
+                                double warmup_s, unsigned frame_offset) -> std::wstring {
+        std::wstring cmd = L"\"" + self_exe + L"\"";
+        for (int i = 1; i < argc; ++i) {
+            std::wstring arg = widen(argv[i]);
+            if (arg == options.output) {
+                cmd += L" \"" + chunk_out + L"\"";
+            } else if (arg == L"--parallel") {
+                cmd += L" --parallel 1";
+                if (i + 1 < argc && argv[i + 1][0] != '-') ++i; // skip value
+            } else {
+                if (arg.find(L' ') != std::wstring::npos) {
+                    cmd += L" \"" + arg + L"\"";
+                } else {
+                    cmd += L" " + arg;
+                }
+            }
+        }
+        cmd += L" --child-chunk " + std::to_wstring(start_s) + L" " + std::to_wstring(dur_s) +
+               L" " + std::to_wstring(warmup_s);
+        cmd += L" --frame-index-offset " + std::to_wstring(frame_offset);
+        if (budget.ffmpeg_threads_per_worker > 0) {
+            cmd += L" --ffmpeg-threads " + std::to_wstring(budget.ffmpeg_threads_per_worker);
+        }
+        return cmd;
+    };
+
+    std::wstring cmd0 = build_worker_cmd(out_part0, 0.0, split_sec, 0.0, 0);
+    std::wstring cmd1 = build_worker_cmd(out_part1, split_sec, total_dur - split_sec, warmup_sec,
+                                         (unsigned)std::round(split_sec * params.fps));
+
+    STARTUPINFOW si0{}, si1{};
+    si0.cb = sizeof(si0);
+    si0.dwFlags = STARTF_USESTDHANDLES;
+    si0.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si0.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si0.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+    si1.cb = sizeof(si1);
+    si1.dwFlags = STARTF_USESTDHANDLES;
+    si1.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si1.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si1.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+    PROCESS_INFORMATION pi0{}, pi1{};
+
+    // Launch worker 0 with below normal priority (prevents desktop/UI freeze)
+    if (!CreateProcessW(nullptr, cmd0.data(), nullptr, nullptr, TRUE,
+                        BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &si0, &pi0)) {
+        fprintf(stderr, "[FAIL] 无法启动分片工作进程 0 (错误码 %lu)\n", GetLastError());
+        return 1;
+    }
+
+    // Small stagger delay to let worker 0 initialize pipeline without driver race
+    Sleep(600);
+
+    // Launch worker 1 with below normal priority
+    if (!CreateProcessW(nullptr, cmd1.data(), nullptr, nullptr, TRUE,
+                        BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &si1, &pi1)) {
+        fprintf(stderr, "[FAIL] 无法启动分片工作进程 1 (错误码 %lu)\n", GetLastError());
+        TerminateProcess(pi0.hProcess, 1);
+        CloseHandle(pi0.hProcess);
+        CloseHandle(pi0.hThread);
+        return 1;
+    }
+
+    HANDLE handles[2] = { pi0.hProcess, pi1.hProcess };
+    WaitForMultipleObjects(2, handles, TRUE, INFINITE);
+
+    DWORD code0 = 1, code1 = 1;
+    GetExitCodeProcess(pi0.hProcess, &code0);
+    GetExitCodeProcess(pi1.hProcess, &code1);
+
+    CloseHandle(pi0.hProcess);
+    CloseHandle(pi0.hThread);
+    CloseHandle(pi1.hProcess);
+    CloseHandle(pi1.hThread);
+
+    if (code0 != 0 || code1 != 0) {
+        fprintf(stderr, "[FAIL] 分片处理异常退出 (分片0: %lu, 分片1: %lu)\n", code0, code1);
+        _wremove(out_part0.c_str());
+        _wremove(out_part1.c_str());
+        return 1;
+    }
+
+    fprintf(stderr, "[parallel] 各分片处理完成，正在极速拼合并封装音频...\n");
+    fflush(stderr);
+
+    // Write concat file in UTF-8
+    FILE *fconcat = _wfopen(concat_list_path.c_str(), L"wb");
+    if (!fconcat) {
+        fprintf(stderr, "[FAIL] 无法创建合并列表文件\n");
+        return 1;
+    }
+    std::wstring p0_norm = out_part0;
+    std::wstring p1_norm = out_part1;
+    for (auto &c : p0_norm) if (c == L'\\') c = L'/';
+    for (auto &c : p1_norm) if (c == L'\\') c = L'/';
+
+    auto to_u8 = [](const std::wstring &w) -> std::string {
+        int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (n <= 1) return "";
+        std::string s((size_t)n - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, s.data(), n, nullptr, nullptr);
+        return s;
+    };
+
+    std::string line0 = "file '" + to_u8(p0_norm) + "'\r\n";
+    std::string line1 = "file '" + to_u8(p1_norm) + "'\r\n";
+    fwrite(line0.data(), 1, line0.size(), fconcat);
+    fwrite(line1.data(), 1, line1.size(), fconcat);
+    fclose(fconcat);
+
+    // Concat & mux audio
+    std::wstring audio_args;
+    if (params.audio_codec.empty() || params.audio_codec == "none") {
+        audio_args = L"-an ";
+    } else if (params.audio_codec == "wmapro" || params.audio_codec == "wmav2" ||
+               params.audio_codec == "wmavoice" || params.audio_codec == "pcm_s16le" ||
+               params.audio_codec == "pcm_s24le" || params.audio_codec == "alac") {
+        audio_args = L"-c:a aac -b:a 192k ";
+    } else {
+        audio_args = L"-c:a copy ";
+    }
+
+    std::wstring concat_cmd = tool_cmd(false) + L" -y -nostdin -v error -f concat -safe 0 -i \"" +
+                              concat_list_path + L"\" -i \"" + options.input +
+                              L"\" -map 0:v -map 1:a? -c:v copy " + audio_args +
+                              L"\"" + options.output + L"\"";
+
+    STARTUPINFOW csi{};
+    csi.cb = sizeof(csi);
+    PROCESS_INFORMATION cpi{};
+    if (CreateProcessW(nullptr, concat_cmd.data(), nullptr, nullptr, TRUE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &csi, &cpi)) {
+        WaitForSingleObject(cpi.hProcess, 60000);
+        DWORD ccode = 1;
+        GetExitCodeProcess(cpi.hProcess, &ccode);
+        CloseHandle(cpi.hProcess);
+        CloseHandle(cpi.hThread);
+        if (ccode != 0) {
+            fprintf(stderr, "[FAIL] FFmpeg concat 拼合失败 (代码 %lu)\n", ccode);
+            return 1;
+        }
+    } else {
+        fprintf(stderr, "[FAIL] 无法启动 FFmpeg concat 命令\n");
+        return 1;
+    }
+
+    _wremove(out_part0.c_str());
+    _wremove(out_part1.c_str());
+    _wremove(concat_list_path.c_str());
+
+    fprintf(stderr, "[parallel] 🚀 分片并行转码全部完成！输出已保存至：%ls\n", options.output.c_str());
+    fflush(stderr);
+    return 0;
+}
+
 } // namespace
 
 // One full run of the tool; returns 0 ok, 1 failure, 2 retryable (blank race).
@@ -1885,6 +2124,28 @@ static int run_main_once(int argc, char **argv) {
     if (options.upscale != 1.0)
         fprintf(stderr, "[upscale] ratio=%.3f output=%ux%u\n", options.upscale, output_w, output_h);
 
+    // Check parallel processing mode
+    const bool requested_parallel = (options.parallel_mode == "auto" || options.parallel_mode == "2");
+    if (!options.is_child_chunk && requested_parallel) {
+        dlssnr_budget::HardwareInfo budget = dlssnr_budget::detect_hardware_budget(
+            params.duration, params.width, params.height);
+        fprintf(stderr, "%s\n", budget.summary.c_str());
+        fflush(stderr);
+
+        int concurrency = (options.parallel_mode == "2") ? 2 : budget.recommended_concurrency;
+        if (concurrency >= 2 && params.duration >= 15.0) {
+            return run_parallel_orchestrator(argc, argv, options, params, budget, concurrency);
+        }
+    }
+
+    double start_s = 0.0, dur_s = 0.0;
+    if (options.is_child_chunk) {
+        SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+        start_s = std::max(0.0, options.chunk_start_sec - options.warmup_sec);
+        dur_s = options.chunk_duration_sec + (options.chunk_start_sec - start_s);
+        options.warmup_discard_frames = (unsigned)std::round((options.chunk_start_sec - start_s) * params.fps);
+    }
+
     // --- start ffmpeg decode + encode sides ------------------------------
     // Decoder: the child writes its raw frames to the pipe, so the write end
     // is the inherited one; we only read.
@@ -1894,7 +2155,8 @@ static int run_main_once(int argc, char **argv) {
     const bool need_decode_scale = (model_w != params.width || model_h != params.height);
     if (!start_decoder(options.input, decoder_stdout, decoder,
                        need_decode_scale ? model_w : 0,
-                       need_decode_scale ? model_h : 0)) {
+                       need_decode_scale ? model_h : 0,
+                       start_s, dur_s, options.ffmpeg_threads)) {
         fprintf(stderr, "[FAIL] decoder: %s\n", error.c_str());
         decoder_stdout.close();
         return 1;
@@ -1953,7 +2215,8 @@ static int run_main_once(int argc, char **argv) {
     if (!encoder_stdin.make(true, false)) { fprintf(stderr, "[FAIL] pipe\n"); return 1; }
     ChildProcess encoder;
     if (!start_encoder(options.input, options.output, params, options.crf, options.audio,
-                       encoder_stdin, encoder, model_w, model_h, output_w, output_h, options.encoder)) {
+                       encoder_stdin, encoder, model_w, model_h, output_w, output_h, options.encoder,
+                       options.ffmpeg_threads, options.is_child_chunk /* video_only */)) {
         fprintf(stderr, "[FAIL] encoder could not be started (invalid output path or ffmpeg)\n");
         encoder_stdin.close();
         return 1;
@@ -2179,6 +2442,7 @@ static int run_main_once(int argc, char **argv) {
         auto eos_frame = std::make_shared<InputFrame>();
         eos_frame->is_eos = true;
         ready_input_channel.push(eos_frame);
+        decoder_stdout.close();
     });
 
     // Stage 3: Encoder writer & postprocessor thread
@@ -2191,6 +2455,11 @@ static int run_main_once(int argc, char **argv) {
             if (!ready_output_channel.pop(frame)) break;
             if (frame->is_eos) {
                 break;
+            }
+
+            if (options.is_child_chunk && frame->index < options.warmup_discard_frames) {
+                free_output_pool.push(frame);
+                continue;
             }
 
             bool blank = false;
@@ -2218,10 +2487,14 @@ static int run_main_once(int argc, char **argv) {
                     fprintf(stderr, "[warn] could not dump frame %u\n", frame->index);
             }
 
-            frames_written.store(frame->index + 1);
-            if ((frame->index % 5) == 0 || (frame->index < 5)) {
+            unsigned display_idx = frame->index;
+            if (options.is_child_chunk) {
+                display_idx = (frame->index - options.warmup_discard_frames) + options.frame_index_offset;
+            }
+            frames_written.store(display_idx + 1);
+            if ((display_idx % 5) == 0 || (frame->index < 5)) {
                 fprintf(stderr, "[%.5u] %.0f ms (avg %.1f, reset=%d, blanks=%d)\n",
-                        frame->index, frame->ms,
+                        display_idx, frame->ms,
                         elapsed_total.load() / (frame->index + 1),
                         reset_count.load(), blank_count.load());
                 fflush(stderr);

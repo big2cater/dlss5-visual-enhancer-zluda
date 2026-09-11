@@ -1,9 +1,9 @@
-DLSSNRFilter ZLUDA 加速与双引擎多轮降噪发布包 (2026-09-10)
+DLSSNRFilter ZLUDA 加速与双引擎多轮降噪发布包 (2026-09-11)
 
 【使用方法】
 1. 解压整个文件夹，不要只复制单个 DLL。
-2. 将 NVIDIA 官方的 nvngx_dlssnr.dll 放入根目录（与 video_filter.exe / DLSSNRFilter.exe 同级目录）。
-3. 双击运行 DLSSNRFilter.exe（或 dlssnr_gui.exe）。
+2. 将 NVIDIA 官方的 nvngx_dlssnr.dll 放入根目录（与 video_filter.exe / dlssnr_gui.exe 同级目录）。
+3. 双击运行 dlssnr_gui.exe（Qt 6 统一现代图形界面；原 WinForms 界面已正式弃用移除）。
 4. 视频处理需要 ffmpeg.exe 和 ffprobe.exe；请确保已安装 FFmpeg 并把 bin 目录加入系统环境变量 PATH。
 5. 首次运行可能需要较长时间编译/翻译 CUDA 模块，之后会直接调用本机编译缓存（秒级启动）。
 
@@ -43,6 +43,11 @@ DLSSNRFilter ZLUDA 加速与双引擎多轮降噪发布包 (2026-09-10)
    - 默认启用肤色自适应保护遮罩与中性色调风格，输出严格标定 Rec.709 色彩矩阵，解决皮肤发黄与暗部色块问题。
 13. 灵动动作跟踪与运动矢量尺度修正：
    - 校准光流运动矢量尺度与法向范围（0.5x），大幅降低视频动态滤镜延迟，镜头快速移动时不丢人脸、不拖影。
+14. 智能硬件预算守护与切片多进程并行加速（--parallel auto / 2）：
+   - 针对长视频渲染耗时痛点，重构并引入时序重叠切片并行处理架构，实现双进程并发推理，视频转换耗时减半（提速近 2 倍）；
+   - 独创时序预热（Warmup Overlap 30帧）接缝平滑技术：切片边界无缝衔接，彻底根除视频拼接闪烁与跳帧，处理完成后由 FFmpeg 原生秒级零损耗合并音视频流；
+   - 动态硬件资源预算守护（HardwareBudget Guardrail）：自动检测 GPU 显存容量与空闲量、系统可用物理内存（RAM）及 CPU 物理/逻辑核心数。显存不足 8GB 或可用物理内存不足时自动安全回退单进程，严格限制后台编码线程并设置进程低优先级（BELOW_NORMAL_PRIORITY_CLASS），杜绝爆显存崩溃或 CPU 100% 占满导致电脑卡死/死机；
+   - 全面弃用并移除老旧 C# WinForms 界面，统一拥抱轻量现代的 Qt 6 界面（dlssnr_gui.exe），原生提供【🚀 并行加速】下拉选择。
 
 【特别声明】
 - 本发布包与开源仓库严格不包含任何第三方闭源专有模型文件（nvngx_dlssnr.dll）。

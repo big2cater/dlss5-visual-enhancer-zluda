@@ -106,8 +106,8 @@
 ### 2. 使用方法
 1. 从 [Releases 页面](https://github.com/big2cater/dlss5-visual-enhancer-zluda/releases) 下载最新的发布包（例如 `DLSSNRFilter-v2026.09.10-multipass-nodlssnr.zip`）；
 2. 解压整个文件夹（**请解压至全英文路径**，不要单独拷贝某个 DLL）；
-3. **放置专有模型文件**：将合法的 `nvngx_dlssnr.dll`（推荐 Build 310.8.0）放入解压后的根目录（与 `video_filter.exe` / `DLSSNRFilter.exe` 同级目录）；
-4. 双击运行 `DLSSNRFilter.exe`（C# WinForms 界面）或 `dlssnr_gui.exe`（Qt 6 界面）即可开始处理！
+3. **放置专有模型文件**：将合法的 `nvngx_dlssnr.dll`（推荐 Build 310.8.0）放入解压后的根目录（与 `video_filter.exe` / `dlssnr_gui.exe` 同级目录）；
+4. 双击运行 `dlssnr_gui.exe`（Qt 6 统一现代图形界面；原 WinForms 界面已正式退役）即可开始处理！
 
 > ⚠️ **关于首次运行**：首次加载时 ZLUDA 会调用 LLVM 对神经网络模块进行本地编译缓存，首次可能耗时 10~30 秒，编译完成后将永久缓存在本地，后续运行秒级秒启。
 
@@ -123,6 +123,7 @@ video_filter.exe <输入视频> <输出视频> <nvngx_dlssnr.dll路径> <nvcuda.
 
 | 参数 | 默认值 | 作用说明 |
 | :--- | :--- | :--- |
+| `--parallel auto\|2\|off` | `auto` | **时序切片多进程并发加速**：`auto` (智能硬件守护，自动检测显存与CPU安全分配)、`2` (强制双进程并发切片，提速近2倍)、`off` (单进程) |
 | `--passes N` | `1` | 每帧降噪轮次。视频建议 `1` 或 `2`（设为 2 时自动激活双引擎级联乒乓时序管线） |
 | `--yield-ms N` | `1` | 帧间调度让出时间（毫秒）。有效防止重负载下触发 Windows 驱动超时重置（TDR） |
 | `--gamma F` | `1.0` | 输出伽马调节。默认 `1.0`（纯物理标准 sRGB 直通映射，绝不偏色发灰） |
@@ -205,9 +206,9 @@ A：旧版如果简单重复处理会扰乱网络时序导致频闪，但在最�
 
 1. Download the release archive from [Releases](https://github.com/big2cater/dlss5-visual-enhancer-zluda/releases).
 2. Extract the archive into a directory with a standard English path.
-3. Place your legally acquired `nvngx_dlssnr.dll` (Build 310.8.0 recommended) in the same directory as `DLSSNRFilter.exe` and `video_filter.exe`.
+3. Place your legally acquired `nvngx_dlssnr.dll` (Build 310.8.0 recommended) in the same directory as `dlssnr_gui.exe` and `video_filter.exe`.
 4. Ensure `ffmpeg.exe` is available on your system `PATH`.
-5. Launch `DLSSNRFilter.exe` (WinForms GUI) or `dlssnr_gui.exe` (Qt 6 GUI).
+5. Launch `dlssnr_gui.exe` (Qt 6 modern unified GUI; legacy WinForms has been retired).
 
 ---
 
@@ -217,6 +218,7 @@ A：旧版如果简单重复处理会扰乱网络时序导致频闪，但在最�
 video_filter.exe <input> <output> <nvngx_dlssnr.dll> <nvcuda.dll> [nvngx.dll] [nvapi64.dll] [options]
 ```
 
+- `--parallel auto|2|off`: Temporal chunk-based multi-process parallel acceleration (`auto`: intelligent hardware budget guard for VRAM & CPU safety; `2`: 2 workers; `off`: 1 worker).
 - `--passes N`: Number of denoising passes per frame (1 or 2).
 - `--yield-ms N`: Milliseconds to yield execution between frames to prevent Windows TDR (default 1).
 - `--gamma F`: Output gamma adjustment (1.0 default = standard physical sRGB).
