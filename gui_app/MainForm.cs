@@ -29,13 +29,19 @@ namespace DlssnrFilter
 
         public int Intensity { get; set; } = 100;            // /100
         public int GlobalTone { get; set; } = 0;             // /100
-        public int LocalTone { get; set; } = 100;            // /100
+        public int LocalTone { get; set; } = 0;              // /100 (Default 0 to avoid milky blue fog)
         public int LocalStructure { get; set; } = 100;       // /100
-        public int SkinStructure { get; set; } = 0;          // /100
-        public int Style { get; set; } = 0;
+        public int SkinStructure { get; set; } = 10;         // /100 (Default 0.10 for cinematic skin texture)
+        public int Style { get; set; } = 2;                  // 2 = 电影 (Cinematic)
         public int Preset { get; set; } = 0;
         public string DlssModelPreset { get; set; } = "default";
-        public bool AutoMask { get; set; } = true;
+        public bool AutoMask { get; set; } = false;          // false = Magpie / Merserk standard
+
+        // 统一画面合成调优系统 (方案 3、4、5 互不冲突)
+        public int OutputMix { get; set; } = 100;            // 0..100% (方案 5: AI 柔和全局融合)
+        public int DetailBoost { get; set; } = 100;          // 0..200% (方案 4: 高频细节清晰度增强)
+        public int ShadowProtect { get; set; } = 50;         // 0..200% (方案 3: 暗部压制保护，推荐 50%，0%绝对纯黑)
+        public int GlowControl { get; set; } = 100;          // 0..200% (方案 3: 高光反射控制)
 
         // Evaluations per frame. For VIDEO this stays at 1: the network blends
         // with its own previous output, so evaluating a frame more than once
@@ -90,6 +96,8 @@ namespace DlssnrFilter
         private RadioButton _rbVideo, _rbImage;
         private TrackBar _tbIntensity, _tbGlobalTone, _tbLocalTone, _tbLocalStruct, _tbSkinStruct;
         private Label _lblIntensity, _lblGlobalTone, _lblLocalTone, _lblLocalStruct, _lblSkinStruct;
+        private TrackBar _tbOutputMix, _tbDetailBoost, _tbShadowProtect, _tbGlowControl;
+        private Label _lblOutputMix, _lblDetailBoost, _lblShadowProtect, _lblGlowControl;
         private ComboBox _cbStyle, _cbPreset, _cbReset, _cbUpscale, _cbDlssModel;
         private CheckBox _ckAutoMask, _ckAudio, _ckDump, _ckFlow;
         private NumericUpDown _nPasses, _nImagePasses, _nEvery, _nCrf, _nGamma;
@@ -395,12 +403,13 @@ namespace DlssnrFilter
 
             AddSliderRow(left, 0, "强度", out _tbIntensity, out _lblIntensity, 0, 200, 100, "{0:0.00}");
             AddSliderRow(left, 1, "全局色调", out _tbGlobalTone, out _lblGlobalTone, 0, 100, 0, "{0:0.00}");
-            AddSliderRow(left, 2, "局部色调", out _tbLocalTone, out _lblLocalTone, 0, 200, 100, "{0:0.00}");
+            AddSliderRow(left, 2, "局部色调", out _tbLocalTone, out _lblLocalTone, 0, 200, 0, "{0:0.00}");
             AddSliderRow(left, 3, "局部结构", out _tbLocalStruct, out _lblLocalStruct, 0, 200, 100, "{0:0.00}");
-            AddSliderRow(left, 4, "皮肤结构", out _tbSkinStruct, out _lblSkinStruct, 0, 100, 0, "{0:0.00}");
+            AddSliderRow(left, 4, "皮肤结构", out _tbSkinStruct, out _lblSkinStruct, 0, 100, 10, "{0:0.00}");
 
             _cbStyle = new ComboBox { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList };
             _cbStyle.Items.AddRange(new object[] { "0 - 默认", "1 - 自然", "2 - 电影" });
+            _cbStyle.SelectedIndex = 2; // 默认电影风格 (Cinematic)
             _cbPreset = new ComboBox { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList };
             _cbPreset.Items.AddRange(new object[] {
                 "0 - 自动", "1 - Preset #1", "2 - Preset #2", "3 - Preset #3" });
@@ -408,7 +417,7 @@ namespace DlssnrFilter
             _cbDlssModel.Items.AddRange(new object[] { "默认", "J", "K", "L", "M" });
             // Placed with the other switches in the video panel, not in this
             // column -- see the flow row holding 运动向量引导 further down.
-            _ckAutoMask = new CheckBox { Text = "自动遮罩", AutoSize = true, Checked = true };
+            _ckAutoMask = new CheckBox { Text = "自动遮罩", AutoSize = true, Checked = false };
             AddComboRow(left, 5, "风格", _cbStyle);
             AddComboRow(left, 6, "DLSS模型预设", _cbPreset);
             // Short on purpose: the caption column is 110 design pixels wide,
@@ -558,10 +567,64 @@ namespace DlssnrFilter
             _videoPanel.Controls.Add(vt);
 
             var imagePanel = new Panel { Dock = DockStyle.Fill, Visible = false };
-            var it = new Label { Dock = DockStyle.Fill, AutoSize = false,
-                Padding = new Padding(S(8)), TextAlign = ContentAlignment.TopLeft,
-                Text = "单图模式\r\n重复处理次数和左侧参数会应用到当前图片。\r\n输出格式：PNG。" };
-            imagePanel.Controls.Add(it);
+            var itOuter = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4 };
+            itOuter.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            itOuter.RowStyles.Add(new RowStyle(SizeType.Absolute, S(138))); // 4 sliders * 34 + 2
+            itOuter.RowStyles.Add(new RowStyle(SizeType.Absolute, S(36)));  // presets
+            itOuter.RowStyles.Add(new RowStyle(SizeType.Absolute, S(78)));  // desc
+            itOuter.RowStyles.Add(new RowStyle(SizeType.Percent, 100));     // spacer
+
+            var it = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 4, Margin = Padding.Empty };
+            it.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, S(95)));
+            it.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            it.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, S(50)));
+            for (var i = 0; i < 4; i++)
+                it.RowStyles.Add(new RowStyle(SizeType.Absolute, S(34)));
+
+            AddSliderRow(it, 0, "AI混合浓度", out _tbOutputMix, out _lblOutputMix, 0, 100, 100, "{0:0%}");
+            AddSliderRow(it, 1, "细节清晰度", out _tbDetailBoost, out _lblDetailBoost, 0, 200, 100, "{0:0%}");
+            AddSliderRow(it, 2, "暗部保护", out _tbShadowProtect, out _lblShadowProtect, 0, 200, 50, "{0:0%}");
+            AddSliderRow(it, 3, "高光辉光", out _tbGlowControl, out _lblGlowControl, 0, 200, 100, "{0:0%}");
+            itOuter.Controls.Add(it, 0, 0);
+
+            var presetRow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false, AutoSize = false, Margin = new Padding(0, S(4), 0, 0) };
+            var btnP1 = new Button { Text = "原生电影(推荐)", AutoSize = true, Height = S(28), Margin = new Padding(0, 0, S(4), 0) };
+            btnP1.Click += (_, _) => ApplyCompositePreset(100, 100, 50, 100);
+            var btnP2 = new Button { Text = "柔和写真", AutoSize = true, Height = S(28), Margin = new Padding(0, 0, S(4), 0) };
+            btnP2.Click += (_, _) => ApplyCompositePreset(80, 90, 50, 100);
+            var btnP3 = new Button { Text = "极致微距", AutoSize = true, Height = S(28), Margin = new Padding(0, 0, S(4), 0) };
+            btnP3.Click += (_, _) => ApplyCompositePreset(100, 115, 20, 110);
+            var btnP4 = new Button { Text = "纯黑无雾", AutoSize = true, Height = S(28), Margin = new Padding(0, 0, S(4), 0) };
+            btnP4.Click += (_, _) => ApplyCompositePreset(100, 100, 0, 100);
+            presetRow.Controls.Add(btnP1);
+            presetRow.Controls.Add(btnP2);
+            presetRow.Controls.Add(btnP3);
+            presetRow.Controls.Add(btnP4);
+            itOuter.Controls.Add(presetRow, 0, 1);
+
+            var descLabel = new Label {
+                Dock = DockStyle.Fill, AutoSize = false,
+                Font = new Font(Font.FontFamily, 8.5F),
+                ForeColor = Color.FromArgb(120, 120, 130),
+                Text = "【画面合成说明 (方案3/4/5协同运作，互不冲突)】\r\n" +
+                       "• 方案 3 (暗部保护): 抑制暗部灰雾，0%锁定纯黑\r\n" +
+                       "• 方案 4 (细节清晰): 频域高频分离增强，>100%睫毛发丝锐利\r\n" +
+                       "• 方案 5 (AI混合浓度): 原图与AI柔和融合，80%呈现胶片感"
+            };
+            itOuter.Controls.Add(descLabel, 0, 2);
+
+            _tip.SetToolTip(_tbOutputMix, "AI 画面与原图的全局混合浓度 (方案 5)。100% 为完全 AI 输出；80% 或更低能带来柔美的真实写真感，化解数码过度锐化。");
+            _tip.SetToolTip(_tbDetailBoost, "细节清晰度与高频提取增强 (方案 4)。100% 为原生 AI 细节；>100% 锐化睫毛和发丝，<100% 柔化画面。");
+            _tip.SetToolTip(_tbShadowProtect, "针对暗部被 AI 抬升的压制强度 (方案 3)。推荐 50%；拉到 0% 锁定纯黑底色，彻底杜绝任何泛灰起雾。");
+            _tip.SetToolTip(_tbGlowControl, "高光反射和眼神光的 AI 表现调节 (方案 3)。100% 为标准高光表现。");
+
+            _tip.SetToolTip(btnP1, "【原生电影 (推荐)】：混合 100% | 细节 100% | 暗部保护 50% | 局部色调 0 | 风格 电影");
+            _tip.SetToolTip(btnP2, "【柔和写真 (防发脆)】：混合 80% | 细节 90% | 暗部保护 50% | 消除过度数码锐化，自然写真质感");
+            _tip.SetToolTip(btnP3, "【极致微距 (锐利)】：混合 100% | 细节 115% | 暗部保护 20% | 睫毛发丝根根分明，高频微距锐化");
+            _tip.SetToolTip(btnP4, "【纯黑强化 (绝对无雾)】：混合 100% | 细节 100% | 暗部保护 0% | 彻底锁定原图纯黑，零灰雾");
+
+            imagePanel.Controls.Add(itOuter);
 
             right.Controls.Add(_videoPanel, 0, 0);
             right.Controls.Add(imagePanel, 0, 0);
@@ -751,12 +814,12 @@ namespace DlssnrFilter
         {
             _tbIntensity.Value = 100;
             _tbGlobalTone.Value = 0;
-            _tbLocalTone.Value = 100;
+            _tbLocalTone.Value = 0; // 默认 0，彻底消除暗部泛蓝泛灰起雾
             _tbLocalStruct.Value = 100;
-            _tbSkinStruct.Value = 0;
-            _cbStyle.SelectedIndex = 0;
+            _tbSkinStruct.Value = 10; // 默认 0.10，保留真实自然皮肤与毛孔
+            _cbStyle.SelectedIndex = 2; // 默认电影风格 (Cinematic)
             _cbPreset.SelectedIndex = 0;
-            _ckAutoMask.Checked = true;
+            _ckAutoMask.Checked = false; // 默认关闭遮罩，避免边缘光晕
             _nGamma.Value = 1.0m;
             _nImagePasses.Value = 3;
             _nPasses.Value = 1;
@@ -764,6 +827,23 @@ namespace DlssnrFilter
             _nEvery.Value = 60;
             _tbCut.Text = "0.30";
             _ckFlow.Checked = false;
+            if (_tbOutputMix != null) _tbOutputMix.Value = 100;
+            if (_tbDetailBoost != null) _tbDetailBoost.Value = 100;
+            if (_tbShadowProtect != null) _tbShadowProtect.Value = 50;
+            if (_tbGlowControl != null) _tbGlowControl.Value = 100;
+        }
+
+        private void ApplyCompositePreset(int mix, int detail, int shadow, int glow)
+        {
+            if (_tbOutputMix != null) _tbOutputMix.Value = mix;
+            if (_tbDetailBoost != null) _tbDetailBoost.Value = detail;
+            if (_tbShadowProtect != null) _tbShadowProtect.Value = shadow;
+            if (_tbGlowControl != null) _tbGlowControl.Value = glow;
+            _tbLocalTone.Value = 0;
+            _cbStyle.SelectedIndex = 2; // 电影
+            _tbSkinStruct.Value = 10;
+            _ckAutoMask.Checked = false;
+            CollectFromUi();
         }
 
         // =================================================================
@@ -856,6 +936,10 @@ namespace DlssnrFilter
             _cbUpscale.SelectedIndex = _s.UpscaleMode switch { "quality" => 1, "balanced" => 2, "performance" => 3, "ultra" => 4, _ => 0 };
             _ckDump.Checked = _s.DumpFrames;
             _tbDumpDir.Text = _s.DumpDir;
+            if (_tbOutputMix != null) _tbOutputMix.Value = Clamp(_s.OutputMix, 0, 100);
+            if (_tbDetailBoost != null) _tbDetailBoost.Value = Clamp(_s.DetailBoost, 0, 200);
+            if (_tbShadowProtect != null) _tbShadowProtect.Value = Clamp(_s.ShadowProtect, 0, 200);
+            if (_tbGlowControl != null) _tbGlowControl.Value = Clamp(_s.GlowControl, 0, 200);
             _settingText = false;
             // Always re-sync mode and output with the loaded input: persisted
             // settings from an older session may hold a stale combination
@@ -882,6 +966,10 @@ namespace DlssnrFilter
             _s.Preset = _cbPreset.SelectedIndex;
             _s.DlssModelPreset = _cbDlssModel.SelectedIndex switch { 1 => "J", 2 => "K", 3 => "L", 4 => "M", _ => "default" };
             _s.AutoMask = _ckAutoMask.Checked;
+            if (_tbOutputMix != null) _s.OutputMix = _tbOutputMix.Value;
+            if (_tbDetailBoost != null) _s.DetailBoost = _tbDetailBoost.Value;
+            if (_tbShadowProtect != null) _s.ShadowProtect = _tbShadowProtect.Value;
+            if (_tbGlowControl != null) _s.GlowControl = _tbGlowControl.Value;
             _s.Passes = (int)_nPasses.Value;
             _s.ImagePasses = (int)_nImagePasses.Value;
             _s.Crf = (int)_nCrf.Value;
@@ -941,7 +1029,7 @@ namespace DlssnrFilter
             var leftH = Math.Max(_leftTlp.PreferredSize.Height, S(430));
             var rightH = Math.Max(_vtTlp.PreferredSize.Height, S(340));
             if (_imagePanel != null && _imagePanel.Visible)
-                rightH = Math.Max(rightH, S(130));
+                rightH = Math.Max(rightH, S(430));
             var paramsH = _stackedParams ? leftH + rightH + S(46) : Math.Max(leftH, rightH) + S(34);
             _root.RowStyles[1].Height = paramsH;
 
@@ -974,7 +1062,6 @@ namespace DlssnrFilter
                 _leftTlp.RowStyles[8].Height = image ? S(38) : 0;
                 _leftTlp.PerformLayout();
             }
-            if (image) _imagePanel.Bounds = _videoPanel.Bounds; // same cell, same size
             _root?.PerformLayout();
             FitSectionHeights();
         }
@@ -1152,6 +1239,10 @@ namespace DlssnrFilter
             sb.Append(" --preset ").Append(_s.Preset);
             sb.Append(" --gamma ").Append(_s.Gamma.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
             if (!_s.AutoMask) sb.Append(" --no-auto-mask");
+            sb.Append(" --output-mix ").Append((_s.OutputMix / 100.0).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            sb.Append(" --detail-boost ").Append((_s.DetailBoost / 100.0).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            sb.Append(" --shadow-protect ").Append((_s.ShadowProtect / 100.0).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            sb.Append(" --glow-control ").Append((_s.GlowControl / 100.0).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
             sb.Append(" --precompile-wait");
 
             _framesDone = 0;
@@ -1270,6 +1361,10 @@ namespace DlssnrFilter
             sb.Append(" --preset ").Append(_s.Preset);
             sb.Append(" --gamma ").Append(_s.Gamma.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
             if (!_s.AutoMask) sb.Append(" --no-auto-mask");
+            sb.Append(" --output-mix ").Append((_s.OutputMix / 100.0).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            sb.Append(" --detail-boost ").Append((_s.DetailBoost / 100.0).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            sb.Append(" --shadow-protect ").Append((_s.ShadowProtect / 100.0).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            sb.Append(" --glow-control ").Append((_s.GlowControl / 100.0).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
             // 严格串行预热：先单独翻译完，主流程不再并发编译（压低黑屏竞态）
             sb.Append(" --precompile-wait");
             return sb.ToString();
@@ -2035,6 +2130,8 @@ namespace DlssnrFilter
             to.CutThreshold = from.CutThreshold; to.Crf = from.Crf;
             to.Fps = from.Fps; to.MaxFrames = from.MaxFrames;
             to.Audio = from.Audio; to.DumpFrames = from.DumpFrames; to.DumpDir = from.DumpDir;
+            to.OutputMix = from.OutputMix; to.DetailBoost = from.DetailBoost;
+            to.ShadowProtect = from.ShadowProtect; to.GlowControl = from.GlowControl;
         }
     }
 }

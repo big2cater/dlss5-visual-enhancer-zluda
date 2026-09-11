@@ -639,6 +639,161 @@ const std::array<uint16_t, 65536> &half_to_rgb48_lut() {
     return lut;
 }
 
+// --------------------------------------------------------------------------
+// Unified post-composite processor (Schemes 3, 4, 5)
+// Combines Magpie Rec.709 directional residual gating (Scheme 3),
+// frequency-domain high-frequency detail boost (Scheme 4),
+// and linear output mix (Scheme 5).
+// --------------------------------------------------------------------------
+struct CompositeOptions {
+    float output_mix = 1.0f;       // --output-mix (0.0..1.0)
+    float detail_boost = 1.0f;     // --detail-boost (0.0..2.0)
+    float shadow_protect = 1.0f;   // --shadow-protect (0.0..2.0)
+    float glow_control = 1.0f;     // --glow-control (0.0..2.0)
+
+    bool is_active() const {
+        return std::abs(output_mix - 1.0f) > 0.001f ||
+               std::abs(detail_boost - 1.0f) > 0.001f ||
+               std::abs(shadow_protect - 1.0f) > 0.001f ||
+               std::abs(glow_control - 1.0f) > 0.001f;
+    }
+};
+
+void apply_post_composite(const enhancer::Image &in, enhancer::Image &out, const CompositeOptions &opts) {
+    if (!opts.is_active()) return;
+    if (in.width != out.width || in.height != out.height || in.empty() || out.empty()) return;
+
+    const unsigned width = in.width;
+    const unsigned height = in.height;
+    const size_t total_pixels = (size_t)width * height;
+    const uint16_t *src_in = in.pixels.data();
+    uint16_t *src_out = out.pixels.data();
+
+    const bool need_high_freq = (std::abs(opts.detail_boost - 1.0f) > 0.001f);
+    std::vector<float> blur_dlss;
+
+    if (need_high_freq) {
+        // Separable Gaussian blur (ksize=9, sigma=2.0)
+        // 9 taps: [-4, -3, -2, -1, 0, 1, 2, 3, 4]
+        static const float weights[5] = {0.204164f, 0.180174f, 0.123832f, 0.066282f, 0.027631f};
+
+        // Intermediate buffer: float RGB (3 floats per pixel)
+        std::vector<float> temp_h(total_pixels * 3);
+        blur_dlss.resize(total_pixels * 3);
+
+        // Pass 1: Horizontal blur from src_out -> temp_h
+        WorkerPool::instance().parallel_for(height, [&](size_t y_start, size_t y_end, size_t /*tid*/) {
+            for (size_t y = y_start; y < y_end; ++y) {
+                const size_t row_offset = y * width;
+                for (size_t x = 0; x < width; ++x) {
+                    float sum_r = 0.0f, sum_g = 0.0f, sum_b = 0.0f;
+                    for (int dx = -4; dx <= 4; ++dx) {
+                        int sx = (int)x + dx;
+                        if (sx < 0) sx = 0;
+                        else if (sx >= (int)width) sx = (int)width - 1;
+                        const float w = weights[std::abs(dx)];
+                        const size_t idx = (row_offset + (size_t)sx) * 4;
+                        sum_r += enhancer::half_to_float(src_out[idx + 0]) * w;
+                        sum_g += enhancer::half_to_float(src_out[idx + 1]) * w;
+                        sum_b += enhancer::half_to_float(src_out[idx + 2]) * w;
+                    }
+                    const size_t out_idx = (row_offset + x) * 3;
+                    temp_h[out_idx + 0] = sum_r;
+                    temp_h[out_idx + 1] = sum_g;
+                    temp_h[out_idx + 2] = sum_b;
+                }
+            }
+        });
+
+        // Pass 2: Vertical blur from temp_h -> blur_dlss
+        WorkerPool::instance().parallel_for(height, [&](size_t y_start, size_t y_end, size_t /*tid*/) {
+            for (size_t y = y_start; y < y_end; ++y) {
+                const size_t row_offset = y * width;
+                for (size_t x = 0; x < width; ++x) {
+                    float sum_r = 0.0f, sum_g = 0.0f, sum_b = 0.0f;
+                    for (int dy = -4; dy <= 4; ++dy) {
+                        int sy = (int)y + dy;
+                        if (sy < 0) sy = 0;
+                        else if (sy >= (int)height) sy = (int)height - 1;
+                        const float w = weights[std::abs(dy)];
+                        const size_t idx = ((size_t)sy * width + x) * 3;
+                        sum_r += temp_h[idx + 0] * w;
+                        sum_g += temp_h[idx + 1] * w;
+                        sum_b += temp_h[idx + 2] * w;
+                    }
+                    const size_t out_idx = (row_offset + x) * 3;
+                    blur_dlss[out_idx + 0] = sum_r;
+                    blur_dlss[out_idx + 1] = sum_g;
+                    blur_dlss[out_idx + 2] = sum_b;
+                }
+            }
+        });
+    }
+
+    // Pass 3: Composite modulation loop
+    const float out_mix = std::clamp(opts.output_mix, 0.0f, 1.0f);
+    const float one_minus_mix = 1.0f - out_mix;
+    const float detail_delta = opts.detail_boost - 1.0f;
+    const float shadow_prot = opts.shadow_protect;
+    const float glow_ctrl = opts.glow_control;
+
+    WorkerPool::instance().parallel_for(total_pixels, [&](size_t p_start, size_t p_end, size_t /*tid*/) {
+        for (size_t i = p_start; i < p_end; ++i) {
+            const size_t idx4 = i * 4;
+            const float r_orig = enhancer::half_to_float(src_in[idx4 + 0]);
+            const float g_orig = enhancer::half_to_float(src_in[idx4 + 1]);
+            const float b_orig = enhancer::half_to_float(src_in[idx4 + 2]);
+
+            const float r_dlss = enhancer::half_to_float(src_out[idx4 + 0]);
+            const float g_dlss = enhancer::half_to_float(src_out[idx4 + 1]);
+            const float b_dlss = enhancer::half_to_float(src_out[idx4 + 2]);
+
+            // Linear Rec.709 luminance
+            const float y_orig = 0.2126f * r_orig + 0.7152f * g_orig + 0.0722f * b_orig;
+            const float y_dlss = 0.2126f * r_dlss + 0.7152f * g_dlss + 0.0722f * b_dlss;
+            const float delta_y = y_dlss - y_orig;
+
+            // Directional multiplier (Magpie logic)
+            const bool is_shadow = (delta_y < 0.0f) || (y_orig < 0.20f && delta_y > 0.0f);
+            const float mult = is_shadow ? shadow_prot : glow_ctrl;
+
+            // Controlled base candidate
+            float r_cand = r_orig + (r_dlss - r_orig) * mult;
+            float g_cand = g_orig + (g_dlss - g_orig) * mult;
+            float b_cand = b_orig + (b_dlss - b_orig) * mult;
+
+            // High frequency detail modulation
+            if (need_high_freq) {
+                const size_t idx3 = i * 3;
+                const float hf_r = r_dlss - blur_dlss[idx3 + 0];
+                const float hf_g = g_dlss - blur_dlss[idx3 + 1];
+                const float hf_b = b_dlss - blur_dlss[idx3 + 2];
+                r_cand += detail_delta * hf_r;
+                g_cand += detail_delta * hf_g;
+                b_cand += detail_delta * hf_b;
+            }
+
+            if (r_cand < 0.0f) r_cand = 0.0f;
+            if (g_cand < 0.0f) g_cand = 0.0f;
+            if (b_cand < 0.0f) b_cand = 0.0f;
+
+            // Output mix with original
+            float r_final = one_minus_mix * r_orig + out_mix * r_cand;
+            float g_final = one_minus_mix * g_orig + out_mix * g_cand;
+            float b_final = one_minus_mix * b_orig + out_mix * b_cand;
+
+            if (r_final < 0.0f) r_final = 0.0f;
+            if (g_final < 0.0f) g_final = 0.0f;
+            if (b_final < 0.0f) b_final = 0.0f;
+
+            src_out[idx4 + 0] = enhancer::float_to_half(r_final);
+            src_out[idx4 + 1] = enhancer::float_to_half(g_final);
+            src_out[idx4 + 2] = enhancer::float_to_half(b_final);
+            // alpha channel is preserved
+        }
+    });
+}
+
 // half RGBA -> rgb48, and while we are in there, a cheap blank-frame check.
 void half_rgba_to_rgb48(const enhancer::Image &image, unsigned char *rgb48, bool &blank) {
     const uint16_t *src = image.pixels.data();
@@ -854,6 +1009,7 @@ struct Options {
     std::string dlss_model_preset = "default";
     std::string encoder = "auto";
     int yield_ms = 1; // ms to yield per frame to prevent TDR and keep DWM responsive
+    CompositeOptions comp_opts;
 };
 
 void usage() {
@@ -877,6 +1033,10 @@ void usage() {
         "  --dlss-model-preset P DLSS model preset: default, J, K, L, M\n"
         "  --intensity F --global-tone F --local-tone F --local-structure F\n"
         "  --skin-structure F --style N --preset N --no-auto-mask\n"
+        "  --output-mix F        AI output blend mix, 0.0..1.0 (1.0 default = 100%% AI)\n"
+        "  --detail-boost F      high-frequency detail boost, 0.0..2.0 (1.0 default)\n"
+        "  --shadow-protect F    shadow darkening protection multiplier, 0.0..2.0 (1.0 default)\n"
+        "  --glow-control F      reflection/highlight glow multiplier, 0.0..2.0 (1.0 default)\n"
         "  --crf N               quality / CQP value (18)\n"
         "  --encoder P           encoder: auto, amf/h264_amf, hevc_amf, x264 (auto default)\n"
         "  --fps N               override output frame rate\n"
@@ -969,6 +1129,18 @@ bool parse_args(int argc, char **argv, Options &options) {
             options.settings.preset = atoi(v);
         } else if (arg == "--no-auto-mask") {
             options.settings.auto_mask = false;
+        } else if (arg == "--output-mix") {
+            const char *v = need("--output-mix"); if (!v) return false;
+            options.comp_opts.output_mix = (float)atof(v);
+        } else if (arg == "--detail-boost") {
+            const char *v = need("--detail-boost"); if (!v) return false;
+            options.comp_opts.detail_boost = (float)atof(v);
+        } else if (arg == "--shadow-protect") {
+            const char *v = need("--shadow-protect"); if (!v) return false;
+            options.comp_opts.shadow_protect = (float)atof(v);
+        } else if (arg == "--glow-control") {
+            const char *v = need("--glow-control"); if (!v) return false;
+            options.comp_opts.glow_control = (float)atof(v);
         } else if (arg == "--crf") {
             const char *v = need("--crf"); if (!v) return false;
             options.crf = atoi(v);
@@ -1436,6 +1608,7 @@ int run_image_mode(int argc, char **argv) {
     enhancer::Settings settings;
     settings.passes = 3; // stills settle over a few evaluations
     int retries = 3;     // blank-output races are re-evaluated this many times
+    CompositeOptions comp_opts;
     enhancer::Paths paths;
     paths.snippet = widen(argv[4]);
     paths.cuda_driver = widen(argv[5]);
@@ -1459,6 +1632,10 @@ int run_image_mode(int argc, char **argv) {
         else if (arg == "--preset") { const char *v = need("--preset"); if (!v) return 2; settings.preset = atoi(v); }
         else if (arg == "--dlss-model-preset") { const char *v = need("--dlss-model-preset"); if (!v) return 2; SetEnvironmentVariableA("DLSS_PRESET", v); }
         else if (arg == "--no-auto-mask") { settings.auto_mask = false; }
+        else if (arg == "--output-mix") { const char *v = need("--output-mix"); if (!v) return 2; comp_opts.output_mix = (float)atof(v); }
+        else if (arg == "--detail-boost") { const char *v = need("--detail-boost"); if (!v) return 2; comp_opts.detail_boost = (float)atof(v); }
+        else if (arg == "--shadow-protect") { const char *v = need("--shadow-protect"); if (!v) return 2; comp_opts.shadow_protect = (float)atof(v); }
+        else if (arg == "--glow-control") { const char *v = need("--glow-control"); if (!v) return 2; comp_opts.glow_control = (float)atof(v); }
         else if (arg == "--precompile-wait" || arg == "--retry-delay") {
             if (arg == "--retry-delay") need("--retry-delay"); // 外壳标志，忽略
         }
@@ -1509,6 +1686,9 @@ int run_image_mode(int argc, char **argv) {
     const bool blank = output_is_blank(out);
     if (blank)
         fprintf(stderr, "[warn] 输出空白：本轮求值竞态，交给外层重跑\n");
+    else if (comp_opts.is_active()) {
+        apply_post_composite(in, out, comp_opts);
+    }
     if (!dump_png(wic, widen(argv[3]), out)) {
         fprintf(stderr, "[FAIL] could not write %s\n", argv[3]);
         processor.stop();
@@ -2030,6 +2210,10 @@ static int run_main_once(int argc, char **argv) {
         out_frame->index = in_frame->index;
         out_frame->ms = ms;
         out_frame->is_eos = false;
+
+        if (options.comp_opts.is_active()) {
+            apply_post_composite(in_frame->in, out_frame->out, options.comp_opts);
+        }
 
         // Return input frame buffer to free pool for reuse
         free_input_pool.push(in_frame);
