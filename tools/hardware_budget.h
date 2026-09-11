@@ -110,7 +110,7 @@ inline HardwareInfo detect_hardware_budget(double video_duration_sec = 0.0, int 
     // Gate 5: 4K video resolution check
     else if (width * height >= 3840 * 2160 && info.avail_vram_mb < 12000) {
         snprintf(buf, sizeof(buf),
-                 "[硬件评估] 4K 超高分辨率 (单流显存开销极大) -> 安全降级为单进程模式",
+                 "[硬件评估] 4K 超高分辨率且可用显存不足 12GB (可用 %zu MB) -> 安全降级为单进程模式",
                  info.avail_vram_mb);
         safe = 1;
     }

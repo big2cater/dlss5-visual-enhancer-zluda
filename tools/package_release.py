@@ -53,7 +53,7 @@ for src, dst in files_to_copy:
 
 # Copy Qt plugins
 for folder in ["platforms", "imageformats", "styles"]:
-    src_folder = os.path.join(root_dir, "speed-test-staging-20260909-v2", folder)
+    src_folder = os.path.join(root_dir, "run", folder)
     dst_folder = os.path.join(staging_dir, folder)
     if os.path.exists(src_folder):
         for item in os.listdir(src_folder):

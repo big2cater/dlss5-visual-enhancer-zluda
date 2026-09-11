@@ -909,6 +909,8 @@ void BatchWindow::start_run() {
     }
 
     frames_done_ = 0;
+    chunk0_max_ = 0;
+    chunk1_max_ = 0;
     frames_total_ = -1;
     seconds_ = 0;
     error_buffer_.clear();
@@ -1148,7 +1150,17 @@ void BatchWindow::read_error() {
         const auto frame = frame_re_.match(line);
         if (frame.hasMatch()) {
             const long reported_frame = frame.captured(1).toLongLong();
-            frames_done_ = qMax(frames_done_, reported_frame + 1);
+            if (frames_total_ > 0) {
+                const long mid = frames_total_ / 2;
+                if (reported_frame >= mid) {
+                    chunk1_max_ = qMax(chunk1_max_, reported_frame - mid + 1);
+                } else {
+                    chunk0_max_ = qMax(chunk0_max_, reported_frame + 1);
+                }
+                frames_done_ = qMin(frames_total_, chunk0_max_ + chunk1_max_);
+            } else {
+                frames_done_ = qMax(frames_done_, reported_frame + 1);
+            }
             status_->setText(tr("帧 %1 · 本帧 %2 ms · 平均 %3 ms · 复位 %4 · 空白 %5")
                                  .arg(frames_done_)
                                  .arg(frame.captured(2), frame.captured(3), frame.captured(4),

@@ -170,6 +170,8 @@ private:
     QString frame_hold_in_;
     QString frame_hold_out_;
     long frames_done_ = 0;
+    long chunk0_max_ = 0;
+    long chunk1_max_ = 0;
     long frames_total_ = -1;
     int seconds_ = 0;
     // The output path was derived from the input, so it follows it until the

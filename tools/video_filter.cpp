@@ -373,7 +373,11 @@ std::wstring tool_cmd(bool probe) {
         std::wstring dir = from_env;
         // A trailing backslash would make "dir\ffmpeg.exe" if we just joined.
         if (!dir.empty() && dir.back() != L'\\') dir += L'\\';
-        return dir + (probe ? L"ffprobe.exe" : L"ffmpeg.exe");
+        std::wstring exe = dir + (probe ? L"ffprobe.exe" : L"ffmpeg.exe");
+        if (exe.find(L' ') != std::wstring::npos && exe.front() != L'"') {
+            exe = L"\"" + exe + L"\"";
+        }
+        return exe;
     }
     return probe ? L"ffprobe" : L"ffmpeg";
 }
@@ -1898,8 +1902,8 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
     double warmup_sec = 1.0;
     if (split_sec < 3.0) warmup_sec = 0.5;
 
-    std::wstring self_exe(MAX_PATH, L'\0');
-    DWORD len = GetModuleFileNameW(nullptr, self_exe.data(), MAX_PATH);
+    std::wstring self_exe(32768, L'\0');
+    DWORD len = GetModuleFileNameW(nullptr, self_exe.data(), (DWORD)self_exe.size());
     self_exe.resize(len);
 
     std::wstring out_part0 = options.output + L".part0.mp4";
@@ -1915,10 +1919,10 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
         std::wstring cmd = L"\"" + self_exe + L"\"";
         for (int i = 1; i < argc; ++i) {
             std::wstring arg = widen(argv[i]);
-            if (arg == options.output) {
+            if (i == 2) {
                 cmd += L" \"" + chunk_out + L"\"";
             } else if (arg == L"--parallel") {
-                cmd += L" --parallel 1";
+                cmd += L" --parallel off";
                 if (i + 1 < argc && argv[i + 1][0] != '-') ++i; // skip value
             } else {
                 if (arg.find(L' ') != std::wstring::npos) {
@@ -1992,6 +1996,7 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
         fprintf(stderr, "[FAIL] 分片处理异常退出 (分片0: %lu, 分片1: %lu)\n", code0, code1);
         _wremove(out_part0.c_str());
         _wremove(out_part1.c_str());
+        _wremove(concat_list_path.c_str());
         return 1;
     }
 
@@ -2002,6 +2007,8 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
     FILE *fconcat = _wfopen(concat_list_path.c_str(), L"wb");
     if (!fconcat) {
         fprintf(stderr, "[FAIL] 无法创建合并列表文件\n");
+        _wremove(out_part0.c_str());
+        _wremove(out_part1.c_str());
         return 1;
     }
     std::wstring p0_norm = out_part0;
@@ -2024,38 +2031,47 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
     fclose(fconcat);
 
     // Concat & mux audio
-    std::wstring audio_args;
-    if (params.audio_codec.empty() || params.audio_codec == "none") {
-        audio_args = L"-an ";
-    } else if (params.audio_codec == "wmapro" || params.audio_codec == "wmav2" ||
-               params.audio_codec == "wmavoice" || params.audio_codec == "pcm_s16le" ||
-               params.audio_codec == "pcm_s24le" || params.audio_codec == "alac") {
-        audio_args = L"-c:a aac -b:a 192k ";
+    std::wstring concat_cmd;
+    if (!options.audio || params.audio_codec.empty() || params.audio_codec == "none") {
+        concat_cmd = tool_cmd(false) + L" -y -nostdin -v error -f concat -safe 0 -i \"" +
+                     concat_list_path + L"\" -c:v copy -an \"" + options.output + L"\"";
     } else {
-        audio_args = L"-c:a copy ";
+        std::wstring audio_args;
+        if (params.audio_codec == "wmapro" || params.audio_codec == "wmav2" ||
+            params.audio_codec == "wmavoice" || params.audio_codec == "pcm_s16le" ||
+            params.audio_codec == "pcm_s24le" || params.audio_codec == "alac") {
+            audio_args = L"-c:a aac -b:a 192k ";
+        } else {
+            audio_args = L"-c:a copy ";
+        }
+        concat_cmd = tool_cmd(false) + L" -y -nostdin -v error -f concat -safe 0 -i \"" +
+                     concat_list_path + L"\" -i \"" + options.input +
+                     L"\" -map 0:v -map 1:a? -c:v copy " + audio_args +
+                     L"\"" + options.output + L"\"";
     }
-
-    std::wstring concat_cmd = tool_cmd(false) + L" -y -nostdin -v error -f concat -safe 0 -i \"" +
-                              concat_list_path + L"\" -i \"" + options.input +
-                              L"\" -map 0:v -map 1:a? -c:v copy " + audio_args +
-                              L"\"" + options.output + L"\"";
 
     STARTUPINFOW csi{};
     csi.cb = sizeof(csi);
     PROCESS_INFORMATION cpi{};
     if (CreateProcessW(nullptr, concat_cmd.data(), nullptr, nullptr, TRUE,
                        CREATE_NO_WINDOW, nullptr, nullptr, &csi, &cpi)) {
-        WaitForSingleObject(cpi.hProcess, 60000);
+        WaitForSingleObject(cpi.hProcess, INFINITE);
         DWORD ccode = 1;
         GetExitCodeProcess(cpi.hProcess, &ccode);
         CloseHandle(cpi.hProcess);
         CloseHandle(cpi.hThread);
         if (ccode != 0) {
             fprintf(stderr, "[FAIL] FFmpeg concat 拼合失败 (代码 %lu)\n", ccode);
+            _wremove(out_part0.c_str());
+            _wremove(out_part1.c_str());
+            _wremove(concat_list_path.c_str());
             return 1;
         }
     } else {
         fprintf(stderr, "[FAIL] 无法启动 FFmpeg concat 命令\n");
+        _wremove(out_part0.c_str());
+        _wremove(out_part1.c_str());
+        _wremove(concat_list_path.c_str());
         return 1;
     }
 
