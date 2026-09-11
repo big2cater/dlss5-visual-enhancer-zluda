@@ -505,17 +505,18 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
     }
 
     auto get_codec_args = [&](const std::string &enc) -> std::wstring {
+        const std::wstring color_flags = L"-colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv ";
         if (enc == "hevc_amf") {
             return L"-c:v hevc_amf -rc cqp -qp_i " + std::to_wstring(crf) +
                    L" -qp_p " + std::to_wstring(crf) +
-                   L" -quality quality -pix_fmt yuv420p ";
+                   L" -quality quality -pix_fmt yuv420p " + color_flags;
         } else if (enc == "h264_amf" || enc == "amf") {
             return L"-c:v h264_amf -rc cqp -qp_i " + std::to_wstring(crf) +
                    L" -qp_p " + std::to_wstring(crf) +
-                   L" -quality quality -pix_fmt yuv420p ";
+                   L" -quality quality -pix_fmt yuv420p " + color_flags;
         } else {
             return L"-c:v libx264 -crf " + std::to_wstring(crf) +
-                   L" -preset veryfast -pix_fmt yuv420p ";
+                   L" -preset veryfast -pix_fmt yuv420p " + color_flags;
         }
     };
 
@@ -524,6 +525,11 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
     const std::wstring sub_args = is_mkv ? L"-map 0:s? -c:s copy " : L"";
 
     auto build_command = [&](const std::wstring &codec_args) -> std::wstring {
+        const std::wstring vf_args = (output_width != input_width || output_height != input_height)
+            ? (L"-vf scale=" + std::to_wstring(output_width) + L":" + std::to_wstring(output_height) +
+               L":flags=lanczos:in_color_matrix=bt709:out_color_matrix=bt709:in_range=full:out_range=limited ")
+            : L"-vf scale=in_color_matrix=bt709:out_color_matrix=bt709:in_range=full:out_range=limited ";
+
         return tool_cmd(false) + L" -nostdin -v error -y -i \"" + input + L"\" " +
                L"-f rawvideo -pix_fmt rgb48le -s " +
                std::to_wstring(input_width) + L"x" + std::to_wstring(input_height) +
@@ -531,8 +537,7 @@ bool start_encoder(const std::wstring &input, const std::wstring &output,
                (audio ? L"-map 0:a? " : L"") +
                L"-map 1:v " +
                sub_args +
-               ((output_width != input_width || output_height != input_height) ?
-                (L"-vf scale=" + std::to_wstring(output_width) + L":" + std::to_wstring(output_height) + L":flags=lanczos ") : L"") +
+               vf_args +
                codec_args +
                (audio ? L"-c:a copy " : L"-an ") +
                L"\"" + output + L"\"";

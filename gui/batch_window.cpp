@@ -294,10 +294,10 @@ QWidget *BatchWindow::build_left_column() {
     gamma_->setValue(1.0);
     form->addRow(tr("输出伽马"), gamma_);
 
-    auto_mask_ = new QCheckBox(tr("自动遮罩"));
-    auto_mask_->setChecked(false);
+    auto_mask_ = new QCheckBox(tr("自动遮罩 (保护肤色/主体识别)"));
+    auto_mask_->setChecked(true);
     auto_mask_->setToolTip(
-        tr("自动生成遮罩，只对被识别为画面的区域施加滤镜，保留字幕/UI 等。视频和单图模式都生效。"));
+        tr("自动生成 AI 语义遮罩，精准隔离人物肤色与背景，防止背景暖色光源污染面部肤色，保留字幕/UI。建议始终开启。"));
     form->addRow(QString(), auto_mask_);
 
     auto *reset_button = new QPushButton(tr("恢复默认参数"));
@@ -366,7 +366,7 @@ QWidget *BatchWindow::build_composite_column() {
     btn_preset_soft_->setToolTip(tr("【柔和写真 (防发脆)】：混合 80% | 细节 90% | 暗部保护 50% | 消除过度数码锐化，自然写真质感"));
     btn_preset_macro_->setToolTip(tr("【极致微距 (锐利)】：混合 100% | 细节 115% | 暗部保护 20% | 睫毛发丝根根分明，高频微距锐化"));
     btn_preset_black_->setToolTip(tr("【纯黑强化 (绝对无雾)】：混合 100% | 细节 100% | 暗部保护 0% | 彻底锁定原图纯黑，零灰雾"));
-    btn_preset_motion_->setToolTip(tr("【灵动跟人 (防拖影/低延迟)】：风格 自然 | 强度 85% | 混合 90% | 细节 105% | 自动开启运动向量引导 | 专治人物转头/大幅度动作时滤镜慢半拍或拖影滞后问题"));
+    btn_preset_motion_->setToolTip(tr("【灵动跟人 (防拖影/极速响应/自然白皙)】：风格 默认(自然冷白·无偏黄) | 开启自动遮罩(隔离肤色) | 强度 85% | 混合 90% | 细节 105% | 自动开启运动向量引导 | 专治人物转头/大幅度动作滞后与皮肤泛黄"));
     btn_preset_motion_->setStyleSheet(QStringLiteral("font-weight: bold; color: #4da6ff;"));
 
     grid->addWidget(btn_preset_film_, 0, 0);
@@ -390,8 +390,9 @@ QWidget *BatchWindow::build_composite_column() {
     });
     connect(btn_preset_motion_, &QPushButton::clicked, this, [this] {
         apply_composite_preset(90, 105, 50, 100);
-        style_->setCurrentIndex(1); // 1 - 自然 (低时序惯性)
+        style_->setCurrentIndex(0); // 0 - 默认 (自然通透冷白皮，零泛黄，低时序惯性)
         intensity_->setValue(85);   // 85% 灵动响应
+        if (auto_mask_) auto_mask_->setChecked(true); // 开启主体人物自动遮罩，杜绝背景黄光污染肤色
         if (flow_) flow_->setChecked(true); // 开启运动向量光流引导
     });
 
@@ -592,7 +593,7 @@ void BatchWindow::load_settings() {
         loaded_gamma = 1.0; // 升级旧版临时 1.4 补偿值回正至物理正确的 1.0
     }
     gamma_->setValue(loaded_gamma);
-    auto_mask_->setChecked(settings.value(QStringLiteral("autoMask"), false).toBool());
+    auto_mask_->setChecked(settings.value(QStringLiteral("autoMask"), true).toBool());
 
     if (output_mix_) output_mix_->setValue(settings.value(QStringLiteral("outputMix"), 100).toInt());
     if (detail_boost_) detail_boost_->setValue(settings.value(QStringLiteral("detailBoost"), 100).toInt());
@@ -722,7 +723,7 @@ void BatchWindow::reset_effects() {
     model_scale_->setCurrentIndex(0);
     upscale_->setCurrentIndex(0);
     codec_->setCurrentIndex(0);
-    auto_mask_->setChecked(false);
+    auto_mask_->setChecked(true);
     gamma_->setValue(1.0);
     image_passes_->setValue(3);
     passes_->setValue(1);
@@ -744,7 +745,7 @@ void BatchWindow::apply_composite_preset(int mix, int detail, int shadow, int gl
     if (local_tone_) local_tone_->setValue(0);
     if (style_) style_->setCurrentIndex(2); // 电影
     if (skin_structure_) skin_structure_->setValue(10); // 0.10
-    if (auto_mask_) auto_mask_->setChecked(false);
+    if (auto_mask_) auto_mask_->setChecked(true);
 }
 
 // ---------------------------------------------------------------------------
