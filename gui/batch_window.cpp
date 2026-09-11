@@ -116,12 +116,12 @@ BatchWindow::BatchWindow() {
     setCentralWidget(central);
     // Keep both parameter columns visible on first launch. The old fixed
     // 1000px width clipped the right video controls on ordinary desktops.
-    setMinimumSize(900, 700);
+    setMinimumSize(950, 700);
     const QRect screen = QGuiApplication::primaryScreen()
                               ? QGuiApplication::primaryScreen()->availableGeometry()
                               : QRect(0, 0, 1440, 900);
-    resize(qMin(1280, qMax(1000, screen.width() - 80)),
-           qMin(900, qMax(700, screen.height() - 80)));
+    resize(qMin(1360, qMax(1100, screen.width() - 60)),
+           qMin(920, qMax(720, screen.height() - 60)));
 
     // Match the frame summary anywhere in a line. ffmpeg can prefix inherited
     // diagnostics and different builds use 5 or 6 frame digits.
@@ -229,16 +229,31 @@ QWidget *BatchWindow::build_files() {
 }
 
 QWidget *BatchWindow::build_parameters() {
-    auto *box = new QGroupBox(tr("参数"));
+    auto *box = new QGroupBox(tr("参数设置"));
     auto *columns = new QHBoxLayout(box);
+    columns->setSpacing(12);
+
     columns->addWidget(build_left_column(), 1);
-    columns->addWidget(build_right_column(), 1);
+    composite_panel_ = build_composite_column();
+    columns->addWidget(composite_panel_, 1);
+    video_panel_ = build_video_column();
+    columns->addWidget(video_panel_, 1);
+
     return box;
 }
 
 QWidget *BatchWindow::build_left_column() {
     auto *column = new QWidget;
-    auto *form = new QFormLayout(column);
+    auto *col_layout = new QVBoxLayout(column);
+    col_layout->setContentsMargins(0, 0, 0, 0);
+    col_layout->setSpacing(6);
+
+    auto *header = new QLabel(tr("<b>【DLSS 核心设置】</b>"));
+    header->setStyleSheet(QStringLiteral("color: #4da6ff; margin-bottom: 2px;"));
+    col_layout->addWidget(header);
+
+    auto *form = new QFormLayout;
+    form->setContentsMargins(0, 0, 0, 0);
 
     form->addRow(tr("强度"), slider_row(200, 100, intensity_, intensity_value_));
     form->addRow(tr("全局色调"), slider_row(100, 0, global_tone_, global_tone_value_));
@@ -274,17 +289,47 @@ QWidget *BatchWindow::build_left_column() {
     gamma_->setValue(1.0);
     form->addRow(tr("输出伽马"), gamma_);
 
-    // Lives in this column, not the video panel, so it shows in both modes:
-    // the video panel is hidden in single-image mode, which had left the
-    // checkbox out of reach there. The backend takes --no-auto-mask either way.
     auto_mask_ = new QCheckBox(tr("自动遮罩"));
     auto_mask_->setChecked(false);
     auto_mask_->setToolTip(
         tr("自动生成遮罩，只对被识别为画面的区域施加滤镜，保留字幕/UI 等。视频和单图模式都生效。"));
     form->addRow(QString(), auto_mask_);
 
-    // Only for a still: repeating the evaluation is the nearest thing to a
-    // scene standing still, and video cannot have it (see passes_ below).
+    auto *reset_button = new QPushButton(tr("恢复默认参数"));
+    connect(reset_button, &QPushButton::clicked, this, &BatchWindow::reset_effects);
+    form->addRow(QString(), reset_button);
+
+    col_layout->addLayout(form);
+    col_layout->addStretch(1);
+    return column;
+}
+
+QWidget *BatchWindow::build_composite_column() {
+    auto *column = new QWidget;
+    auto *col_layout = new QVBoxLayout(column);
+    col_layout->setContentsMargins(0, 0, 0, 0);
+    col_layout->setSpacing(6);
+
+    auto *header = new QLabel(tr("<b>【画面合成 & 防起雾 (通用)】</b>"));
+    header->setStyleSheet(QStringLiteral("color: #4da6ff; margin-bottom: 2px;"));
+    col_layout->addWidget(header);
+
+    auto *form = new QFormLayout;
+    form->setContentsMargins(0, 0, 0, 0);
+
+    form->addRow(tr("AI混合浓度"), slider_percent_row(100, 100, output_mix_, output_mix_value_));
+    output_mix_->setToolTip(tr("AI 画面与原图的全局混合浓度 (方案 5)。100% 为完全 AI 输出；80% 或更低能带来柔美的真实写真感，化解数码过度锐化。视频与单图均生效。"));
+
+    form->addRow(tr("细节清晰度"), slider_percent_row(200, 100, detail_boost_, detail_boost_value_));
+    detail_boost_->setToolTip(tr("细节清晰度与高频提取增强 (方案 4)。100% 为原生 AI 细节；>100% 锐化睫毛和发丝，<100% 柔化画面。视频与单图均生效。"));
+
+    form->addRow(tr("暗部保护"), slider_percent_row(200, 50, shadow_protect_, shadow_protect_value_));
+    shadow_protect_->setToolTip(tr("针对暗部被 AI 抬升的压制强度 (方案 3)。推荐 50%；拉到 0% 锁定纯黑底色，彻底杜绝任何泛灰起雾。视频与单图均生效。"));
+
+    form->addRow(tr("高光辉光"), slider_percent_row(200, 100, glow_control_, glow_control_value_));
+    glow_control_->setToolTip(tr("高光反射和眼神光的 AI 表现调节 (方案 3)。100% 为标准高光表现。视频与单图均生效。"));
+
+    // Single-image repeating passes row:
     image_passes_ = new QSpinBox;
     image_passes_->setRange(1, 12);
     image_passes_->setValue(3);
@@ -298,23 +343,67 @@ QWidget *BatchWindow::build_left_column() {
     passes_layout->addStretch(1);
     form->addRow(image_passes_row_);
 
-    // Below 输出伽马, in a row of its own: up among the other settings it read
-    // as belonging to the ones above it rather than to the column as a whole.
-    auto *reset_button = new QPushButton(tr("恢复默认参数"));
-    connect(reset_button, &QPushButton::clicked, this, &BatchWindow::reset_effects);
-    form->addRow(QString(), reset_button);
+    col_layout->addLayout(form);
 
+    // Preset buttons 2x2 grid
+    auto *preset_grid_widget = new QWidget;
+    auto *grid = new QGridLayout(preset_grid_widget);
+    grid->setContentsMargins(0, 4, 0, 4);
+    grid->setSpacing(6);
+
+    btn_preset_film_ = new QPushButton(tr("原生电影(推荐)"));
+    btn_preset_soft_ = new QPushButton(tr("柔和写真"));
+    btn_preset_macro_ = new QPushButton(tr("极致微距"));
+    btn_preset_black_ = new QPushButton(tr("纯黑无雾"));
+
+    btn_preset_film_->setToolTip(tr("【原生电影 (推荐)】：混合 100% | 细节 100% | 暗部保护 50% | 局部色调 0 | 风格 电影"));
+    btn_preset_soft_->setToolTip(tr("【柔和写真 (防发脆)】：混合 80% | 细节 90% | 暗部保护 50% | 消除过度数码锐化，自然写真质感"));
+    btn_preset_macro_->setToolTip(tr("【极致微距 (锐利)】：混合 100% | 细节 115% | 暗部保护 20% | 睫毛发丝根根分明，高频微距锐化"));
+    btn_preset_black_->setToolTip(tr("【纯黑强化 (绝对无雾)】：混合 100% | 细节 100% | 暗部保护 0% | 彻底锁定原图纯黑，零灰雾"));
+
+    grid->addWidget(btn_preset_film_, 0, 0);
+    grid->addWidget(btn_preset_soft_, 0, 1);
+    grid->addWidget(btn_preset_macro_, 1, 0);
+    grid->addWidget(btn_preset_black_, 1, 1);
+    col_layout->addWidget(preset_grid_widget);
+
+    connect(btn_preset_film_, &QPushButton::clicked, this, [this] {
+        apply_composite_preset(100, 100, 50, 100);
+    });
+    connect(btn_preset_soft_, &QPushButton::clicked, this, [this] {
+        apply_composite_preset(80, 90, 50, 100);
+    });
+    connect(btn_preset_macro_, &QPushButton::clicked, this, [this] {
+        apply_composite_preset(100, 115, 20, 110);
+    });
+    connect(btn_preset_black_, &QPushButton::clicked, this, [this] {
+        apply_composite_preset(100, 100, 0, 100);
+    });
+
+    auto *desc_label = new QLabel(tr(
+        "【方案说明 (3/4/5协同运作，互不冲突)】\n"
+        "• 方案 3 (暗部保护): 抑制暗部灰雾，0%锁定纯黑\n"
+        "• 方案 4 (细节清晰): 频域高频分离，>100%发丝锐利\n"
+        "• 方案 5 (AI混合浓度): 原图与AI柔和融合，80%呈现写真感"));
+    desc_label->setStyleSheet(QStringLiteral("color: #888899; font-size: 11px;"));
+    desc_label->setWordWrap(true);
+    col_layout->addWidget(desc_label);
+
+    col_layout->addStretch(1);
     return column;
 }
 
-QWidget *BatchWindow::build_right_column() {
+QWidget *BatchWindow::build_video_column() {
     auto *column = new QWidget;
-    auto *stack = new QVBoxLayout(column);
-    stack->setContentsMargins(0, 0, 0, 0);
+    auto *col_layout = new QVBoxLayout(column);
+    col_layout->setContentsMargins(0, 0, 0, 0);
+    col_layout->setSpacing(6);
 
-    // ---- video ----------------------------------------------------------
-    video_panel_ = new QWidget;
-    auto *form = new QFormLayout(video_panel_);
+    auto *header = new QLabel(tr("<b>【视频流与编码】</b>"));
+    header->setStyleSheet(QStringLiteral("color: #4da6ff; margin-bottom: 2px;"));
+    col_layout->addWidget(header);
+
+    auto *form = new QFormLayout;
     form->setContentsMargins(0, 0, 0, 0);
 
     reset_ = new QComboBox;
@@ -380,9 +469,6 @@ QWidget *BatchWindow::build_right_column() {
         tr("超分输出模式：经 DLSS 5 神经增强后，超分放大至指定倍率的目标分辨率并进行硬件编码。"));
     form->addRow(tr("Upscaling 输出"), upscale_);
 
-    // Three columns rather than one flow row: the path field takes whatever the
-    // check box and the button leave, which is the most it can get, and nothing
-    // wraps to a second line that is not there.
     dump_ = new QCheckBox(tr("抽帧到目录"));
     dump_dir_ = new QLineEdit;
     auto *dump_button = new QPushButton(tr("选择…"));
@@ -402,8 +488,6 @@ QWidget *BatchWindow::build_right_column() {
     flow_ = new QCheckBox(tr("运动向量引导"));
     flow_->setToolTip(tr("优先使用 D3D12 GPU 计算运动向量，再自动回退 CPU。默认关。"));
     audio_ = new QCheckBox(tr("音轨直通"));
-    // auto_mask_ lives in the left column so it is visible in single-image
-    // mode too; see build_left_column.
     auto *switches = new QWidget;
     auto *switch_layout = new QHBoxLayout(switches);
     switch_layout->setContentsMargins(0, 0, 0, 0);
@@ -412,79 +496,8 @@ QWidget *BatchWindow::build_right_column() {
     switch_layout->addStretch(1);
     form->addRow(switches);
 
-    stack->addWidget(video_panel_);
-
-    // ---- image ----------------------------------------------------------
-    image_panel_ = new QWidget;
-    auto *image_layout = new QVBoxLayout(image_panel_);
-    image_layout->setContentsMargins(0, 0, 0, 0);
-    image_layout->setSpacing(6);
-
-    auto *image_form = new QFormLayout;
-    image_form->setContentsMargins(0, 0, 0, 0);
-
-    image_form->addRow(tr("AI混合浓度"), slider_percent_row(100, 100, output_mix_, output_mix_value_));
-    output_mix_->setToolTip(tr("AI 画面与原图的全局混合浓度 (方案 5)。100% 为完全 AI 输出；80% 或更低能带来柔美的真实写真感，化解数码过度锐化。"));
-
-    image_form->addRow(tr("细节清晰度"), slider_percent_row(200, 100, detail_boost_, detail_boost_value_));
-    detail_boost_->setToolTip(tr("细节清晰度与高频提取增强 (方案 4)。100% 为原生 AI 细节；>100% 锐化睫毛和发丝，<100% 柔化画面。"));
-
-    image_form->addRow(tr("暗部保护"), slider_percent_row(200, 50, shadow_protect_, shadow_protect_value_));
-    shadow_protect_->setToolTip(tr("针对暗部被 AI 抬升的压制强度 (方案 3)。推荐 50%；拉到 0% 锁定纯黑底色，彻底杜绝任何泛灰起雾。"));
-
-    image_form->addRow(tr("高光辉光"), slider_percent_row(200, 100, glow_control_, glow_control_value_));
-    glow_control_->setToolTip(tr("高光反射和眼神光的 AI 表现调节 (方案 3)。100% 为标准高光表现。"));
-
-    image_layout->addLayout(image_form);
-
-    // Preset buttons row
-    auto *preset_row = new QWidget;
-    auto *preset_layout = new QHBoxLayout(preset_row);
-    preset_layout->setContentsMargins(0, 0, 0, 0);
-    preset_layout->setSpacing(4);
-
-    btn_preset_film_ = new QPushButton(tr("原生电影(推荐)"));
-    btn_preset_soft_ = new QPushButton(tr("柔和写真"));
-    btn_preset_macro_ = new QPushButton(tr("极致微距"));
-    btn_preset_black_ = new QPushButton(tr("纯黑无雾"));
-
-    btn_preset_film_->setToolTip(tr("【原生电影 (推荐)】：混合 100% | 细节 100% | 暗部保护 50% | 局部色调 0 | 风格 电影"));
-    btn_preset_soft_->setToolTip(tr("【柔和写真 (防发脆)】：混合 80% | 细节 90% | 暗部保护 50% | 消除过度数码锐化，自然写真质感"));
-    btn_preset_macro_->setToolTip(tr("【极致微距 (锐利)】：混合 100% | 细节 115% | 暗部保护 20% | 睫毛发丝根根分明，高频微距锐化"));
-    btn_preset_black_->setToolTip(tr("【纯黑强化 (绝对无雾)】：混合 100% | 细节 100% | 暗部保护 0% | 彻底锁定原图纯黑，零灰雾"));
-
-    preset_layout->addWidget(btn_preset_film_);
-    preset_layout->addWidget(btn_preset_soft_);
-    preset_layout->addWidget(btn_preset_macro_);
-    preset_layout->addWidget(btn_preset_black_);
-    preset_layout->addStretch(1);
-    image_layout->addWidget(preset_row);
-
-    connect(btn_preset_film_, &QPushButton::clicked, this, [this] {
-        apply_composite_preset(100, 100, 50, 100);
-    });
-    connect(btn_preset_soft_, &QPushButton::clicked, this, [this] {
-        apply_composite_preset(80, 90, 50, 100);
-    });
-    connect(btn_preset_macro_, &QPushButton::clicked, this, [this] {
-        apply_composite_preset(100, 115, 20, 110);
-    });
-    connect(btn_preset_black_, &QPushButton::clicked, this, [this] {
-        apply_composite_preset(100, 100, 0, 100);
-    });
-
-    auto *desc_label = new QLabel(tr(
-        "【画面合成说明 (方案3/4/5协同运作，互不冲突)】\n"
-        "• 方案 3 (暗部保护): 抑制暗部灰雾，0%锁定纯黑\n"
-        "• 方案 4 (细节清晰): 频域高频分离增强，>100%睫毛发丝锐利\n"
-        "• 方案 5 (AI混合浓度): 原图与AI柔和融合，80%呈现胶片感"));
-    desc_label->setStyleSheet(QStringLiteral("color: #888899; font-size: 11px;"));
-    desc_label->setWordWrap(true);
-    image_layout->addWidget(desc_label);
-
-    image_layout->addStretch(1);
-
-    stack->addWidget(image_panel_);
+    col_layout->addLayout(form);
+    col_layout->addStretch(1);
     return column;
 }
 
@@ -678,7 +691,6 @@ void BatchWindow::auto_fill_output(bool follow_input) {
 void BatchWindow::update_mode_ui() {
     const bool image = image_mode_->isChecked();
     video_panel_->setVisible(!image);
-    image_panel_->setVisible(image);
     image_passes_row_->setVisible(image);
 }
 

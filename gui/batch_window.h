@@ -53,7 +53,8 @@ private:
     QWidget *build_files();
     QWidget *build_parameters();
     QWidget *build_left_column();
-    QWidget *build_right_column();
+    QWidget *build_composite_column();
+    QWidget *build_video_column();
     QWidget *build_run();
     QLineEdit *add_path_row(QFormLayout *form, const QString &caption, bool open);
 
@@ -131,7 +132,7 @@ private:
     QCheckBox *audio_ = nullptr;
 
     QWidget *video_panel_ = nullptr;
-    QWidget *image_panel_ = nullptr;
+    QWidget *composite_panel_ = nullptr;
     QWidget *image_passes_row_ = nullptr;
 
     // ---- composite (schemes 3, 4, 5) ------------------------------------

@@ -661,11 +661,12 @@ struct CompositeOptions {
 
 void apply_post_composite(const enhancer::Image &in, enhancer::Image &out, const CompositeOptions &opts) {
     if (!opts.is_active()) return;
-    if (in.width != out.width || in.height != out.height || in.empty() || out.empty()) return;
+    if (in.empty() || out.empty()) return;
 
-    const unsigned width = in.width;
-    const unsigned height = in.height;
+    const unsigned width = out.width;
+    const unsigned height = out.height;
     const size_t total_pixels = (size_t)width * height;
+    const bool same_dim = (in.width == width && in.height == height);
     const uint16_t *src_in = in.pixels.data();
     uint16_t *src_out = out.pixels.data();
 
@@ -737,12 +738,45 @@ void apply_post_composite(const enhancer::Image &in, enhancer::Image &out, const
     const float shadow_prot = opts.shadow_protect;
     const float glow_ctrl = opts.glow_control;
 
+    const float scale_x = same_dim ? 1.0f : ((float)in.width / (float)width);
+    const float scale_y = same_dim ? 1.0f : ((float)in.height / (float)height);
+
     WorkerPool::instance().parallel_for(total_pixels, [&](size_t p_start, size_t p_end, size_t /*tid*/) {
         for (size_t i = p_start; i < p_end; ++i) {
             const size_t idx4 = i * 4;
-            const float r_orig = enhancer::half_to_float(src_in[idx4 + 0]);
-            const float g_orig = enhancer::half_to_float(src_in[idx4 + 1]);
-            const float b_orig = enhancer::half_to_float(src_in[idx4 + 2]);
+            float r_orig, g_orig, b_orig;
+            if (same_dim) {
+                r_orig = enhancer::half_to_float(src_in[idx4 + 0]);
+                g_orig = enhancer::half_to_float(src_in[idx4 + 1]);
+                b_orig = enhancer::half_to_float(src_in[idx4 + 2]);
+            } else {
+                const size_t x = i % width;
+                const size_t y = i / width;
+                const float sx = (float)x * scale_x;
+                const float sy = (float)y * scale_y;
+                const int x0 = (int)sx;
+                const int y0 = (int)sy;
+                const int x1 = std::min(x0 + 1, (int)in.width - 1);
+                const int y1 = std::min(y0 + 1, (int)in.height - 1);
+                const float fx = sx - x0;
+                const float fy = sy - y0;
+                const float w00 = (1.0f - fx) * (1.0f - fy);
+                const float w10 = fx * (1.0f - fy);
+                const float w01 = (1.0f - fx) * fy;
+                const float w11 = fx * fy;
+
+                const uint16_t *p00 = &src_in[((size_t)y0 * in.width + x0) * 4];
+                const uint16_t *p10 = &src_in[((size_t)y0 * in.width + x1) * 4];
+                const uint16_t *p01 = &src_in[((size_t)y1 * in.width + x0) * 4];
+                const uint16_t *p11 = &src_in[((size_t)y1 * in.width + x1) * 4];
+
+                r_orig = w00 * enhancer::half_to_float(p00[0]) + w10 * enhancer::half_to_float(p10[0]) +
+                         w01 * enhancer::half_to_float(p01[0]) + w11 * enhancer::half_to_float(p11[0]);
+                g_orig = w00 * enhancer::half_to_float(p00[1]) + w10 * enhancer::half_to_float(p10[1]) +
+                         w01 * enhancer::half_to_float(p01[1]) + w11 * enhancer::half_to_float(p11[1]);
+                b_orig = w00 * enhancer::half_to_float(p00[2]) + w10 * enhancer::half_to_float(p10[2]) +
+                         w01 * enhancer::half_to_float(p01[2]) + w11 * enhancer::half_to_float(p11[2]);
+            }
 
             const float r_dlss = enhancer::half_to_float(src_out[idx4 + 0]);
             const float g_dlss = enhancer::half_to_float(src_out[idx4 + 1]);
