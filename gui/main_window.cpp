@@ -779,6 +779,7 @@ void MainWindow::set_busy(bool busy) {
     busy_ = busy;
     run_button_->setEnabled(!busy && !input_.empty());
     prewarm_button_->setEnabled(!busy && !nvidia_mode_);
+    if (mode_button_) mode_button_->setEnabled(!busy);
     save_button_->setEnabled(!busy && have_output_);
     compare_button_->setEnabled(!busy && have_output_);
 }

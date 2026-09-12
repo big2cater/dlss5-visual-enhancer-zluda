@@ -2953,6 +2953,8 @@ static int real_main(int argc, char **argv) {
                 if (!snippet && strstr(argv[j], "nvngx_dlssnr")) snippet = argv[j];
                 else if (snippet && !driver && strstr(argv[j], "nvcuda")) driver = argv[j];
             }
+            if (!snippet && argc >= 5) snippet = argv[3];
+            if (!driver && argc >= 5) driver = argv[4];
             if (snippet && driver) {
                 fprintf(stderr, "[precompile-wait] 串行预热: %s %s ...\n", snippet, driver);
                 fflush(stderr);

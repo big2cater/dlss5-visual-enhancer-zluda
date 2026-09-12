@@ -197,6 +197,7 @@ private:
 
     QRegularExpression frame_re_;
     QByteArray error_buffer_;
+    QByteArray prewarm_buffer_;
 };
 
 } // namespace batch

@@ -972,6 +972,7 @@ void BatchWindow::start_run() {
     start_button_->setEnabled(false);
     if (preview_button_) preview_button_->setEnabled(false);
     if (frame_hold_button_) frame_hold_button_->setEnabled(false);
+    if (prewarm_button_) prewarm_button_->setEnabled(false);
     stop_button_->setEnabled(true);
     timer_->start();
     log_line(tr(">>> 开始%1处理").arg(image_mode_->isChecked() ? tr("图片") : tr("视频")),
@@ -1059,6 +1060,7 @@ void BatchWindow::start_preview() {
     start_button_->setEnabled(false);
     if (preview_button_) preview_button_->setEnabled(false);
     if (frame_hold_button_) frame_hold_button_->setEnabled(false);
+    if (prewarm_button_) prewarm_button_->setEnabled(false);
     stop_button_->setEnabled(true);
     timer_->start();
     log_line(tr(">>> 开始 3 秒快速预览（共 %1 帧）-> %2").arg(frames_total_).arg(preview_output_path_),
@@ -1135,6 +1137,7 @@ void BatchWindow::start_frame_hold_compare() {
     start_button_->setEnabled(false);
     if (preview_button_) preview_button_->setEnabled(false);
     if (frame_hold_button_) frame_hold_button_->setEnabled(false);
+    if (prewarm_button_) prewarm_button_->setEnabled(false);
     stop_button_->setEnabled(true);
     timer_->start();
     log_line(tr(">>> 开始单帧定帧降噪增强 -> 准备对比"), QColor(135, 206, 250));
@@ -1177,16 +1180,19 @@ void BatchWindow::start_prewarm() {
         return;
     }
 
+    user_stopped_ = false;
     prewarm_running_ = true;
     start_button_->setEnabled(false);
     if (preview_button_) preview_button_->setEnabled(false);
     if (frame_hold_button_) frame_hold_button_->setEnabled(false);
     prewarm_button_->setEnabled(false);
     stop_button_->setEnabled(true);
+    progress_->setValue(0);
     status_->setText(tr("正在预热翻译缓存…"));
     log_line(tr(">>> 开始预热翻译缓存（每个模块落地时都会在这里出现一行）"),
              QColor(135, 206, 250));
 
+    prewarm_buffer_.clear();
     prewarm_process_.setProgram(exe);
     prewarm_process_.setArguments({QStringLiteral("--precompile"), snippet_->text(),
                                    driver_->text()});
@@ -1197,6 +1203,8 @@ void BatchWindow::start_prewarm() {
                  QColor(255, 90, 60));
         prewarm_running_ = false;
         start_button_->setEnabled(true);
+        if (preview_button_) preview_button_->setEnabled(true);
+        if (frame_hold_button_) frame_hold_button_->setEnabled(true);
         prewarm_button_->setEnabled(true);
         stop_button_->setEnabled(false);
         status_->setText(tr("就绪"));
@@ -1204,32 +1212,68 @@ void BatchWindow::start_prewarm() {
 }
 
 void BatchWindow::on_prewarm_output() {
-    const QByteArray err = prewarm_process_.readAllStandardError();
-    const QByteArray out = prewarm_process_.readAllStandardOutput();
-    for (const QByteArray *channel : {&err, &out}) {
-        const QList<QByteArray> lines = channel->split('\n');
-        for (const QByteArray &raw : lines) {
-            QString line = QString::fromLocal8Bit(raw).trimmed();
-            if (!line.isEmpty()) log_line(line, QColor(200, 200, 200));
+    prewarm_buffer_.append(prewarm_process_.readAllStandardError());
+    prewarm_buffer_.append(prewarm_process_.readAllStandardOutput());
+    while (true) {
+        const int idx = prewarm_buffer_.indexOf('\n');
+        if (idx < 0) break;
+        const QString line = QString::fromUtf8(prewarm_buffer_.left(idx)).trimmed();
+        prewarm_buffer_.remove(0, idx + 1);
+        if (line.isEmpty()) continue;
+
+        static const QRegularExpression pre(
+            QStringLiteral(R"(\[precompile\] translated (\d+) of (\d+))"));
+        const auto translating = pre.match(line);
+        if (translating.hasMatch()) {
+            const long long done = translating.captured(1).toLongLong();
+            const long long total = translating.captured(2).toLongLong();
+            if (total > 0) {
+                const long long clamped_done = qBound(0LL, done, total);
+                progress_->setValue(qMin(99, (int)(clamped_done * 99 / total)));
+                status_->setText(tr("正在预热翻译缓存… (%1 / %2)").arg(clamped_done).arg(total));
+            }
+            log_line(line, QColor(255, 215, 0));
+            continue;
+        }
+
+        if (line.contains(QStringLiteral("[FAIL]")) || line.contains(QStringLiteral("failed")) ||
+            line.contains(QStringLiteral("error"))) {
+            log_line(line, QColor(255, 90, 60));
+        } else {
+            log_line(line, QColor(200, 200, 200));
         }
     }
 }
 
 void BatchWindow::on_prewarm_finished(int code, QProcess::ExitStatus status) {
+    on_prewarm_output();
+    if (!prewarm_buffer_.isEmpty()) {
+        const QString tail = QString::fromUtf8(prewarm_buffer_).trimmed();
+        prewarm_buffer_.clear();
+        if (!tail.isEmpty()) log_line(tail, QColor(200, 200, 200));
+    }
+
     prewarm_running_ = false;
     start_button_->setEnabled(true);
+    if (preview_button_) preview_button_->setEnabled(true);
+    if (frame_hold_button_) frame_hold_button_->setEnabled(true);
     prewarm_button_->setEnabled(true);
     stop_button_->setEnabled(false);
+
     if (user_stopped_) {
+        user_stopped_ = false;
+        progress_->setValue(0);
         status_->setText(tr("预热已停止"));
         return;
     }
     if (status == QProcess::CrashExit || code != 0) {
+        progress_->setValue(0);
         status_->setText(tr("预热失败"));
         log_line(tr(">>> 预热失败（退出码 %1）。未完成的模块会在下次预热或处理时重试。").arg(code),
                  QColor(255, 90, 60));
         return;
     }
+    progress_->setValue(100);
     status_->setText(tr("缓存已就绪，处理将直接从缓存启动。"));
     log_line(tr(">>> 预热完成：全部模块已在本机缓存中，之后每次启动都是秒级。"),
              QColor(120, 220, 120));
@@ -1370,6 +1414,7 @@ void BatchWindow::on_finished(int code, QProcess::ExitStatus exit_status) {
     start_button_->setEnabled(true);
     if (preview_button_) preview_button_->setEnabled(true);
     if (frame_hold_button_) frame_hold_button_->setEnabled(true);
+    if (prewarm_button_) prewarm_button_->setEnabled(true);
     stop_button_->setEnabled(false);
     timer_->stop();
 
@@ -1463,6 +1508,7 @@ void BatchWindow::dropEvent(QDropEvent *event) {
 
 void BatchWindow::closeEvent(QCloseEvent *event) {
     if (running_) process_.kill();
+    if (prewarm_running_) prewarm_process_.kill();
     save_settings();
     QMainWindow::closeEvent(event);
 }

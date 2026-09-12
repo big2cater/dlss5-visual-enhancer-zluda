@@ -1,5 +1,6 @@
 #include "batch_window.h"
 #include "gpu_detection.h"
+#include "precompile.h"
 
 #include <QApplication>
 #include <QGuiApplication>
@@ -37,6 +38,10 @@ int main(int argc, char **argv) {
     QApplication application(argc, argv);
     QApplication::setApplicationName(QStringLiteral("DLSSNRFilter"));
     QApplication::setOrganizationName(QStringLiteral("dlssnrfilter"));
+
+    const QStringList arguments = QApplication::arguments();
+    if (arguments.size() == 4 && arguments[1] == QLatin1String("--compile-one"))
+        return enhancer::compile_one(arguments[2].toStdWString(), arguments[3].toStdWString());
 
     batch::BatchWindow window;
     window.show();

@@ -63,6 +63,14 @@ std::wstring temporary_directory() {
     return directory;
 }
 
+std::wstring get_absolute_path(const std::wstring &path) {
+    if (path.empty()) return {};
+    wchar_t full[MAX_PATH] = {};
+    DWORD len = GetFullPathNameW(path.c_str(), MAX_PATH, full, nullptr);
+    if (len > 0 && len < MAX_PATH) return std::wstring(full, len);
+    return path;
+}
+
 // ---- the warm-start stamp -------------------------------------------------
 //
 // precompile() cannot cheaply ask ZLUDA whether its cache already holds a
@@ -212,8 +220,9 @@ std::vector<std::vector<unsigned char>> extract_modules(const std::wstring &libr
     return modules;
 }
 
-int compile_one(const std::wstring &module_file, const std::wstring &driver) {
+int compile_one(const std::wstring &module_file, const std::wstring &driver_in) {
     dlssnr::auto_configure_gpu_environment();
+    const std::wstring driver = get_absolute_path(driver_in);
     const size_t slash = driver.find_last_of(L"/\\");
     if (slash != std::wstring::npos) {
         SetDllDirectoryW(driver.substr(0, slash).c_str());
@@ -245,8 +254,10 @@ int compile_one(const std::wstring &module_file, const std::wstring &driver) {
     return cuModuleLoadData(&module, image.data()) == 0 ? 0 : 6;
 }
 
-bool precompile(const std::wstring &library, const std::wstring &driver, unsigned jobs,
+bool precompile(const std::wstring &library_in, const std::wstring &driver_in, unsigned jobs,
                 const std::function<void(const Progress &)> &report, std::string &error) {
+    const std::wstring library = get_absolute_path(library_in);
+    const std::wstring driver = get_absolute_path(driver_in);
     // The stamp check lives here and not only in the callers, because the
     // --precompile entry points -- the prewarm child that --precompile-wait
     // spawns, the manual command, the GUI's own -- dispatch every module
@@ -258,7 +269,7 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
     if (precompile_cache_is_warm(library, driver)) {
         Progress progress;
         progress.message = "every module is already in the cache, nothing to translate";
-        report(progress);
+        if (report) report(progress);
         return true;
     }
     const std::vector<std::vector<unsigned char>> modules = extract_modules(library, error);
@@ -292,7 +303,7 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
                  ceiling, adaptive ? " as memory allows" : "");
         progress.message = buffer;
     }
-    report(progress);
+    if (report) report(progress);
 
     // Written out because the work happens in separate processes: each one is
     // a whole compiler pipeline over a large module, and running them in
@@ -429,7 +440,7 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
                      progress.done, progress.total, running.size(), free_physical_mb());
             progress.message = buffer;
         }
-        report(progress);
+        if (report) report(progress);
     }
 
     for (HANDLE h : running) {
@@ -450,13 +461,17 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
     return true;
 }
 
-bool precompile_cache_is_warm(const std::wstring &library, const std::wstring &driver) {
+bool precompile_cache_is_warm(const std::wstring &library_in, const std::wstring &driver_in) {
+    const std::wstring library = get_absolute_path(library_in);
+    const std::wstring driver = get_absolute_path(driver_in);
     const std::wstring directory = cache_directory();
     if (directory.empty()) return false;
     std::ifstream in(directory + kStampName);
     if (!in) return false;
     std::string line;
-    if (!std::getline(in, line) || line != "v2") return false;
+    if (!std::getline(in, line)) return false;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line != "v2") return false;
     // The GPU the stamp was written for must still be the GPU present: the
     // cache entries it vouches for are keyed to that chip. An environment
     // without an identifiable GPU answers not warm rather than guessing.
@@ -469,6 +484,7 @@ bool precompile_cache_is_warm(const std::wstring &library, const std::wstring &d
     std::string gpu_line;
     bool gpu_seen = false;
     while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         std::istringstream fields(line);
         std::string kind;
         fields >> kind;
@@ -485,8 +501,16 @@ bool precompile_cache_is_warm(const std::wstring &library, const std::wstring &d
     FileStamp snippet{};
     FileStamp cuda{};
     if (!file_stamp(library, snippet) || !file_stamp(driver, cuda)) return false;
-    if (snippet.size != snippet_size || snippet.mtime != snippet_mtime) return false;
-    if (cuda.size != driver_size || cuda.mtime != driver_mtime) return false;
+
+    auto mtime_matches = [](unsigned long long a, unsigned long long b) {
+        // FAT32, zip extraction, and integer text serialization can truncate
+        // sub-second timestamp fractions. Allow up to 2 seconds (20,000,000 FILETIME ticks).
+        constexpr unsigned long long kTwoSeconds = 20000000ULL;
+        return (a >= b ? a - b : b - a) <= kTwoSeconds;
+    };
+
+    if (snippet.size != snippet_size || !mtime_matches(snippet.mtime, snippet_mtime)) return false;
+    if (cuda.size != driver_size || !mtime_matches(cuda.mtime, driver_mtime)) return false;
     // The databases only grow in normal use; smaller than recorded means the
     // cache was reset or rotated and the entries behind the stamp are gone.
     return cache_database_bytes(directory) >= db_bytes;

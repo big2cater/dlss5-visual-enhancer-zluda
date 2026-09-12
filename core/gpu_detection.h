@@ -90,8 +90,8 @@ inline std::wstring detected_gpu_identity() {
     }
     if (!best) return {};
     wchar_t ids[64] = {};
-    swprintf(ids, 64, L"|%04X|%04X|%zu", best->vendor_id, best->device_id,
-             best->dedicated_vram_mb);
+    swprintf_s(ids, 64, L"|%04X|%04X|%zu", best->vendor_id, best->device_id,
+               best->dedicated_vram_mb);
     return best->name + ids;
 }
 
