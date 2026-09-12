@@ -228,6 +228,20 @@ int compile_one(const std::wstring &module_file, const std::wstring &driver) {
 
 bool precompile(const std::wstring &library, const std::wstring &driver, unsigned jobs,
                 const std::function<void(const Progress &)> &report, std::string &error) {
+    // The stamp check lives here and not only in the callers, because the
+    // --precompile entry points -- the prewarm child that --precompile-wait
+    // spawns, the manual command, the GUI's own -- dispatch every module
+    // unconditionally. Against a cache that already holds everything, each of
+    // the fifteen children still pays a full driver load and context creation
+    // on its way to a cache hit: minutes of pure overhead, paid again for
+    // every image in a batch. The callers that check the stamp themselves
+    // simply never reach this line when it answers warm.
+    if (precompile_cache_is_warm(library, driver)) {
+        Progress progress;
+        progress.message = "every module is already in the cache, nothing to translate";
+        report(progress);
+        return true;
+    }
     const std::vector<std::vector<unsigned char>> modules = extract_modules(library, error);
     if (modules.empty()) return false;
 
