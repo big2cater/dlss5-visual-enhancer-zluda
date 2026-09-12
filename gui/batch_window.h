@@ -76,6 +76,13 @@ private:
     void read_error();
     void on_finished(int code, QProcess::ExitStatus status);
     void on_second_tick();
+    // Translates the network into ZLUDA's cache ahead of the first job: the
+    // same work the first run would trigger, offered on its own with the
+    // module progress streaming into the log.
+    void start_prewarm();
+    void on_prewarm_output();
+    void on_prewarm_finished(int code, QProcess::ExitStatus status);
+    void hint_cold_cache();
 
     QStringList arguments() const;
     bool validate(QString *problem) const;
@@ -157,13 +164,18 @@ private:
     QPushButton *frame_hold_button_ = nullptr;
     QPushButton *stop_button_ = nullptr;
     QPushButton *compare_button_ = nullptr;
+    QPushButton *prewarm_button_ = nullptr;
     QProgressBar *progress_ = nullptr;
     QLabel *status_ = nullptr;
     QPlainTextEdit *log_ = nullptr;
 
     QProcess process_;
+    // The warm-up runs video_filter --precompile on its own process so it
+    // never contends with a job for process_.
+    QProcess prewarm_process_;
     QTimer *timer_ = nullptr;
     bool running_ = false;
+    bool prewarm_running_ = false;
     bool is_preview_ = false;
     bool is_frame_hold_ = false;
     QString preview_output_path_;

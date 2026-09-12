@@ -52,6 +52,10 @@ if(Qt6_FOUND)
         gui/batch_window.h
         gui/compare_view.cpp
         gui/compare_view.h
+        # The warm-up button asks the precompile layer whether the stamp says
+        # the cache is already warm before dispatching a translation.
+        core/precompile.cpp
+        core/precompile.h
     )
     target_include_directories(dlssnr_gui PRIVATE core)
     target_link_libraries(dlssnr_gui PRIVATE Qt6::Widgets dxgi)

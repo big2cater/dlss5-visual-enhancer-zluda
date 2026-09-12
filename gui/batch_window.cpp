@@ -1,6 +1,7 @@
 #include "batch_window.h"
 
 #include "compare_view.h"
+#include "../core/precompile.h"
 
 #include <QCheckBox>
 #include <QCloseEvent>
@@ -137,8 +138,14 @@ BatchWindow::BatchWindow() {
     connect(&process_, &QProcess::readyReadStandardOutput, this, [this]() { process_.readAllStandardOutput(); });
     connect(&process_, &QProcess::finished, this, &BatchWindow::on_finished);
 
+    connect(prewarm_button_, &QPushButton::clicked, this, &BatchWindow::start_prewarm);
+    connect(&prewarm_process_, &QProcess::readyReadStandardError, this, &BatchWindow::on_prewarm_output);
+    connect(&prewarm_process_, &QProcess::readyReadStandardOutput, this, &BatchWindow::on_prewarm_output);
+    connect(&prewarm_process_, &QProcess::finished, this, &BatchWindow::on_prewarm_finished);
+
     load_settings();
     update_mode_ui();
+    hint_cold_cache();
 }
 
 QString BatchWindow::application_dir() { return QCoreApplication::applicationDirPath(); }
@@ -539,6 +546,9 @@ QWidget *BatchWindow::build_run() {
     auto *box = new QGroupBox(tr("运行"));
     auto *layout = new QHBoxLayout(box);
 
+    prewarm_button_ = new QPushButton(tr("预热缓存"));
+    prewarm_button_->setToolTip(tr("把网络的代码提前翻译进本机缓存：首次使用或更换版本/显卡后点一次，"
+                                   "之后的处理直接从缓存启动。NVIDIA 显卡无需预热。"));
     start_button_ = new QPushButton(tr("开始"));
     preview_button_ = new QPushButton(tr("预览 3 秒"));
     preview_button_->setToolTip(tr("仅处理前 3 秒视频快速验证效果，完成后自动打开对比窗口。"));
@@ -555,6 +565,7 @@ QWidget *BatchWindow::build_run() {
     status_ = new QLabel(tr("就绪"));
     status_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
 
+    layout->addWidget(prewarm_button_);
     layout->addWidget(start_button_);
     layout->addWidget(preview_button_);
     layout->addWidget(frame_hold_button_);
@@ -1130,12 +1141,110 @@ void BatchWindow::start_frame_hold_compare() {
 }
 
 void BatchWindow::stop_run() {
+    if (prewarm_running_) {
+        user_stopped_ = true;
+        prewarm_process_.kill();
+        log_line(tr(">>> 已请求停止预热"), QColor(255, 165, 0));
+        return;
+    }
     if (!running_) return;
     user_stopped_ = true;
     process_.kill();
     is_preview_ = false;
     is_frame_hold_ = false;
     log_line(tr(">>> 已请求停止"), QColor(255, 165, 0));
+}
+
+// The warm-up needs only the network and the driver: it never touches the
+// input, output or ffmpeg side. On NVIDIA machines there is nothing to
+// translate -- the driver runs the network as shipped -- so the button is
+// best left alone there, and a fully warm cache answers instantly.
+void BatchWindow::start_prewarm() {
+    if (running_ || prewarm_running_) return;
+    if (snippet_->text().isEmpty() || driver_->text().isEmpty()) {
+        log_line(tr("预热需要先填入网络库（nvngx_dlssnr.dll）与 CUDA 驱动（nvcuda.dll）路径。"),
+                 QColor(255, 170, 60));
+        return;
+    }
+    if (enhancer::precompile_cache_is_warm(snippet_->text().toStdWString(),
+                                 driver_->text().toStdWString())) {
+        log_line(tr("翻译缓存已是热的，无需预热，可直接开始处理。"), QColor(120, 220, 120));
+        return;
+    }
+    const QString exe = application_dir() + QStringLiteral("/video_filter.exe");
+    if (!QFileInfo::exists(exe)) {
+        log_line(tr("找不到 video_filter.exe：%1").arg(exe), QColor(255, 90, 60));
+        return;
+    }
+
+    prewarm_running_ = true;
+    start_button_->setEnabled(false);
+    if (preview_button_) preview_button_->setEnabled(false);
+    if (frame_hold_button_) frame_hold_button_->setEnabled(false);
+    prewarm_button_->setEnabled(false);
+    stop_button_->setEnabled(true);
+    status_->setText(tr("正在预热翻译缓存…"));
+    log_line(tr(">>> 开始预热翻译缓存（每个模块落地时都会在这里出现一行）"),
+             QColor(135, 206, 250));
+
+    prewarm_process_.setProgram(exe);
+    prewarm_process_.setArguments({QStringLiteral("--precompile"), snippet_->text(),
+                                   driver_->text()});
+    prewarm_process_.setWorkingDirectory(application_dir());
+    prewarm_process_.start();
+    if (!prewarm_process_.waitForStarted(5000)) {
+        log_line(tr("预热进程启动失败：%1").arg(prewarm_process_.errorString()),
+                 QColor(255, 90, 60));
+        prewarm_running_ = false;
+        start_button_->setEnabled(true);
+        prewarm_button_->setEnabled(true);
+        stop_button_->setEnabled(false);
+        status_->setText(tr("就绪"));
+    }
+}
+
+void BatchWindow::on_prewarm_output() {
+    const QByteArray err = prewarm_process_.readAllStandardError();
+    const QByteArray out = prewarm_process_.readAllStandardOutput();
+    for (const QByteArray *channel : {&err, &out}) {
+        const QList<QByteArray> lines = channel->split('\n');
+        for (const QByteArray &raw : lines) {
+            QString line = QString::fromLocal8Bit(raw).trimmed();
+            if (!line.isEmpty()) log_line(line, QColor(200, 200, 200));
+        }
+    }
+}
+
+void BatchWindow::on_prewarm_finished(int code, QProcess::ExitStatus status) {
+    prewarm_running_ = false;
+    start_button_->setEnabled(true);
+    prewarm_button_->setEnabled(true);
+    stop_button_->setEnabled(false);
+    if (user_stopped_) {
+        status_->setText(tr("预热已停止"));
+        return;
+    }
+    if (status == QProcess::CrashExit || code != 0) {
+        status_->setText(tr("预热失败"));
+        log_line(tr(">>> 预热失败（退出码 %1）。未完成的模块会在下次预热或处理时重试。").arg(code),
+                 QColor(255, 90, 60));
+        return;
+    }
+    status_->setText(tr("缓存已就绪，处理将直接从缓存启动。"));
+    log_line(tr(">>> 预热完成：全部模块已在本机缓存中，之后每次启动都是秒级。"),
+             QColor(120, 220, 120));
+}
+
+// Startup guidance, mirroring start_prewarm's own checks: point at the
+// button before a first run disappears into a long silent translation.
+void BatchWindow::hint_cold_cache() {
+    if (snippet_->text().isEmpty() || driver_->text().isEmpty()) return;
+    if (enhancer::precompile_cache_is_warm(snippet_->text().toStdWString(),
+                                 driver_->text().toStdWString()))
+        return;
+    log_line(tr("提示：首次使用建议先点击【预热缓存】——把网络翻译进本机缓存（约 20~40 "
+                "分钟，仅此一次）。跳过也可以，但首个任务会长时间停留在编译阶段。"),
+             QColor(255, 200, 90));
 }
 
 void BatchWindow::probe_total() {
