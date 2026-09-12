@@ -564,8 +564,10 @@ void MainWindow::set_nvidia_mode(bool nvidia) {
     nvidia_mode_ = nvidia;
     mode_button_->setText(nvidia ? tr("Mode: NVIDIA") : tr("Mode: AMD (ZLUDA)"));
     // NVIDIA's driver runs the network directly; there is nothing to
-    // translate, so the warm-up has no purpose there.
-    prewarm_button_->setEnabled(!nvidia);
+    // translate, so the warm-up has no purpose there. While something is
+    // running the button stays off either way -- a warm-up dispatched now
+    // would queue behind the run and translate concurrently with it.
+    prewarm_button_->setEnabled(!nvidia && !busy_);
 
     for (QWidget *row : {driver_row_, nvapi_row_}) row->setVisible(!nvidia);
 
@@ -762,7 +764,8 @@ void MainWindow::show_original(bool original) {
 // a long translation, and a long silent wait reads as a hang. Point at the
 // warm-up button before that happens rather than after.
 void MainWindow::hint_cold_cache() {
-    if (nvidia_mode_ || snippet_path_->text().isEmpty() || driver_path_->text().isEmpty())
+    if (busy_ || nvidia_mode_ || snippet_path_->text().isEmpty() ||
+        driver_path_->text().isEmpty())
         return;
     Paths paths;
     paths.snippet = to_wide(snippet_path_->text());
