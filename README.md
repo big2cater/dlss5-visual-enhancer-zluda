@@ -107,9 +107,10 @@
 1. 从 [Releases 页面](https://github.com/big2cater/dlss5-visual-enhancer-zluda/releases) 下载最新的发布包（例如 `DLSSNRFilter-v2026.09.11-multipass-nodlssnr.zip`）；
 2. 解压整个文件夹（**请解压至全英文路径**，不要单独拷贝某个 DLL）；
 3. **放置专有模型文件**：将合法的 `nvngx_dlssnr.dll`（推荐 Build 310.8.0）放入解压后的根目录（与 `video_filter.exe` / `dlssnr_gui.exe` 同级目录）；
-4. 双击运行 `dlssnr_gui.exe`（Qt 6 统一现代图形界面；原 WinForms 界面已正式退役）即可开始处理！
+4. 双击运行 `dlssnr_gui.exe`（Qt 6 统一现代图形界面；原 WinForms 界面已正式退役）；
+5. **首次使用请先预热**：点击 **Warm up cache** 按钮预热翻译缓存（进度实时显示在日志窗，约 20~40 分钟，仅此一次），状态栏显示 Cache ready 后再点 **Enhance** 即可秒级出图！
 
-> ⚠️ **关于首次运行**：首次加载时 ZLUDA 会调用 LLVM 对神经网络模块进行本地编译缓存，首次可能耗时 10~30 秒，编译完成后将永久缓存在本地，后续运行秒级秒启。
+> ⚠️ **关于首次运行**：首次使用（以及每次更换程序版本或显卡之后）需要把网络编译为本机缓存，全程约 20~40 分钟。强烈建议先点 **Warm up cache** 预热——进度可见，不会像卡死；编译结果永久保存在本机（绑定显卡），之后每次启动秒级拉起。直接点 Enhance 跳过预热也可以，程序会主动询问是否先预热。
 
 ---
 
@@ -209,6 +210,15 @@ A：旧版如果简单重复处理会扰乱网络时序导致频闪，但在最�
 3. Place your legally acquired `nvngx_dlssnr.dll` (Build 310.8.0 recommended) in the same directory as `dlssnr_gui.exe` and `video_filter.exe`.
 4. Ensure `ffmpeg.exe` is available on your system `PATH`.
 5. Launch `dlssnr_gui.exe` (Qt 6 modern unified GUI; legacy WinForms has been retired).
+6. **Warm up first**: click **Warm up cache** before the first Enhance -- it
+   translates the network into the local cache (about 20-40 minutes, once),
+   with the module progress visible in the log. Every later start is fast.
+
+> ⚠️ **About the first run**: the first use (and every version or graphics
+> card change) has to compile the network for this machine, which takes a
+> while. The compiled cache is bound to the GPU it was built for and persists
+> locally; skipping the warm-up still works -- the program offers it before a
+> cold first run.
 
 ---
 

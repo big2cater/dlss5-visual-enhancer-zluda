@@ -358,6 +358,7 @@ MainWindow::MainWindow() {
     worker_thread_.start();
 
     restore_paths();
+    hint_cold_cache();
 
     g_window = this;
     dlss_cuda::set_log_sink(&log_to_window);
@@ -577,6 +578,7 @@ void MainWindow::set_nvidia_mode(bool nvidia) {
     // on NVIDIA it fills the runtime in from beside the executable without
     // touching the driver/NVAPI fields just cleared above.
     fill_in_defaults(snippet_path_, driver_path_, runtime_path_, nvapi_path_, nvidia);
+    hint_cold_cache();
 }
 
 namespace {
@@ -756,6 +758,20 @@ void MainWindow::show_original(bool original) {
     display(original ? input_ : output_);
 }
 
+// First-run guidance: a cold translation cache means the first Enhance runs
+// a long translation, and a long silent wait reads as a hang. Point at the
+// warm-up button before that happens rather than after.
+void MainWindow::hint_cold_cache() {
+    if (nvidia_mode_ || snippet_path_->text().isEmpty() || driver_path_->text().isEmpty())
+        return;
+    Paths paths;
+    paths.snippet = to_wide(snippet_path_->text());
+    paths.cuda_driver = to_wide(driver_path_->text());
+    if (precompile_cache_is_warm(paths.snippet, paths.cuda_driver)) return;
+    status_->setText(tr("Tip: first use should start with \"Warm up cache\" -- translating "
+                        "the network now takes a while; after it, everything starts fast."));
+}
+
 void MainWindow::set_busy(bool busy) {
     busy_ = busy;
     run_button_->setEnabled(!busy && !input_.empty());
@@ -783,17 +799,35 @@ void MainWindow::run() {
                     "be pointed at before anything can run."));
         return;
     }
-    set_busy(true);
-    // The first run on a machine translates the network's code, which with a
-    // cold cache takes tens of minutes. Saying so beats looking frozen.
-    status_->setText(tr("Working. The very first run on this machine has to translate the "
-                        "network and can take a long time."));
-
     Paths paths;
     paths.snippet = to_wide(snippet_path_->text());
     paths.cuda_driver = to_wide(driver_path_->text());
     paths.ngx_runtime = to_wide(runtime_path_->text());
     paths.nvapi = to_wide(nvapi_path_->text());
+
+    // Cold cache: the first run carries a whole translation, and a long
+    // silent wait reads as a hang. Offer the warm-up path -- which shows the
+    // module progress in the log -- before committing to it.
+    if (!nvidia_mode_ && !precompile_cache_is_warm(paths.snippet, paths.cuda_driver)) {
+        const QMessageBox::StandardButton choice = QMessageBox::question(
+            this, tr("Warm up cache"),
+            tr("The translation cache is not warmed up yet: the first run has to "
+               "translate the network, which takes a while (roughly 20-40 minutes "
+               "on a cold machine).\n\n"
+               "Warm up first? The \"Warm up cache\" button does the same work with "
+               "the progress visible in the log."),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+        if (choice == QMessageBox::Yes) {
+            prewarm();
+            return;
+        }
+    }
+
+    set_busy(true);
+    // The first run on a machine translates the network's code, which with a
+    // cold cache takes tens of minutes. Saying so beats looking frozen.
+    status_->setText(tr("Working. The very first run on this machine has to translate the "
+                        "network and can take a long time."));
 
     QMetaObject::invokeMethod(worker_, "start", Qt::QueuedConnection, Q_ARG(Paths, paths));
 }

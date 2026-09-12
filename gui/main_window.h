@@ -107,6 +107,7 @@ private:
     void display(const Image &image);
     void rescale();
     void set_busy(bool busy);
+    void hint_cold_cache();
     void remember_paths() const;
     void restore_paths();
     Settings current_settings() const;
