@@ -64,11 +64,42 @@ inline std::vector<DetectedGpu> enumerate_gpus() {
     return gpus;
 }
 
+// The GPU the network would run on, as a stable identity string for the
+// precompile stamp. Mirrors the pick in auto_configure_gpu_environment above
+// (largest non-virtual adapter, AMD preferred when an AMD discrete is
+// present) -- keep the two in sync: a stamp naming a different GPU than the
+// one this selection lands on must not answer warm, or a machine that
+// swapped graphics cards would skip translating for its new chip.
+inline std::wstring detected_gpu_identity() {
+    auto gpus = enumerate_gpus();
+    const DetectedGpu *best = nullptr;
+    const DetectedGpu *best_amd = nullptr;
+    for (const auto &gpu : gpus) {
+        if (gpu.is_virtual) continue;
+        if (!best || gpu.dedicated_vram_mb > best->dedicated_vram_mb) best = &gpu;
+        if (gpu.vendor_id == 0x1002 &&
+            (!best_amd || gpu.dedicated_vram_mb > best_amd->dedicated_vram_mb))
+            best_amd = &gpu;
+    }
+    if (best_amd && (!best || best->vendor_id != 0x1002 ||
+                     best_amd->dedicated_vram_mb > best->dedicated_vram_mb))
+        best = best_amd;
+    if (!best) {
+        for (const auto &gpu : gpus)
+            if (!gpu.is_software) { best = &gpu; break; }
+    }
+    if (!best) return {};
+    wchar_t ids[64] = {};
+    swprintf(ids, 64, L"|%04X|%04X|%zu", best->vendor_id, best->device_id,
+             best->dedicated_vram_mb);
+    return best->name + ids;
+}
+
 inline void auto_configure_gpu_environment() {
     // 1. Enumerate GPUs via DXGI
     auto gpus = enumerate_gpus();
     if (gpus.empty()) {
-        OutputDebugStringA("[GPU-AutoConfig] No GPU adapters enumerated via DXGI\n");
+        OutputDebugStringA("[GPU-AutoConfig] Warning: CreateDXGIFactory1 failed\n");
         return;
     }
 

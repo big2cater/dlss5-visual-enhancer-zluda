@@ -40,10 +40,16 @@ public:
 public slots:
     void start(const Paths &paths);
     void process(const Image &input, const Settings &settings);
+    // Translates the network into ZLUDA's cache ahead of the first run: the
+    // same work Processor::start would trigger, run on its own so it can be
+    // offered as a button with visible progress instead of a long silent
+    // pause inside the first Enhance.
+    void prewarm(const Paths &paths);
 
 signals:
     void started(bool ok, const QString &message);
     void finished(bool ok, const Image &output, double milliseconds, const QString &message);
+    void prewarmed(bool ok, const QString &message);
 
 private:
     Processor processor_;
@@ -82,7 +88,9 @@ private slots:
     void choose_image();
     void save_result();
     void run();
+    void prewarm();
     void on_started(bool ok, const QString &message);
+    void on_prewarmed(bool ok, const QString &message);
     void on_finished(bool ok, const Image &output, double milliseconds, const QString &message);
     void show_original(bool original);
     // Toggled by the AMD/NVIDIA button. On NVIDIA the driver, the NGX runtime
@@ -112,6 +120,9 @@ private:
     QPushButton *run_button_ = nullptr;
     QPushButton *save_button_ = nullptr;
     QPushButton *compare_button_ = nullptr;
+    // Translates the network into ZLUDA's cache ahead of the first Enhance,
+    // with the module progress visible in the log instead of a silent pause.
+    QPushButton *prewarm_button_ = nullptr;
 
     QPushButton *mode_button_ = nullptr;
     bool nvidia_mode_ = false;

@@ -2,6 +2,7 @@
 #include "half_float.h"
 
 #include "dlss_cuda.h"
+#include "../core/precompile.h"
 
 #include <cstdlib>
 
@@ -244,6 +245,20 @@ void Worker::start(const Paths &paths) {
     emit started(ok, QString::fromStdString(error));
 }
 
+// Translates the network into ZLUDA's cache without loading the rest of the
+// session: no D3D12 device, no network, no window of state to tear down. The
+// module progress arrives through the same log channel the start-up uses, so
+// a machine that is mid-warm-up shows ticking lines instead of silence.
+void Worker::prewarm(const Paths &paths) {
+    std::string error;
+    const bool ok = precompile(
+        paths.snippet, paths.cuda_driver, 0,
+        [](const Progress &progress) { log_to_window(progress.message.c_str()); }, error);
+    const QString message = ok ? QString(tr("The translation cache is ready."))
+                               : QString::fromStdString(error);
+    emit prewarmed(ok, message);
+}
+
 void Worker::process(const Image &input, const Settings &settings) {
     Image output;
     std::string error;
@@ -339,6 +354,7 @@ MainWindow::MainWindow() {
     connect(&worker_thread_, &QThread::finished, worker_, &QObject::deleteLater);
     connect(worker_, &Worker::started, this, &MainWindow::on_started);
     connect(worker_, &Worker::finished, this, &MainWindow::on_finished);
+    connect(worker_, &Worker::prewarmed, this, &MainWindow::on_prewarmed);
     worker_thread_.start();
 
     restore_paths();
@@ -436,10 +452,20 @@ QWidget *MainWindow::build_controls() {
     row->setContentsMargins(0, 0, 0, 0);
     auto *open = new QPushButton(tr("Open image..."), buttons);
     run_button_ = new QPushButton(tr("Enhance"), buttons);
+    // Warm-up is a preparation step, not a conversion: it runs the same
+    // translation the first Enhance would trigger, but on its own, with the
+    // module progress ticking in the log -- a cold machine no longer looks
+    // frozen for the length of a translation.
+    prewarm_button_ = new QPushButton(tr("Warm up cache"), buttons);
+    prewarm_button_->setToolTip(tr("Translates the network into ZLUDA's cache ahead of "
+                                   "time, so the first Enhance starts fast. Unnecessary on "
+                                   "NVIDIA cards -- there the driver runs the network directly."));
+    connect(prewarm_button_, &QPushButton::clicked, this, &MainWindow::prewarm);
     save_button_ = new QPushButton(tr("Save result..."), buttons);
     run_button_->setEnabled(false);
     save_button_->setEnabled(false);
     row->addWidget(open);
+    row->addWidget(prewarm_button_);
     row->addWidget(run_button_);
     row->addWidget(save_button_);
     layout->addWidget(buttons);
@@ -536,6 +562,9 @@ QWidget *MainWindow::build_paths() {
 void MainWindow::set_nvidia_mode(bool nvidia) {
     nvidia_mode_ = nvidia;
     mode_button_->setText(nvidia ? tr("Mode: NVIDIA") : tr("Mode: AMD (ZLUDA)"));
+    // NVIDIA's driver runs the network directly; there is nothing to
+    // translate, so the warm-up has no purpose there.
+    prewarm_button_->setEnabled(!nvidia);
 
     for (QWidget *row : {driver_row_, nvapi_row_}) row->setVisible(!nvidia);
 
@@ -730,6 +759,7 @@ void MainWindow::show_original(bool original) {
 void MainWindow::set_busy(bool busy) {
     busy_ = busy;
     run_button_->setEnabled(!busy && !input_.empty());
+    prewarm_button_->setEnabled(!busy && !nvidia_mode_);
     save_button_->setEnabled(!busy && have_output_);
     compare_button_->setEnabled(!busy && have_output_);
 }
@@ -777,6 +807,41 @@ void MainWindow::on_started(bool ok, const QString &message) {
     }
     QMetaObject::invokeMethod(worker_, "process", Qt::QueuedConnection, Q_ARG(Image, input_),
                               Q_ARG(Settings, current_settings()));
+}
+
+// The warm-up needs only the network and, on AMD, the driver: it never loads
+// the NGX runtime or NVAPI, and on NVIDIA there is nothing to translate at
+// all -- the driver runs the network as it is.
+void MainWindow::prewarm() {
+    if (nvidia_mode_) {
+        status_->setText(tr("NVIDIA cards run the network directly -- there is nothing to warm up."));
+        return;
+    }
+    if (snippet_path_->text().isEmpty() || driver_path_->text().isEmpty()) {
+        QMessageBox::warning(this, tr("Warm up cache"),
+                             tr("The network and the CUDA driver have to be pointed at "
+                                "before the cache can be warmed."));
+        return;
+    }
+    set_busy(true);
+    status_->setText(tr("Warming up the translation cache. On a cold machine this "
+                        "takes a while; the log shows each module as it lands."));
+    Paths paths;
+    paths.snippet = to_wide(snippet_path_->text());
+    paths.cuda_driver = to_wide(driver_path_->text());
+    paths.ngx_runtime = to_wide(runtime_path_->text());
+    paths.nvapi = to_wide(nvapi_path_->text());
+    QMetaObject::invokeMethod(worker_, "prewarm", Qt::QueuedConnection, Q_ARG(Paths, paths));
+}
+
+void MainWindow::on_prewarmed(bool ok, const QString &message) {
+    set_busy(false);
+    if (ok) {
+        status_->setText(tr("Cache ready. The next Enhance starts fast."));
+    } else {
+        status_->setText(tr("Warm-up failed"));
+        QMessageBox::critical(this, tr("Warm up cache"), message);
+    }
 }
 
 void MainWindow::on_finished(bool ok, const Image &output, double milliseconds,

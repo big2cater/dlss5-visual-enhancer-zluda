@@ -134,6 +134,17 @@ unsigned long long cache_database_bytes(const std::wstring &directory) {
     return total;
 }
 
+std::string to_utf8(const std::wstring &text) {
+    if (text.empty()) return {};
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(),
+                                    nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return {};
+    std::string out(bytes, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), out.data(), bytes,
+                        nullptr, nullptr);
+    return out;
+}
+
 void write_precompile_stamp(const std::wstring &library, const std::wstring &driver) {
     const std::wstring directory = cache_directory();
     if (directory.empty()) return;
@@ -141,13 +152,21 @@ void write_precompile_stamp(const std::wstring &library, const std::wstring &dri
     // lives; stamping here would let a cold machine skip precompile forever.
     const unsigned long long db_bytes = cache_database_bytes(directory);
     if (db_bytes == 0) return;
+    // The compiled kernels are keyed to the chip they were translated for, so
+    // the stamp names the GPU too: a machine that swapped graphics cards must
+    // not skip precompile on the word of a stamp written for the old one.
+    const std::wstring gpu = dlssnr::detected_gpu_identity();
+    if (gpu.empty()) return;
+    const std::string gpu_utf8 = to_utf8(gpu);
+    if (gpu_utf8.empty()) return;
     FileStamp snippet{};
     FileStamp cuda{};
     if (!file_stamp(library, snippet) || !file_stamp(driver, cuda)) return;
     CreateDirectoryW(directory.c_str(), nullptr);
     std::ofstream out(directory + kStampName);
     if (!out) return;
-    out << "v1\n"
+    out << "v2\n"
+        << "gpu " << gpu_utf8 << "\n"
         << "snippet " << snippet.size << " " << snippet.mtime << "\n"
         << "driver " << cuda.size << " " << cuda.mtime << "\n"
         << "db " << db_bytes << "\n";
@@ -437,18 +456,31 @@ bool precompile_cache_is_warm(const std::wstring &library, const std::wstring &d
     std::ifstream in(directory + kStampName);
     if (!in) return false;
     std::string line;
-    if (!std::getline(in, line) || line != "v1") return false;
+    if (!std::getline(in, line) || line != "v2") return false;
+    // The GPU the stamp was written for must still be the GPU present: the
+    // cache entries it vouches for are keyed to that chip. An environment
+    // without an identifiable GPU answers not warm rather than guessing.
+    std::wstring gpu = dlssnr::detected_gpu_identity();
+    if (gpu.empty()) return false;
+    const std::string gpu_utf8 = to_utf8(gpu);
     unsigned long long snippet_size = 0, snippet_mtime = 0;
     unsigned long long driver_size = 0, driver_mtime = 0;
     unsigned long long db_bytes = 0;
+    std::string gpu_line;
+    bool gpu_seen = false;
     while (std::getline(in, line)) {
         std::istringstream fields(line);
         std::string kind;
         fields >> kind;
-        if (kind == "snippet") fields >> snippet_size >> snippet_mtime;
+        if (kind == "gpu") {
+            gpu_line = line.size() > 4 ? line.substr(4) : std::string();
+            gpu_seen = true;
+        }
+        else if (kind == "snippet") fields >> snippet_size >> snippet_mtime;
         else if (kind == "driver") fields >> driver_size >> driver_mtime;
         else if (kind == "db") fields >> db_bytes;
     }
+    if (!gpu_seen || gpu_line != gpu_utf8) return false;
     if (db_bytes == 0) return false;
     FileStamp snippet{};
     FileStamp cuda{};
