@@ -300,6 +300,11 @@ struct InputFrame {
     enhancer::Image motion;
     bool reset = false;
     bool is_eos = false;
+    // Does this frame carry visible content? Sampled from the decoded rgb48
+    // bytes in the reader: fade-in openings start from pure black, and a
+    // black output for a black input is the network doing its job -- the
+    // blank verdict only means failure when the input carries signal.
+    bool input_has_signal = false;
     ID3D12Resource *upload_buf = nullptr;
     void *mapped_ptr = nullptr;
 
@@ -1820,6 +1825,7 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
     }
 };
 bool output_is_blank(const enhancer::Image &); // defined below the mode
+bool image_has_signal(const enhancer::Image &); // defined below the mode
 
 bool load_image(IWICImagingFactory *wic, const std::wstring &path, enhancer::Image &image) {
     IWICBitmapDecoder *decoder = nullptr;
@@ -1985,7 +1991,7 @@ int run_image_mode(int argc, char **argv) {
         }
         return 1;
     }
-    const bool blank = output_is_blank(out);
+    const bool blank = output_is_blank(out) && image_has_signal(in);
     if (blank)
         fprintf(stderr, "[warn] 输出空白：本轮求值竞态，交给外层重跑\n");
     else if (comp_opts.is_active()) {
@@ -2020,23 +2026,45 @@ bool output_is_blank(const enhancer::Image &image) {
     const size_t step = 8;
     double sum = 0.0, sum_sq = 0.0;
     size_t samples = 0;
-    float max_luma = 0.0f;
+    float max_channel = 0.0f;
     for (size_t i = 0; i < count; i += step) {
         const float r = enhancer::half_to_float(src[i * 4 + 0]);
         const float g = enhancer::half_to_float(src[i * 4 + 1]);
         const float b = enhancer::half_to_float(src[i * 4 + 2]);
-        const float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-        if (luma > max_luma) max_luma = luma;
-        sum += luma;
-        sum_sq += (double)luma * luma;
+        // The per-channel maximum, not luma: luma weights blue at 0.0722, so
+        // a correctly-rendered saturated blue frame dips under any luma bar
+        // and reads as blank. All channels near zero is the actual signature
+        // of a failed launch.
+        const float mx = (std::max)((std::max)(r, g), b);
+        if (mx > max_channel) max_channel = mx;
+        sum += mx;
+        sum_sq += (double)mx * mx;
         ++samples;
     }
     if (samples == 0) return true;
     const double mean = sum / (double)samples;
     const double variance = sum_sq / (double)samples - mean * mean;
-    // A true blank output from a failed GPU launch has max_luma near zero (< 0.005)
-    // and almost zero variance (< 0.0001). A valid dark photograph/screenshot has real highlights.
-    return (max_luma < 0.005f) || (mean < 0.002 && variance < 0.0001);
+    // A true blank output from a failed GPU launch has max_channel near zero
+    // (< 0.005) and almost zero variance (< 0.0001). A valid dark
+    // photograph/screenshot keeps at least one channel with real highlights.
+    return (max_channel < 0.005f) || (mean < 0.002 && variance < 0.0001);
+}
+
+// True when the input picture carries visible content (any sampled sRGB-encoded
+// half above roughly 38/255). Dark frames -- fade-in openings, night scenes --
+// legitimately produce a near-black output, so the blank verdict on the output
+// must be gated by this.
+bool image_has_signal(const enhancer::Image &image) {
+    if (image.empty()) return false;
+    const uint16_t *src = image.pixels.data();
+    const size_t count = (size_t)image.width * image.height;
+    for (size_t i = 0; i < count; i += 8) {
+        if (enhancer::half_to_float(src[i * 4 + 0]) > 0.15f ||
+            enhancer::half_to_float(src[i * 4 + 1]) > 0.15f ||
+            enhancer::half_to_float(src[i * 4 + 2]) > 0.15f)
+            return true;
+    }
+    return false;
 }
 
 static int run_parallel_orchestrator(int argc, char **argv, const Options &options,
@@ -2643,6 +2671,18 @@ static int run_main_once(int argc, char **argv) {
             frame->index = dec_index;
             frame->is_eos = false;
 
+            // Sample the frame's own brightness (sRGB-encoded 16-bit rgb48).
+            // Every 64th pixel is plenty: this only tells black-lead-in apart
+            // from real content.
+            unsigned max16 = 0;
+            for (size_t p = 0; p + 5 < (size_t)frame_bytes; p += 6 * 64) {
+                const unsigned r = dst_raw[p] | (unsigned)(dst_raw[p + 1] << 8);
+                const unsigned g = dst_raw[p + 2] | (unsigned)(dst_raw[p + 3] << 8);
+                const unsigned b = dst_raw[p + 4] | (unsigned)(dst_raw[p + 5] << 8);
+                max16 = std::max({max16, r, g, b});
+            }
+            frame->input_has_signal = max16 > 7000; // sRGB ~27/255: below this a correct output is itself under the blank bar, and the two are indistinguishable
+
             // Reset determination
             bool reset = false;
             switch (options.reset) {
@@ -2826,13 +2866,24 @@ static int run_main_once(int argc, char **argv) {
                               .count();
         elapsed_total.store(elapsed_total.load() + ms);
 
-        // Check if first frame came out blank (ZLUDA sticky race)
-        if (in_frame->index == 0 && output_is_blank(out_frame->out)) {
-            fprintf(stderr, "[FAIL] 首帧输出空白（本轮竞态），交由外层重跑\n");
-            failed = true;
-            retryable = true;
-            abort_pipeline.store(true);
-            break;
+        // Guard against the ZLUDA sticky race (a launch that silently no-ops
+        // and leaves the frame black) -- but only when the INPUT actually
+        // carries signal: cinematic videos open on a fade-in from black, and
+        // a black output for a black input is the network doing its job.
+        // Checked over the first ~2 seconds of frames; a launch race blanks
+        // every frame, dark content does not.
+        if (in_frame->index < 64 && output_is_blank(out_frame->out)) {
+            if (in_frame->input_has_signal) {
+                fprintf(stderr, "[FAIL] frame %u: 输出空白而输入有内容（ZLUDA 竞态），交由外层重跑\n",
+                        in_frame->index);
+                failed = true;
+                retryable = true;
+                abort_pipeline.store(true);
+                break;
+            }
+            if (in_frame->index == 0) {
+                fprintf(stderr, "[info] 首帧为黑场（输入无信号），跳过空白判定\n");
+            }
         }
 
         out_frame->index = in_frame->index;
