@@ -387,9 +387,17 @@ bool spawn(const std::wstring &command, Pipe &feed /*child stdin*/, Pipe &collec
 }
 
 bool wait_exit(HANDLE process, DWORD timeout_ms, DWORD &code) {
-    if (WaitForSingleObject(process, timeout_ms) != WAIT_OBJECT_0) return false;
+    if (!process) { code = 1; return false; }
+    DWORD wr = WaitForSingleObject(process, timeout_ms);
+    if (wr != WAIT_OBJECT_0) {
+        if (wr == WAIT_TIMEOUT) {
+            TerminateProcess(process, 1);
+        }
+        code = 1;
+        return false;
+    }
     code = 1;
-    GetExitCodeProcess(process, &code);
+    if (!GetExitCodeProcess(process, &code)) return false;
     return true;
 }
 
@@ -454,12 +462,37 @@ bool probe_video(const std::wstring &input, VideoParams &params, std::string &er
     std::string text;
     char buffer[512];
     DWORD read = 0;
-    while (ReadFile(pipe.read_end, buffer, sizeof buffer, &read, nullptr) && read) {
-        text.append(buffer, read);
+    const auto probe_start = std::chrono::steady_clock::now();
+    while (true) {
+        DWORD avail = 0;
+        if (PeekNamedPipe(pipe.read_end, nullptr, 0, nullptr, &avail, nullptr)) {
+            if (avail > 0) {
+                if (ReadFile(pipe.read_end, buffer, sizeof buffer, &read, nullptr) && read) {
+                    text.append(buffer, read);
+                    continue;
+                }
+            }
+        }
+        DWORD exit_code = STILL_ACTIVE;
+        if (GetExitCodeProcess(child.process, &exit_code) && exit_code != STILL_ACTIVE) {
+            while (ReadFile(pipe.read_end, buffer, sizeof buffer, &read, nullptr) && read) {
+                text.append(buffer, read);
+            }
+            break;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - probe_start).count() > 15000) {
+            TerminateProcess(child.process, 1);
+            pipe.close();
+            child.close();
+            error = "ffprobe timed out after 15s (process terminated)";
+            return false;
+        }
+        Sleep(10);
     }
     pipe.close();
     DWORD code = 1;
-    if (!wait_exit(child.process, 15000, code) || code != 0) {
+    if (!wait_exit(child.process, 2000, code) || code != 0) {
         error = "ffprobe failed (code " + std::to_string(code) + "): " + text;
         child.close();
         return false;
@@ -1222,15 +1255,25 @@ void usage() {
 }
 
 bool parse_args(int argc, char **argv, Options &options) {
-    if (argc < 7) { usage(); return false; }
+    if (argc < 5) { usage(); return false; }
     options.input = widen(argv[1]);
     options.output = widen(argv[2]);
     options.snippet = widen(argv[3]);
     options.driver = widen(argv[4]);
-    options.runtime = argc > 5 ? widen(argv[5]) : L"nvngx.dll";
-    options.nvapi = argc > 6 ? widen(argv[6]) : L"nvapi64.dll";
+    options.runtime = L"nvngx.dll";
+    options.nvapi = L"nvapi64.dll";
 
-    for (int i = 7; i < argc; ++i) {
+    int arg_start = 5;
+    if (argc > 5 && argv[5][0] != '-') {
+        options.runtime = widen(argv[5]);
+        arg_start = 6;
+        if (argc > 6 && argv[6][0] != '-') {
+            options.nvapi = widen(argv[6]);
+            arg_start = 7;
+        }
+    }
+
+    for (int i = arg_start; i < argc; ++i) {
         const std::string arg = argv[i];
         auto need = [&](const char *name) -> const char * {
             if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", name); return nullptr; }
@@ -1239,6 +1282,8 @@ bool parse_args(int argc, char **argv, Options &options) {
         if (arg == "--passes") {
             const char *v = need("--passes"); if (!v) return false;
             options.settings.passes = atoi(v);
+            if (options.settings.passes < 1) options.settings.passes = 1;
+            if (options.settings.passes > 10) options.settings.passes = 10;
         } else if (arg == "--reset") {
             const char *v = need("--reset"); if (!v) return false;
             if (!strcmp(v, "auto")) options.reset = ResetMode::Auto;
@@ -1252,6 +1297,8 @@ bool parse_args(int argc, char **argv, Options &options) {
         } else if (arg == "--cut-threshold") {
             const char *v = need("--cut-threshold"); if (!v) return false;
             options.cut_threshold = atof(v);
+            if (options.cut_threshold < 0.0) options.cut_threshold = 0.0;
+            if (options.cut_threshold > 1.0) options.cut_threshold = 1.0;
         } else if (arg == "--gamma") {
             const char *v = need("--gamma"); if (!v) return false;
             options.gamma = atof(v);
@@ -1274,10 +1321,6 @@ bool parse_args(int argc, char **argv, Options &options) {
         } else if (arg == "--dlss-model-preset") {
             const char *v = need("--dlss-model-preset"); if (!v) return false;
             options.dlss_model_preset = v;
-        } else if (arg == "--retries") {
-            // Consumed by the outer process-level retry wrapper; accept it here
-            // so the video argument list rejects nothing.
-            if (!need("--retries")) return false;
         } else if (arg == "--flow-only") {
             // Diagnostic short-circuit handled later in run_main_once; just
             // accept the flag here.
@@ -1299,9 +1342,13 @@ bool parse_args(int argc, char **argv, Options &options) {
         } else if (arg == "--style") {
             const char *v = need("--style"); if (!v) return false;
             options.settings.style = atoi(v);
+            if (options.settings.style < 0) options.settings.style = 0;
+            if (options.settings.style > 3) options.settings.style = 3;
         } else if (arg == "--preset") {
             const char *v = need("--preset"); if (!v) return false;
             options.settings.preset = atoi(v);
+            if (options.settings.preset < 0) options.settings.preset = 0;
+            if (options.settings.preset > 3) options.settings.preset = 3;
         } else if (arg == "--no-auto-mask") {
             options.settings.auto_mask = false;
         } else if (arg == "--output-mix") {
@@ -1319,6 +1366,8 @@ bool parse_args(int argc, char **argv, Options &options) {
         } else if (arg == "--crf") {
             const char *v = need("--crf"); if (!v) return false;
             options.crf = atoi(v);
+            if (options.crf < 0) options.crf = 0;
+            if (options.crf > 51) options.crf = 51;
         } else if (arg == "--encoder") {
             const char *v = need("--encoder"); if (!v) return false;
             options.encoder = v;
@@ -1330,6 +1379,10 @@ bool parse_args(int argc, char **argv, Options &options) {
         } else if (arg == "--max-frames") {
             const char *v = need("--max-frames"); if (!v) return false;
             options.max_frames = atoi(v);
+            if (options.max_frames < 0) {
+                fprintf(stderr, "[warn] --max-frames must be non-negative; set to 0\n");
+                options.max_frames = 0;
+            }
         } else if (arg == "--yield-ms") {
             const char *v = need("--yield-ms"); if (!v) return false;
             options.yield_ms = atoi(v);
@@ -1809,6 +1862,8 @@ int run_image_mode(int argc, char **argv) {
     enhancer::Settings settings;
     settings.passes = 3; // stills settle over a few evaluations
     int retries = 3;     // blank-output races are re-evaluated this many times
+    double upscale_factor = 1.0;
+    double model_scale = 1.0;
     CompositeOptions comp_opts;
     enhancer::Paths paths;
     paths.snippet = widen(argv[4]);
@@ -1839,8 +1894,20 @@ int run_image_mode(int argc, char **argv) {
         else if (arg == "--glow-control") { const char *v = need("--glow-control"); if (!v) return 1; comp_opts.glow_control = (float)atof(v); }
         else if (arg == "--precompile-wait") { /* shell flag, ignore */ }
         else if (arg == "--retry-delay") { need("--retry-delay"); }
-        else if (arg == "--upscale-mode" || arg == "--upscale") { need(arg.c_str()); }
-        else if (arg == "--model-scale") { need("--model-scale"); }
+        else if (arg == "--upscale-mode" || arg == "--upscale") {
+            const char *v = need(arg.c_str()); if (!v) return 1;
+            if (!_stricmp(v, "quality")) upscale_factor = 1.5;
+            else if (!_stricmp(v, "balanced")) upscale_factor = 1.724;
+            else if (!_stricmp(v, "performance")) upscale_factor = 2.0;
+            else if (!_stricmp(v, "ultra")) upscale_factor = 3.0;
+            else { double f = atof(v); if (f >= 1.0) upscale_factor = f; }
+        }
+        else if (arg == "--model-scale") {
+            const char *v = need("--model-scale"); if (!v) return 1;
+            model_scale = atof(v);
+            if (model_scale < 0.25) model_scale = 0.25;
+            if (model_scale > 1.0) model_scale = 1.0;
+        }
         else if (arg == "--flow" || arg == "--no-flow" || arg == "--flow-only") { /* ignore */ }
         else if (arg == "--cut-threshold") { need("--cut-threshold"); }
         else if (arg == "--crf") { need("--crf"); }
@@ -1870,7 +1937,14 @@ int run_image_mode(int argc, char **argv) {
         wic->Release();
         return 1;
     }
-    fprintf(stderr, "[info] image %ux%u, %d passes\n", in.width, in.height, settings.passes);
+    if (upscale_factor > 1.0) {
+        settings.output_width = ((unsigned)std::round(in.width * upscale_factor)) & ~1u;
+        settings.output_height = ((unsigned)std::round(in.height * upscale_factor)) & ~1u;
+        fprintf(stderr, "[info] image %ux%u -> %ux%u (upscale %.2fx), %d passes\n",
+                in.width, in.height, settings.output_width, settings.output_height, upscale_factor, settings.passes);
+    } else {
+        fprintf(stderr, "[info] image %ux%u, %d passes\n", in.width, in.height, settings.passes);
+    }
     if (comp_opts.is_active()) {
         fprintf(stderr, "[composite] 画面合成与防起雾已开启: 混合=%.0f%%, 细节=%.0f%%, 暗部保护=%.0f%%, 高光=%.0f%%\n",
                 comp_opts.output_mix * 100.0f,
@@ -1986,7 +2060,7 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
     _wremove(concat_list_path.c_str());
 
     auto build_worker_cmd = [&](const std::wstring &chunk_out, double start_s, double dur_s,
-                                double warmup_s, unsigned frame_offset) -> std::wstring {
+                                double warmup_s, unsigned frame_offset, int worker_max_frames) -> std::wstring {
         std::wstring cmd = L"\"" + self_exe + L"\"";
         for (int i = 1; i < argc; ++i) {
             std::wstring arg = widen(argv[i]);
@@ -1994,6 +2068,8 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
                 cmd += L" \"" + chunk_out + L"\"";
             } else if (arg == L"--parallel") {
                 cmd += L" --parallel off";
+                if (i + 1 < argc && argv[i + 1][0] != '-') ++i; // skip value
+            } else if (arg == L"--max-frames") {
                 if (i + 1 < argc && argv[i + 1][0] != '-') ++i; // skip value
             } else {
                 if (arg.find(L' ') != std::wstring::npos) {
@@ -2009,12 +2085,29 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
         if (budget.ffmpeg_threads_per_worker > 0) {
             cmd += L" --ffmpeg-threads " + std::to_wstring(budget.ffmpeg_threads_per_worker);
         }
+        if (worker_max_frames > 0) {
+            cmd += L" --max-frames " + std::to_wstring(worker_max_frames);
+        }
         return cmd;
     };
 
-    std::wstring cmd0 = build_worker_cmd(out_part0, 0.0, split_sec, 0.0, 0);
+    int w0_max = 0;
+    int w1_max = 0;
+    if (options.max_frames > 0) {
+        unsigned w0_estimated = (unsigned)std::round(split_sec * params.fps);
+        w0_max = (int)std::min((unsigned)options.max_frames, w0_estimated);
+        int rem = options.max_frames - w0_max;
+        if (rem > 0) {
+            unsigned w1_warmup = (unsigned)std::round(warmup_sec * params.fps);
+            w1_max = rem + (int)w1_warmup;
+        } else {
+            w1_max = 1;
+        }
+    }
+
+    std::wstring cmd0 = build_worker_cmd(out_part0, 0.0, split_sec, 0.0, 0, w0_max);
     std::wstring cmd1 = build_worker_cmd(out_part1, split_sec, total_dur - split_sec, warmup_sec,
-                                         (unsigned)std::round(split_sec * params.fps));
+                                         (unsigned)std::round(split_sec * params.fps), w1_max);
 
     STARTUPINFOW si0{}, si1{};
     si0.cb = sizeof(si0);
@@ -2053,8 +2146,19 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
 
     HANDLE handles[2] = { pi0.hProcess, pi1.hProcess };
     DWORD code0 = STILL_ACTIVE, code1 = STILL_ACTIVE;
+    const auto wait_start = std::chrono::steady_clock::now();
+    const double max_wall_sec = std::max(120.0, total_dur * 60.0);
+    bool timed_out = false;
+
     while (true) {
-        WaitForMultipleObjects(2, handles, FALSE, 500);
+        DWORD wr = WaitForMultipleObjects(2, handles, FALSE, 500);
+        if (wr == WAIT_FAILED) {
+            fprintf(stderr, "[FAIL] WaitForMultipleObjects 句柄等待异常 (错误码 %lu)，终止分片...\n", GetLastError());
+            TerminateProcess(pi0.hProcess, 1);
+            TerminateProcess(pi1.hProcess, 1);
+            code0 = code1 = 1;
+            break;
+        }
         GetExitCodeProcess(pi0.hProcess, &code0);
         GetExitCodeProcess(pi1.hProcess, &code1);
         if (code0 != STILL_ACTIVE && code0 != 0) {
@@ -2070,6 +2174,16 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
         if (code0 != STILL_ACTIVE && code1 != STILL_ACTIVE) {
             break;
         }
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed_s = std::chrono::duration<double>(now - wait_start).count();
+        if (elapsed_s > max_wall_sec) {
+            fprintf(stderr, "[FAIL] 分片工作进程超时挂死 (已耗时 %.1f 秒 > 限制 %.1f 秒)，强制终止...\n", elapsed_s, max_wall_sec);
+            TerminateProcess(pi0.hProcess, 1);
+            TerminateProcess(pi1.hProcess, 1);
+            timed_out = true;
+            code0 = code1 = 1;
+            break;
+        }
     }
 
     CloseHandle(pi0.hProcess);
@@ -2077,8 +2191,8 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
     CloseHandle(pi1.hProcess);
     CloseHandle(pi1.hThread);
 
-    if (code0 != 0 || code1 != 0) {
-        fprintf(stderr, "[FAIL] 分片处理异常退出 (分片0: %lu, 分片1: %lu)\n", code0, code1);
+    if (code0 != 0 || code1 != 0 || timed_out) {
+        fprintf(stderr, "[FAIL] 分片处理异常退出 (分片0: %lu, 分片1: %lu%s)\n", code0, code1, timed_out ? ", 超时" : "");
         _wremove(out_part0.c_str());
         _wremove(out_part1.c_str());
         _wremove(concat_list_path.c_str());
@@ -2470,6 +2584,7 @@ static int run_main_once(int argc, char **argv) {
     std::atomic<int> blank_count{0};
     std::atomic<double> elapsed_total{0.0};
     std::atomic<unsigned> frames_written{0};
+    std::atomic<unsigned> frames_written_count{0};
     std::atomic<bool> failed{false};
     std::atomic<bool> retryable{false};
     const auto pipeline_began = std::chrono::steady_clock::now();
@@ -2528,30 +2643,31 @@ static int run_main_once(int argc, char **argv) {
             // When post-composite is active, CPU also needs in_frame->in in linear half-float RGBA
             // to composite with out_frame->out.
             if (!frame->mapped_ptr || options.comp_opts.is_active()) {
-                const unsigned char *src_raw = frame->mapped_ptr ? (const unsigned char *)frame->mapped_ptr : frame->raw_bytes.data();
-                rgb48_to_half_rgba(src_raw, frame->in);
+                rgb48_to_half_rgba(dst_raw, frame->in);
+            }
+            if (frame->mapped_ptr) {
+                frame->raw_bytes.clear();
+                frame->raw_bytes.shrink_to_fit();
             }
 
-            // If CPU flow is used, compute it in worker thread
-            if (options.flow && !gpu_flow_ready) {
-                flowgen.compute(dst_raw, model_w, model_h, reset, frame->motion.pixels);
-            }
-
-
-            if (!ready_input_channel.push(frame)) break;
+            ready_input_channel.push(frame);
             ++dec_index;
         }
 
-        // Push EOS to signal Stage 2
-        auto eos_frame = std::make_shared<InputFrame>();
-        eos_frame->is_eos = true;
-        ready_input_channel.push(eos_frame);
+        // Send EOS frame to Stage 2
+        auto eos_in = std::make_shared<InputFrame>();
+        eos_in->is_eos = true;
+        ready_input_channel.push(eos_in);
     });
 
-    // Stage 3: Encoder writer & postprocessor thread
+    // Stage 3: Encoder writer thread
     std::thread encode_thread([&]() {
+        IWICImagingFactory *wic = nullptr;
+        bool dump_ok = false;
         if (!options.dump_dir.empty()) {
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            dump_ok = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                                 CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)));
         }
         while (!abort_pipeline.load()) {
             std::shared_ptr<OutputFrame> frame;
@@ -2570,6 +2686,10 @@ static int run_main_once(int argc, char **argv) {
             if (blank) {
                 blank_count.fetch_add(1);
                 fprintf(stderr, "[warn] frame %u output looks blank\n", frame->index);
+                failed = true;
+                retryable = true;
+                abort_pipeline.store(true);
+                break;
             }
 
             DWORD written = 0;
@@ -2583,18 +2703,21 @@ static int run_main_once(int argc, char **argv) {
                 break;
             }
 
-            if (!options.dump_dir.empty() && dump_ok) {
-                wchar_t name[512];
-                swprintf(name, 512, L"%s\\frame_%05u.png", options.dump_dir.c_str(), frame->index);
-                if (!dump_png(wic, name, frame->out))
-                    fprintf(stderr, "[warn] could not dump frame %u\n", frame->index);
-            }
-
             unsigned display_idx = frame->index;
             if (options.is_child_chunk) {
-                display_idx = (frame->index - options.warmup_discard_frames) + options.frame_index_offset;
+                int diff = (int)frame->index - (int)options.warmup_discard_frames;
+                display_idx = (diff > 0 ? (unsigned)diff : 0) + options.frame_index_offset;
             }
+
+            if (!options.dump_dir.empty() && dump_ok) {
+                wchar_t name[512];
+                swprintf(name, 512, L"%s\\frame_%05u.png", options.dump_dir.c_str(), display_idx);
+                if (!dump_png(wic, name, frame->out))
+                    fprintf(stderr, "[warn] could not dump frame %u\n", display_idx);
+            }
+
             frames_written.store(display_idx + 1);
+            frames_written_count.fetch_add(1);
             if ((display_idx % 5) == 0 || (frame->index < 5)) {
                 fprintf(stderr, "[%.5u] %.0f ms (avg %.1f, reset=%d, blanks=%d)\n",
                         display_idx, frame->ms,
@@ -2605,6 +2728,7 @@ static int run_main_once(int argc, char **argv) {
 
             free_output_pool.push(frame);
         }
+        if (wic) wic->Release();
         if (!options.dump_dir.empty()) {
             CoUninitialize();
         }
@@ -2722,8 +2846,6 @@ static int run_main_once(int argc, char **argv) {
     if (abort_pipeline.load()) {
         if (decoder.process) TerminateProcess(decoder.process, 1);
         if (encoder.process) TerminateProcess(encoder.process, 1);
-        decoder_stdout.close();
-        encoder_stdin.close();
         if (decode_thread.native_handle()) CancelSynchronousIo((HANDLE)decode_thread.native_handle());
         if (encode_thread.native_handle()) CancelSynchronousIo((HANDLE)encode_thread.native_handle());
         free_input_pool.close();
@@ -2739,7 +2861,7 @@ static int run_main_once(int argc, char **argv) {
                                std::chrono::steady_clock::now() - pipeline_began)
                                .count();
 
-    // --- finish the pipes ------------------------------------------------
+    // --- finish the pipes safely AFTER threads have joined ---
     decoder_stdout.close();
     encoder_stdin.close();
 
@@ -2747,7 +2869,6 @@ static int run_main_once(int argc, char **argv) {
     wait_exit(decoder.process, 15000, decoder_code);
     wait_exit(encoder.process, 60000, encoder_code);
 
-    if (wic) wic->Release();
     processor.stop();
     decoder.close();
     encoder.close();
@@ -2761,7 +2882,7 @@ static int run_main_once(int argc, char **argv) {
         failed.store(true);
     }
 
-    const unsigned total_done = frames_written.load();
+    const unsigned total_done = frames_written_count.load();
     const double total_eval_ms = elapsed_total.load();
     fprintf(stderr,
             "[done] %u frames in %.2f s (%.2f fps throughput, avg GPU %.1f ms), resets=%d, blanks=%d%s\n",
@@ -2770,6 +2891,10 @@ static int run_main_once(int argc, char **argv) {
             total_done ? (total_eval_ms / total_done) : 0.0,
             reset_count.load(), blank_count.load(),
             failed.load() ? " -- FAILED" : "");
+    if (blank_count.load() > 0) {
+        failed.store(true);
+        retryable.store(true);
+    }
     // 2 = retryable failure (blank race) -> outer main() re-runs this program.
     return failed.load() ? (retryable.load() ? 2 : 1) : 0;
 }

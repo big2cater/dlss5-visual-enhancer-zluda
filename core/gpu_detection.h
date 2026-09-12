@@ -106,15 +106,14 @@ inline void auto_configure_gpu_environment() {
         std::wstring name_lower = best_gpu->name;
         std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::towlower);
 
-        // Check for RDNA 4 (RX 9000 series, 9070/9060/9080, Navi 48/44, or device IDs 0x7480..0x749F)
+        // Check for RDNA 4 (RX 9000 series, 9070/9060/9080/9090, Navi 48/44, or device IDs 0x7480..0x74DF)
         bool is_rdna4 = (name_lower.find(L"9070") != std::wstring::npos ||
                          name_lower.find(L"9060") != std::wstring::npos ||
                          name_lower.find(L"9080") != std::wstring::npos ||
+                         name_lower.find(L"9090") != std::wstring::npos ||
                          name_lower.find(L"rx 9") != std::wstring::npos ||
-                         name_lower.find(L"rdna 4") != std::wstring::npos ||
-                         name_lower.find(L"rdna4") != std::wstring::npos ||
-                         name_lower.find(L"navi 4") != std::wstring::npos ||
-                         (best_gpu->device_id >= 0x7480 && best_gpu->device_id <= 0x749F));
+                         name_lower.find(L"radeon 9") != std::wstring::npos ||
+                         (best_gpu->device_id >= 0x7480 && best_gpu->device_id <= 0x74DF));
 
         char msg[512] = {};
         if (is_rdna4) {

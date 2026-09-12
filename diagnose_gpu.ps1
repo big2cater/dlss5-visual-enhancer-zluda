@@ -40,25 +40,29 @@ public class HipDiag {
             int err = Marshal.GetLastWin32Error();
             return "LoadLibrary failed (win32 error: " + err + ")";
         }
-        IntPtr pFunc = GetProcAddress(h, "hipGetDeviceCount");
-        if (pFunc == IntPtr.Zero) {
-            return "hipGetDeviceCount not exported";
-        }
-        var func = (hipGetDeviceCountDelegate)Marshal.GetDelegateForFunctionPointer(pFunc, typeof(hipGetDeviceCountDelegate));
-        int count = -1;
-        int res = func(out count);
-        string ret = "hipGetDeviceCount -> status=" + res + " (" + (res == 0 ? "SUCCESS" : (res == 100 ? "hipErrorNoDevice" : "Error " + res)) + "), count=" + count;
-        if (res == 0 && count > 0) {
-            IntPtr pName = GetProcAddress(h, "hipDeviceGetName");
-            if (pName != IntPtr.Zero) {
-                var funcName = (hipDeviceGetNameDelegate)Marshal.GetDelegateForFunctionPointer(pName, typeof(hipDeviceGetNameDelegate));
-                byte[] nameBuf = new byte[256];
-                funcName(nameBuf, 256, 0);
-                string devName = System.Text.Encoding.ASCII.GetString(nameBuf).TrimEnd('\0');
-                ret += " [GPU 0: " + devName + "]";
+        try {
+            IntPtr pFunc = GetProcAddress(h, "hipGetDeviceCount");
+            if (pFunc == IntPtr.Zero) {
+                return "hipGetDeviceCount not exported";
             }
+            var func = (hipGetDeviceCountDelegate)Marshal.GetDelegateForFunctionPointer(pFunc, typeof(hipGetDeviceCountDelegate));
+            int count = -1;
+            int res = func(out count);
+            string ret = "hipGetDeviceCount -> status=" + res + " (" + (res == 0 ? "SUCCESS" : (res == 100 ? "hipErrorNoDevice" : "Error " + res)) + "), count=" + count;
+            if (res == 0 && count > 0) {
+                IntPtr pName = GetProcAddress(h, "hipDeviceGetName");
+                if (pName != IntPtr.Zero) {
+                    var funcName = (hipDeviceGetNameDelegate)Marshal.GetDelegateForFunctionPointer(pName, typeof(hipDeviceGetNameDelegate));
+                    byte[] nameBuf = new byte[256];
+                    funcName(nameBuf, 256, 0);
+                    string devName = System.Text.Encoding.ASCII.GetString(nameBuf).TrimEnd('\0');
+                    ret += " [GPU 0: " + devName + "]";
+                }
+            }
+            return ret;
+        } finally {
+            FreeLibrary(h);
         }
-        return ret;
     }
 
     public static string TestZluda(string path) {
@@ -67,23 +71,27 @@ public class HipDiag {
             int err = Marshal.GetLastWin32Error();
             return "LoadLibrary failed (win32 error: " + err + ")";
         }
-        IntPtr pInit = GetProcAddress(h, "cuInit");
-        if (pInit == IntPtr.Zero) {
-            return "cuInit not exported";
-        }
-        var cuInit = (cuInitDelegate)Marshal.GetDelegateForFunctionPointer(pInit, typeof(cuInitDelegate));
-        int res = cuInit(0);
-        string ret = "cuInit(0) -> status=" + res + " (" + (res == 0 ? "CUDA_SUCCESS" : (res == 100 ? "CUDA_ERROR_NO_DEVICE" : "Error " + res)) + ")";
-        if (res == 0) {
-            IntPtr pCount = GetProcAddress(h, "cuDeviceGetCount");
-            if (pCount != IntPtr.Zero) {
-                var cuCount = (cuDeviceGetCountDelegate)Marshal.GetDelegateForFunctionPointer(pCount, typeof(cuDeviceGetCountDelegate));
-                int count = 0;
-                cuCount(out count);
-                ret += ", cuDeviceGetCount=" + count;
+        try {
+            IntPtr pInit = GetProcAddress(h, "cuInit");
+            if (pInit == IntPtr.Zero) {
+                return "cuInit not exported";
             }
+            var cuInit = (cuInitDelegate)Marshal.GetDelegateForFunctionPointer(pInit, typeof(cuInitDelegate));
+            int res = cuInit(0);
+            string ret = "cuInit(0) -> status=" + res + " (" + (res == 0 ? "CUDA_SUCCESS" : (res == 100 ? "CUDA_ERROR_NO_DEVICE" : "Error " + res)) + ")";
+            if (res == 0) {
+                IntPtr pCount = GetProcAddress(h, "cuDeviceGetCount");
+                if (pCount != IntPtr.Zero) {
+                    var cuCount = (cuDeviceGetCountDelegate)Marshal.GetDelegateForFunctionPointer(pCount, typeof(cuDeviceGetCountDelegate));
+                    int count = 0;
+                    cuCount(out count);
+                    ret += ", cuDeviceGetCount=" + count;
+                }
+            }
+            return ret;
+        } finally {
+            FreeLibrary(h);
         }
-        return ret;
     }
 }
 "@
@@ -213,7 +221,7 @@ if (-not $scriptPath) { $scriptPath = Join-Path (Get-Location) "diagnose_gpu.ps1
 @("12.0.1", "12.0.0", "11.0.0") | ForEach-Object {
     $ver = $_
     $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptPath -TestOverride $ver -IsolatedOnly
-    if ($output -like "*SUCCESS*") {
+    if ($output -like "*CUDA_SUCCESS*" -and $output -notlike "*cuDeviceGetCount=0*") {
         Write-Host "    [OK] HSA_OVERRIDE_GFX_VERSION=$ver -> $output" -ForegroundColor Green
     } else {
         Write-Host "    [FAIL] HSA_OVERRIDE_GFX_VERSION=$ver -> $output" -ForegroundColor Red

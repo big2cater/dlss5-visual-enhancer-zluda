@@ -21,22 +21,45 @@ inline uint16_t float_to_half(float value) {
     if (f_exp == 0xFFu) {
         // NaN or Infinity
         if (mantissa == 0) return (uint16_t)(sign | 0x7C00u); // Infinity
-        uint16_t nan_mant = (uint16_t)(mantissa >> 13);
+        uint16_t nan_mant = (uint16_t)((mantissa >> 13) & 0x3FFu);
         if (nan_mant == 0) nan_mant = 1;
         return (uint16_t)(sign | 0x7C00u | nan_mant);
     }
 
     int exponent = (int)f_exp - 127 + 15;
 
+    if (exponent >= 0x1F) {
+        // Overflow to infinity
+        return (uint16_t)(sign | 0x7C00u);
+    }
+
     if (exponent <= 0) {
-        // Too small for a normal half: either zero or subnormal.
+        // Too small for a normal half: either zero or subnormal with round-to-nearest-even.
         if (exponent < -10) return (uint16_t)sign;
         mantissa |= 0x800000u;
         const uint32_t shift = (uint32_t)(14 - exponent);
-        return (uint16_t)(sign | (mantissa >> shift));
+        const uint32_t round_bit = 1u << (shift - 1);
+        const uint32_t sticky_mask = round_bit - 1;
+        uint32_t half_mant = mantissa >> shift;
+        if ((mantissa & round_bit) && ((mantissa & sticky_mask) || (half_mant & 1))) {
+            half_mant++;
+        }
+        return (uint16_t)(sign | half_mant);
     }
-    if (exponent >= 0x1F) return (uint16_t)(sign | 0x7C00u); // overflow to infinity
-    return (uint16_t)(sign | ((uint32_t)exponent << 10) | (mantissa >> 13));
+
+    // Normal half with round-to-nearest-even
+    const uint32_t round_bit = 0x1000u;
+    const uint32_t sticky_mask = 0x0FFFu;
+    uint32_t half_mant = mantissa >> 13;
+    if ((mantissa & round_bit) && ((mantissa & sticky_mask) || (half_mant & 1))) {
+        half_mant++;
+        if (half_mant > 0x3FFu) {
+            half_mant = 0;
+            exponent++;
+            if (exponent >= 0x1F) return (uint16_t)(sign | 0x7C00u);
+        }
+    }
+    return (uint16_t)(sign | ((uint32_t)exponent << 10) | half_mant);
 }
 
 inline float half_to_float(uint16_t half) {

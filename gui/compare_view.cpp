@@ -124,7 +124,13 @@ QString CompareDialog::frame_of(const QString &video, const QString &stem) {
                   QStringLiteral("-ss"), QStringLiteral("0"),
                   QStringLiteral("-i"), video, QStringLiteral("-frames:v"), QStringLiteral("1"),
                   QStringLiteral("-y"), png});
-    if (!ffmpeg.waitForFinished(5000) || ffmpeg.exitCode() != 0) {
+    if (!ffmpeg.waitForFinished(5000)) {
+        ffmpeg.kill();
+        ffmpeg.waitForFinished(1000);
+        QFile::remove(png);
+        return {};
+    }
+    if (ffmpeg.exitCode() != 0) {
         QFile::remove(png);
         return {};
     }

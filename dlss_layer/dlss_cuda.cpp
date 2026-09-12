@@ -659,7 +659,14 @@ void *cuda_context() { return g.ctx; }
 const char *last_error() { return g_error[0] ? g_error : "no error"; }
 
 bool init(const InitDesc &desc) {
-    if (g.initialized) return true;
+    if (g.initialized) {
+        if ((desc.device && desc.device != g.device) ||
+            (desc.queue && desc.queue != g.queue)) {
+            set_error("init: already initialized with a different D3D12 device or queue");
+            return false;
+        }
+        return true;
+    }
     if (!desc.device || !desc.queue) {
         set_error("init: device and queue are required");
         return false;
@@ -1498,8 +1505,25 @@ bool upload_shared_colour(const void *src, size_t src_pitch, unsigned rows) {
         return false;
 
     if (g.backbuffer.level0) {
-        copy.dstArray = g.backbuffer.level0;
-        cu_ok(g.cu.cuMemcpy2D(&copy), "cuMemcpy2D (backbuffer upload)");
+        CUDA_ARRAY_DESCRIPTOR ad_bb{};
+        if (!cu_ok(g.cu.cuArrayGetDescriptor(&ad_bb, g.backbuffer.level0), "cuArrayGetDescriptor (backbuffer)"))
+            return false;
+        const size_t bytes_per_texel_bb =
+            (ad_bb.Format == CU_AD_FORMAT_FLOAT ? 4u : ad_bb.Format == CU_AD_FORMAT_HALF ? 2u : 1u) *
+            ad_bb.NumChannels;
+        const size_t row_bytes_bb = (size_t)ad_bb.Width * bytes_per_texel_bb;
+        if (src_pitch >= row_bytes_bb && rows <= ad_bb.Height) {
+            CUDA_MEMCPY2D copy_bb{};
+            copy_bb.srcMemoryType = CU_MEMORYTYPE_HOST;
+            copy_bb.srcHost = src;
+            copy_bb.srcPitch = src_pitch;
+            copy_bb.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+            copy_bb.dstArray = g.backbuffer.level0;
+            copy_bb.WidthInBytes = row_bytes_bb;
+            copy_bb.Height = rows;
+            if (!cu_ok(g.cu.cuMemcpy2D(&copy_bb), "cuMemcpy2D (backbuffer upload)"))
+                return false;
+        }
     }
     return true;
 }

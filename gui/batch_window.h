@@ -178,6 +178,7 @@ private:
     // The output path was derived from the input, so it follows it until the
     // user types one of their own.
     bool auto_output_ = true;
+    bool user_stopped_ = false;
     // Guards the fields while they are being filled in programmatically: the
     // text-changed signal cannot tell that from the user typing.
     bool filling_ = false;

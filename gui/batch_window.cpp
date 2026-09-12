@@ -181,7 +181,10 @@ QWidget *BatchWindow::build_files() {
     // Picking an image switches to image mode and the other way round; the
     // radios are still there to override it afterwards.
     connect(input_, &QLineEdit::textChanged, this, [this] {
-        if (!filling_) auto_fill_output(true);
+        if (!filling_) {
+            auto_output_ = true;
+            auto_fill_output(true);
+        }
     });
     connect(output_, &QLineEdit::textChanged, this, [this] {
         if (!filling_) auto_output_ = false;
@@ -633,6 +636,14 @@ void BatchWindow::load_settings() {
     flow_->setChecked(settings.value(QStringLiteral("flow"), false).toBool());
     audio_->setChecked(settings.value(QStringLiteral("audio"), true).toBool());
 
+    const QString curr_out = output_->text().trimmed();
+    const bool is_out_png = curr_out.endsWith(QStringLiteral(".png"), Qt::CaseInsensitive);
+    const bool is_out_vid = curr_out.endsWith(QStringLiteral(".mp4"), Qt::CaseInsensitive) ||
+                            curr_out.endsWith(QStringLiteral(".mkv"), Qt::CaseInsensitive);
+    if (curr_out.isEmpty() || auto_output_ || (image && is_out_vid) || (!image && is_out_png)) {
+        auto_fill_output(false);
+    }
+
     filling_ = false;
 }
 
@@ -712,12 +723,13 @@ void BatchWindow::auto_fill_output(bool follow_input) {
         update_mode_ui();
     }
 
+    const bool is_img = image_mode_->isChecked();
     const QString derived =
         QFileInfo(source).completeBaseName().isEmpty()
             ? source
             : QFileInfo(source).path() + QStringLiteral("/")
                   + QFileInfo(source).completeBaseName()
-                  + (is_image(source) ? QStringLiteral("_dlss.png") : QStringLiteral("_dlss.mp4"));
+                  + (is_img ? QStringLiteral("_dlss.png") : QStringLiteral("_dlss.mp4"));
     if (!auto_output_) return;
 
     filling_ = true;
@@ -944,6 +956,7 @@ void BatchWindow::start_run() {
         return;
     }
 
+    user_stopped_ = false;
     running_ = true;
     start_button_->setEnabled(false);
     if (preview_button_) preview_button_->setEnabled(false);
@@ -1030,6 +1043,7 @@ void BatchWindow::start_preview() {
         return;
     }
 
+    user_stopped_ = false;
     running_ = true;
     start_button_->setEnabled(false);
     if (preview_button_) preview_button_->setEnabled(false);
@@ -1105,6 +1119,7 @@ void BatchWindow::start_frame_hold_compare() {
         return;
     }
 
+    user_stopped_ = false;
     running_ = true;
     start_button_->setEnabled(false);
     if (preview_button_) preview_button_->setEnabled(false);
@@ -1116,6 +1131,7 @@ void BatchWindow::start_frame_hold_compare() {
 
 void BatchWindow::stop_run() {
     if (!running_) return;
+    user_stopped_ = true;
     process_.kill();
     is_preview_ = false;
     is_frame_hold_ = false;
@@ -1136,24 +1152,30 @@ void BatchWindow::probe_total() {
                  input_->text().trimmed()});
     if (!probe.waitForFinished(5000)) return;
 
-    // Parse values independently. CSV output can combine them on one line,
-    // which previously left frames_total_ unset and the progress bar at 0%.
+    // Line 0 is r_frame_rate, Line 1 is format=duration.
     double rate = 0;
     double duration = 0;
     const QString out = QString::fromUtf8(probe.readAllStandardOutput());
-    for (const QString &part : out.split(QRegularExpression(QStringLiteral("[\\s,]+")),
-                                         Qt::SkipEmptyParts)) {
-        const QString text = part.trimmed();
-        if (text.contains(QLatin1Char('/'))) {
-            const QStringList bits = text.split(QLatin1Char('/'));
-            bool n_ok = false, d_ok = false;
-            const double num = bits.value(0).toDouble(&n_ok);
-            const double den = bits.value(1).toDouble(&d_ok);
-            if (n_ok && d_ok && den > 0) rate = num / den;
-        } else {
+    const QStringList lines = out.split(QRegularExpression(QStringLiteral("[\r\n]+")),
+                                         Qt::SkipEmptyParts);
+    for (int i = 0; i < lines.size(); ++i) {
+        const QString text = lines[i].trimmed();
+        if (i == 0) {
+            if (text.contains(QLatin1Char('/'))) {
+                const QStringList bits = text.split(QLatin1Char('/'));
+                bool n_ok = false, d_ok = false;
+                const double num = bits.value(0).toDouble(&n_ok);
+                const double den = bits.value(1).toDouble(&d_ok);
+                if (n_ok && d_ok && den > 0) rate = num / den;
+            } else {
+                bool ok = false;
+                const double r = text.toDouble(&ok);
+                if (ok && r > 0) rate = r;
+            }
+        } else if (i == 1) {
             bool ok = false;
-            const double value = text.toDouble(&ok);
-            if (ok && value > 0 && value != rate) duration = value;
+            const double val = text.toDouble(&ok);
+            if (ok && val > 0) duration = val;
         }
     }
     if (rate > 0 && duration > 0) frames_total_ = (long)(rate * duration);
@@ -1200,9 +1222,12 @@ void BatchWindow::read_error() {
             QStringLiteral(R"(\[precompile\] translated (\d+) of (\d+))"));
         const auto translating = pre.match(line);
         if (translating.hasMatch()) {
-            const int done = translating.captured(1).toInt();
-            const int total = translating.captured(2).toInt();
-            if (total > 0) progress_->setValue(qMin(99, done * 99 / total));
+            const long long done = translating.captured(1).toLongLong();
+            const long long total = translating.captured(2).toLongLong();
+            if (total > 0) {
+                const long long clamped_done = qBound(0LL, done, total);
+                progress_->setValue(qMin(99, (int)(clamped_done * 99 / total)));
+            }
             log_line(line, QColor(255, 215, 0));
             continue;
         }
@@ -1223,7 +1248,7 @@ void BatchWindow::read_error() {
     }
 }
 
-void BatchWindow::on_finished(int code, QProcess::ExitStatus) {
+void BatchWindow::on_finished(int code, QProcess::ExitStatus exit_status) {
     // Anything still in the pipe: the last lines can arrive with the exit.
     read_error();
     if (!error_buffer_.isEmpty()) {
@@ -1241,10 +1266,21 @@ void BatchWindow::on_finished(int code, QProcess::ExitStatus) {
 
     if (frames_done_ == 0 && frames_total_ < 0 && progress_->value() < 100)
         progress_->setValue(0);  // failed early: do not leave a bar part-filled
-    status_->setText(frames_done_ > 0 ? tr("完成：%1 帧").arg(frames_done_) : tr("处理结束"));
-    if (code != 0) status_->setText(tr("处理失败（exit=%1），见日志").arg(code));
-    log_line(tr(">>> 结束 exit=%1").arg(code),
-             code == 0 ? QColor(144, 238, 144) : QColor(255, 90, 60));
+
+    if (user_stopped_) {
+        status_->setText(tr("已由用户停止"));
+        log_line(tr(">>> 处理已被用户中止"), QColor(255, 165, 0));
+    } else if (exit_status == QProcess::CrashExit) {
+        status_->setText(tr("处理异常崩溃（exit=%1），见日志").arg(code));
+        log_line(tr(">>> 进程异常崩溃 exit=%1").arg(code), QColor(255, 90, 60));
+    } else if (code != 0) {
+        status_->setText(tr("处理失败（exit=%1），见日志").arg(code));
+        log_line(tr(">>> 结束 exit=%1").arg(code), QColor(255, 90, 60));
+    } else {
+        status_->setText(frames_done_ > 0 ? tr("完成：%1 帧").arg(frames_done_) : tr("处理结束"));
+        log_line(tr(">>> 结束 exit=%1").arg(code), QColor(144, 238, 144));
+    }
+    user_stopped_ = false;
 
     if (is_preview_) {
         const QString prev_out = preview_output_path_;

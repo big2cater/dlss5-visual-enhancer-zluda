@@ -71,6 +71,14 @@ std::wstring in_system_directory(const wchar_t *name) {
     return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES ? std::wstring() : path;
 }
 
+std::wstring make_absolute_path(const std::wstring &path) {
+    if (path.empty()) return path;
+    wchar_t buf[MAX_PATH * 2] = {};
+    DWORD len = GetFullPathNameW(path.c_str(), _countof(buf), buf, nullptr);
+    if (len > 0 && len < _countof(buf)) return std::wstring(buf, len);
+    return path;
+}
+
 // A texture copy moves aligned rows, and the rows coming from an image file are
 // not aligned, so everything goes through a staging buffer.
 UINT aligned_pitch(UINT bytes) {
@@ -194,13 +202,32 @@ struct Processor::State {
     bool attempted = false;
     double last_ms = 0.0;
     std::string device_name;
+    bool dll_directory_set = false;
 
-    void wait() {
-        queue->Signal(fence, ++fence_value);
-        if (fence->GetCompletedValue() < fence_value) {
-            fence->SetEventOnCompletion(fence_value, fence_event);
-            WaitForSingleObject(fence_event, INFINITE);
+    bool wait() {
+        if (!queue || !fence) return false;
+        const UINT64 target = ++fence_value;
+        if (FAILED(queue->Signal(fence, target))) {
+            return false;
         }
+        if (fence->GetCompletedValue() < target) {
+            if (!fence_event) return false;
+            if (FAILED(fence->SetEventOnCompletion(target, fence_event))) {
+                return false;
+            }
+            const DWORD wr = WaitForSingleObject(fence_event, 10000);
+            if (wr == WAIT_TIMEOUT || wr == WAIT_FAILED) {
+                if (device) {
+                    const HRESULT hr = device->GetDeviceRemovedReason();
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "[FAIL] State::wait timed out or failed (device removed: 0x%08lX)\n", hr);
+                    OutputDebugStringA(msg);
+                    fprintf(stderr, "%s", msg);
+                }
+                return false;
+            }
+        }
+        return true;
     }
 
     void release_images() {
@@ -326,6 +353,11 @@ bool Processor::start(const Paths &paths, std::string &error,
     }
     s->cmd->Close();
     s->fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!s->fence_event) {
+        error = "could not create D3D12 fence completion event";
+        stop();
+        return false;
+    }
 
     // The network loads the CUDA driver itself, by the name nvcuda.dll, whatever
     // this program was pointed at. Two things follow.
@@ -340,12 +372,15 @@ bool Processor::start(const Paths &paths, std::string &error,
     // installs into System32, on the standard search path, and does not need
     // to be found by hand. Only a non-empty field is held to the naming rule.
     const bool nvidia_mode = paths.cuda_driver.empty();
-    std::wstring cuda_driver = paths.cuda_driver;
-    std::wstring nvapi = paths.nvapi;
+    std::wstring cuda_driver = make_absolute_path(paths.cuda_driver);
+    std::wstring nvapi = make_absolute_path(paths.nvapi);
+    std::wstring snippet = make_absolute_path(paths.snippet);
+    std::wstring ngx_runtime = make_absolute_path(paths.ngx_runtime);
     if (nvidia_mode) {
         cuda_driver = in_system_directory(L"nvcuda.dll");
         if (cuda_driver.empty()) {
             error = "NVIDIA mode needs NVIDIA's own CUDA driver, and nvcuda.dll is not in the system directory.";
+            stop();
             return false;
         }
         nvapi = in_system_directory(L"nvapi64.dll");
@@ -361,12 +396,15 @@ bool Processor::start(const Paths &paths, std::string &error,
                     "other name fails inside the network with nothing to explain it. Point at "
                     "ZLUDA's nvcuda.dll rather than at zluda_real.dll, or leave this blank to "
                     "use the system's own on a real NVIDIA machine.";
+            stop();
             return false;
         }
         // And its directory has to be searchable, both for the network's own
         // load and for a proxy driver that forwards to a library beside it.
-        if (slash != std::wstring::npos)
+        if (slash != std::wstring::npos) {
             SetDllDirectoryW(cuda_driver.substr(0, slash).c_str());
+            s->dll_directory_set = true;
+        }
     }
 
     // On anything other than a real NVIDIA driver, the network's code has to be
@@ -401,7 +439,7 @@ bool Processor::start(const Paths &paths, std::string &error,
     if (!skip_precompile && !real_nvidia) {
         std::string precompile_error;
         const bool ok = precompile(
-            paths.snippet, cuda_driver, 0,
+            snippet, cuda_driver, 0,
             [&log](const Progress &progress) {
                 if (log) log(progress.message);
             },
@@ -430,9 +468,9 @@ bool Processor::start(const Paths &paths, std::string &error,
     init.queue = s->queue;
     init.data_path = L".";
     init.application_id = 0;
-    init.dlss_dll_path = paths.snippet.c_str();
+    init.dlss_dll_path = snippet.c_str();
     init.nvcuda_dll_path = cuda_driver.c_str();
-    init.ngx_runtime_path = or_null(paths.ngx_runtime);
+    init.ngx_runtime_path = or_null(ngx_runtime);
     init.nvapi_dll_path = or_null(nvapi);
     // The file itself answers this, rather than the mode the user picked:
     // pointing the driver field at the system's own nvcuda.dll by hand is
@@ -594,7 +632,11 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         s->cmd->Close();
         ID3D12CommandList *lists[] = {s->cmd};
         s->queue->ExecuteCommandLists(1, lists);
-        s->wait();
+        if (!s->wait()) {
+            error = "D3D12 wait failed during upload (GPU device removed or timed out)";
+            out.pixels.clear();
+            return false;
+        }
     }
 
     // Optional motion-vector guidance (video): either copy a GPU-produced
@@ -620,7 +662,11 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         std::swap(mb.Transition.StateBefore, mb.Transition.StateAfter);
         s->cmd->ResourceBarrier(1, &mb); s->cmd->Close();
         ID3D12CommandList *glists[] = {s->cmd}; s->queue->ExecuteCommandLists(1, glists);
-        s->wait();
+        if (!s->wait()) {
+            error = "D3D12 wait failed during GPU motion upload (GPU device removed or timed out)";
+            out.pixels.clear();
+            return false;
+        }
     } else if (motion && !motion->empty() && motion->width == in.width &&
         motion->height == in.height && s->motion_tex && s->motion_up) {
         const UINT mPitch = aligned_pitch((UINT)in.width * 4);
@@ -665,7 +711,11 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         s->cmd->Close();
         ID3D12CommandList *mlists[] = {s->cmd};
         s->queue->ExecuteCommandLists(1, mlists);
-        s->wait();
+        if (!s->wait()) {
+            error = "D3D12 wait failed during CPU motion upload (GPU device removed or timed out)";
+            out.pixels.clear();
+            return false;
+        }
     }
 
     dlss_cuda::FrameDesc frame{};
@@ -769,7 +819,11 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         s->cmd->Close();
         ID3D12CommandList *readback_lists[] = {s->cmd};
         s->queue->ExecuteCommandLists(1, readback_lists);
-        s->wait();
+        if (!s->wait()) {
+            error = "D3D12 wait failed during readback (GPU device removed or timed out)";
+            out.pixels.clear();
+            return false;
+        }
 
         unsigned char *mapped = nullptr;
         D3D12_RANGE whole{0, (SIZE_T)out_padded * output_height};
@@ -907,7 +961,11 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
         s->cmd->Close();
         ID3D12CommandList *mlists[] = {s->cmd};
         s->queue->ExecuteCommandLists(1, mlists);
-        s->wait();
+        if (!s->wait()) {
+            error = "D3D12 wait failed during GPU motion upload (GPU device removed or timed out)";
+            out.pixels.clear();
+            return false;
+        }
     } else if (motion && !motion->empty() && s->motion_tex && s->motion_up) {
         const UINT motion_pitch = aligned_pitch((UINT)width * 4);
         unsigned char *mapped = nullptr;
@@ -947,7 +1005,11 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
             s->cmd->Close();
             ID3D12CommandList *mlists[] = {s->cmd};
             s->queue->ExecuteCommandLists(1, mlists);
-            s->wait();
+            if (!s->wait()) {
+                error = "D3D12 wait failed during CPU motion upload (GPU device removed or timed out)";
+                out.pixels.clear();
+                return false;
+            }
         }
     }
 
@@ -1040,7 +1102,11 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
         s->cmd->Close();
         ID3D12CommandList *readback_lists[] = {s->cmd};
         s->queue->ExecuteCommandLists(1, readback_lists);
-        s->wait();
+        if (!s->wait()) {
+            error = "D3D12 wait failed during readback (GPU device removed or timed out)";
+            out.pixels.clear();
+            return false;
+        }
 
         unsigned char *mapped = nullptr;
         D3D12_RANGE whole{0, (SIZE_T)out_padded * output_height};
@@ -1079,6 +1145,10 @@ void Processor::stop() {
     s->release_images();
     if (s->fence_event) CloseHandle(s->fence_event);
     s->fence_event = nullptr;
+    if (s->dll_directory_set) {
+        SetDllDirectoryW(nullptr);
+        s->dll_directory_set = false;
+    }
     release(reinterpret_cast<IUnknown *&>(s->cmd));
     release(reinterpret_cast<IUnknown *&>(s->allocator));
     release(reinterpret_cast<IUnknown *&>(s->fence));

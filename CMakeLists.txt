@@ -93,3 +93,17 @@ set_target_properties(nvngx PROPERTIES
     # in.
     AUTOMOC OFF
 )
+
+# Smoke test for image processor and DLSS layer without Qt
+add_executable(processor_smoke
+    tests/processor_smoke.cpp
+    core/image_processor.cpp
+    core/precompile.cpp
+    dlss_layer/dlss_cuda.cpp
+    dlss_layer/frame_blit.cpp
+)
+target_include_directories(processor_smoke PRIVATE core dlss_layer gui)
+target_link_libraries(processor_smoke PRIVATE d3d12 dxgi d3dcompiler windowscodecs ole32 shell32 wintrust)
+target_compile_definitions(processor_smoke PRIVATE UNICODE _UNICODE NOMINMAX)
+target_compile_options(processor_smoke PRIVATE /utf-8)
+set_target_properties(processor_smoke PROPERTIES AUTOMOC OFF)

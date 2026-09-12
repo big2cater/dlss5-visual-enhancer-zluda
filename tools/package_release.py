@@ -12,8 +12,21 @@ try:
 except Exception:
     pass
 
-root_dir = r"d:\Downloads\dlss5-image-enhancer-zluda"
-release_name = "DLSSNRFilter-v2026.09.11-v2-nodlssnr"
+import argparse
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.abspath(os.path.join(script_dir, ".."))
+
+parser = argparse.ArgumentParser(description="Package DLSS-NR Filter release")
+parser.add_argument("--version", default="v2026.09.12-v3", help="Release version tag")
+parser.add_argument("--nodlssnr", action="store_true", help="Explicitly mark without DLSS-NR dll")
+args, _ = parser.parse_known_args()
+
+version_tag = args.version
+if not version_tag.startswith("v"):
+    version_tag = f"v{version_tag}"
+
+release_name = f"DLSSNRFilter-{version_tag}-nodlssnr"
 staging_dir = os.path.join(root_dir, release_name)
 zip_filename = os.path.join(root_dir, f"{release_name}.zip")
 
@@ -37,19 +50,29 @@ os.makedirs(os.path.join(staging_dir, "imageformats"), exist_ok=True)
 os.makedirs(os.path.join(staging_dir, "styles"), exist_ok=True)
 
 # Copy core binaries & dependencies
-# Search directories for binaries and runtimes
+# Search directories for binaries and runtimes - build_qt first where build.bat outputs
 bin_dirs = [
-    os.path.join(root_dir, "build"),
+    os.path.join(root_dir, "build_qt"),
     os.path.join(root_dir, "dist"),
+    os.path.join(root_dir, "build"),
     os.path.join(root_dir, "run"),
-    r"D:\aiwork\DLSSNRFilter-ZLUDA",
 ]
 
-msvc_redist_dirs = [
-    r"D:\Program Files\Microsoft Visual Studio\18\Community\VC\Redist\MSVC\14.50.35710\x64\Microsoft.VC145.CRT",
-    r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Redist\MSVC\14.50.35710\x64\Microsoft.VC145.CRT",
-    r"C:\Windows\System32",
+# Discover MSVC redist directories dynamically
+msvc_redist_dirs = []
+vs_redist_candidates = [
+    os.environ.get("VCToolsRedistDir", ""),
+    r"D:\Program Files\Microsoft Visual Studio\18\Community\VC\Redist\MSVC",
+    r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Redist\MSVC",
+    r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC",
 ]
+for vsc in vs_redist_candidates:
+    if os.path.isdir(vsc):
+        for root, dirs, files in os.walk(vsc):
+            if "x64" in root and any("vcruntime140.dll" == f.lower() for f in files):
+                if root not in msvc_redist_dirs:
+                    msvc_redist_dirs.append(root)
+msvc_redist_dirs.append(r"C:\Windows\System32")
 
 def find_file(filename, search_dirs):
     for d in search_dirs:
@@ -106,7 +129,7 @@ for b in required_binaries:
 
 # 2. Copy MSVC CRT & ICU DLLs
 for dll in msvc_and_icu_dlls:
-    src = find_file(dll, bin_dirs + msvc_redist_dirs)
+    src = find_file(dll, msvc_redist_dirs + bin_dirs)
     if not src:
         raise RuntimeError(f"FATAL: Required runtime DLL '{dll}' not found!")
     dst = os.path.join(staging_dir, dll)

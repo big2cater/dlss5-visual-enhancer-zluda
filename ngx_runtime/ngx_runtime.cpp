@@ -23,6 +23,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <vector>
 
 #include "ngx_cuda.h"
 
@@ -308,14 +310,18 @@ __declspec(dllexport) NVSDK_NGX_Result ngxrt_init(unsigned long long application
     return r;
 }
 
+static std::vector<std::unique_ptr<RuntimeParameters>> s_allocated_params;
+
 // PopulateParameters_Impl fills a block the runtime owns rather than allocating
 // one, so the object is ours and only a pointer to it goes back to the caller.
+// We allocate distinct instances so later populate calls don't invalidate existing features.
 __declspec(dllexport) NVSDK_NGX_Result ngxrt_populate_parameters(NVSDK_NGX_Parameter **out_params) {
     if (!s_populate || !out_params) return NVSDK_NGX_Result_Fail;
-    g_feature_params.reset_all();
-    NVSDK_NGX_Result r = s_populate(&g_feature_params);
+    auto p = std::make_unique<RuntimeParameters>();
+    NVSDK_NGX_Result r = s_populate(p.get());
     g_no_tail_call = 1;
-    *out_params = &g_feature_params;
+    *out_params = p.get();
+    s_allocated_params.push_back(std::move(p));
     return r;
 }
 
@@ -372,6 +378,7 @@ __declspec(dllexport) NVSDK_NGX_Result ngxrt_release_feature(NVSDK_NGX_Handle *h
 }
 
 __declspec(dllexport) NVSDK_NGX_Result ngxrt_shutdown(void) {
+    s_allocated_params.clear();
     if (!s_shutdown) return NVSDK_NGX_Result_Fail;
     NVSDK_NGX_Result r = s_shutdown();
     g_no_tail_call = 1;
@@ -391,7 +398,8 @@ __declspec(dllexport) NVSDK_NGX_Result ngxrt_scratch_size(NVSDK_NGX_Feature feat
                                                           unsigned long long *out_size) {
     if (!s_scratch_size) return NVSDK_NGX_Result_Fail;
     size_t size = 0;
-    NVSDK_NGX_Result r = s_scratch_size(feature_id, params ? params : &g_feature_params, &size);
+    RuntimeParameters temp_params;
+    NVSDK_NGX_Result r = s_scratch_size(feature_id, params ? params : &temp_params, &size);
     g_no_tail_call = 1;
     if (out_size) *out_size = size;
     return r;

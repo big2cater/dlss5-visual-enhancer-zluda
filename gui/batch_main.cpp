@@ -5,7 +5,25 @@
 #include <QGuiApplication>
 #include <QIcon>
 
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+namespace {
+void kill_children_when_this_process_ends() {
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (!job) return;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info, sizeof info) ||
+        !AssignProcessToJobObject(job, GetCurrentProcess())) {
+        CloseHandle(job);
+    }
+}
+} // namespace
+
 int main(int argc, char **argv) {
+    kill_children_when_this_process_ends();
+
     // Detect GPU architecture and inject RDNA 4 environment if needed
     dlssnr::auto_configure_gpu_environment();
 

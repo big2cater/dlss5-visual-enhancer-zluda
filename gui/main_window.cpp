@@ -166,7 +166,7 @@ std::wstring to_wide(const QString &text) { return text.toStdWString(); }
 } // namespace
 
 int run_self_test(const QStringList &arguments) {
-    if (arguments.size() < 6) {
+    if (arguments.size() < 5) {
         fprintf(stderr, "usage: --selftest <in> <out.png> <network> <driver> [runtime] [nvapi]\n");
         return 2;
     }
@@ -359,7 +359,10 @@ MainWindow::~MainWindow() {
     // the moment this process actually ends -- which a hard exit forces now
     // instead of leaving to however long the translation was going to take.
     if (!worker_thread_.wait(2000)) {
-        std::_Exit(0);
+        worker_thread_.terminate();
+        if (!worker_thread_.wait(1000)) {
+            std::_Exit(2);
+        }
     }
 }
 

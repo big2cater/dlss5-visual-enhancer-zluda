@@ -104,6 +104,10 @@ std::vector<std::vector<unsigned char>> extract_modules(const std::wstring &libr
 
 int compile_one(const std::wstring &module_file, const std::wstring &driver) {
     dlssnr::auto_configure_gpu_environment();
+    const size_t slash = driver.find_last_of(L"/\\");
+    if (slash != std::wstring::npos) {
+        SetDllDirectoryW(driver.substr(0, slash).c_str());
+    }
     HMODULE cuda = LoadLibraryW(driver.c_str());
     if (!cuda) return 1;
 
@@ -245,6 +249,22 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
         }
         if (which == WAIT_TIMEOUT) {
             for (size_t j = 0; j < running.size(); ++j) {
+                DWORD exit_code = STILL_ACTIVE;
+                if (!GetExitCodeProcess(running[j], &exit_code) || exit_code != STILL_ACTIVE) {
+                    // Child exited or vanished during this wait slice
+                    if (exit_code != 0) {
+                        ++failures;
+                    }
+                    ++progress.done;
+                    CloseHandle(running[j]);
+                    running.erase(running.begin() + j);
+                    cpu.erase(cpu.begin() + j);
+                    stalled.erase(stalled.begin() + j);
+                    --j;
+                    continue;
+                }
+
+                // Child is STILL_ACTIVE: monitor CPU usage
                 FILETIME created{}, exited{}, kernel{}, user{};
                 if (GetProcessTimes(running[j], &created, &exited, &kernel, &user)) {
                     ULONGLONG cur = (((ULONGLONG)kernel.dwHighDateTime << 32) | kernel.dwLowDateTime) +
@@ -264,14 +284,6 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
                         cpu[j] = cur;
                         stalled[j] = 0;
                     }
-                } else {
-                    // Process vanished: treat as done.
-                    ++progress.done;
-                    CloseHandle(running[j]);
-                    running.erase(running.begin() + j);
-                    cpu.erase(cpu.begin() + j);
-                    stalled.erase(stalled.begin() + j);
-                    --j;
                 }
             }
             continue; // keep waiting on the survivors

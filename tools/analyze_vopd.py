@@ -22,9 +22,29 @@ def main():
         print(f"[!] Database not found: {db_path}")
         return 1
 
-    objdump = r'C:\Program Files\AMD\ROCm\7.1\bin\llvm-objdump.exe'
-    if not os.path.exists(objdump):
-        print(f"[!] llvm-objdump not found at {objdump}")
+    objdump = None
+    candidates = []
+    hip_path = os.environ.get('HIP_PATH')
+    if hip_path:
+        candidates.append(os.path.join(hip_path, 'bin', 'llvm-objdump.exe'))
+    rocm_base = r'C:\Program Files\AMD\ROCm'
+    if os.path.isdir(rocm_base):
+        for ver in sorted(os.listdir(rocm_base), reverse=True):
+            candidates.append(os.path.join(rocm_base, ver, 'bin', 'llvm-objdump.exe'))
+    candidates.extend([
+        r'C:\Program Files\AMD\ROCm\7.1\bin\llvm-objdump.exe',
+        r'C:\Program Files\AMD\ROCm\7.0\bin\llvm-objdump.exe',
+        r'C:\Program Files\AMD\ROCm\6.2\bin\llvm-objdump.exe',
+    ])
+    for cand in candidates:
+        if os.path.isfile(cand):
+            objdump = cand
+            break
+    if not objdump:
+        import shutil
+        objdump = shutil.which('llvm-objdump')
+    if not objdump or not os.path.exists(objdump):
+        print("[!] llvm-objdump.exe not found. Please set HIP_PATH or install ROCm.")
         return 1
 
     conn = sqlite3.connect(db_path)
