@@ -216,7 +216,86 @@ device attributes (compute capability major/minor) at init — the (6,2)-style
 grids are the snippet's own Swin-window decomposition, not something ZLUDA
 under-answered.
 
-## Artifacts
+## Project proposal: lower fp8 mma.sync to WMMA (2026-09-13)
+
+The fp8 conversion inlining shipped in v5 removed the call tax but left the
+mma arithmetic itself emulated scalar-wise. This section is the feasibility
+case for the next lever: lowering `m16n8k32` e4m3 `mma.sync` to unpacked-f16
+`v_wmma_f32_16x16x16_f16` (2 instructions per mma), reusing the fork's
+existing CombineMMA f16 path.
+
+### Why the scalar emulation is slow — the accumulator argument
+
+Each thread of a scalar-emulated m16n8k32 owns 4096/32 = **128 output
+elements**, each needing a live f32 accumulator across the whole k-loop.
+That is the root cause of the measured register state: `vgpr_count = 192`
+(at the ceiling) with **118–184 spill slots** per thread, and ~400 static
+scratch loads/stores per kernel dragging global-memory latency into the
+innermost loop. It also explains why raising the VGPR budget changed
+nothing (A/B in the register-allocation section above): the pressure is
+structural to the emulation, not a budget mistake.
+
+### Why WMMA collapses it
+
+| | scalar emulation | 2× `v_wmma_f32_16x16x16_f16` |
+|---|---|---|
+| math throughput per wave | ~4–8 MACs/cycle (dependent chains + unpack) | 8192 MACs in ~32–64 cycles ≈ **128–256 MACs/cycle** |
+| accumulator VGPRs per mma tile | ~128 (spilled) | **8** (F32 fragment) |
+| fp8 unpack per element | per use, interleaved | once per element, same total |
+
+The accumulator collapse kills the scratch traffic and the spill-driven
+dependency chains at the same time as the math speeds up — a compounding
+gain, not just an instruction swap.
+
+### Numerics: equivalent or better
+
+e4m3 is exactly representable in f16 (3-bit mantissa ⊂ 10-bit, ±448 ⊂
+±65504); products of two e4m3 values are exact in f16; accumulation happens
+in F32 inside the WMMA — the same accumulator precision NVIDIA's fp8
+`mma.sync.f32.e4m3` specifies. No precision is traded away.
+
+### The honest unknowns (what gates the 80–120 ms claim)
+
+1. **Fragment layout conversion**: NVIDIA `mma.sync` thread layouts differ
+   from AMD WMMA layouts; e4m3→f16 unpack must land operands in the right
+   VGPR slots. Cost per element ~1–2 perm/bfi ops, paid once per operand —
+   but the layout shuffle itself is new code with its own register pressure.
+   Mitigation: the fork's CombineMMA already solves the f16 variant of this
+   exact problem; e4m3 prepends one unpack stage to a proven path.
+2. **n8→n16 padding**: 2× WMMA (m16n16k32) covers one m16n8k32 with the N
+   half padded — an effective ~50% efficiency loss unless adjacent n8 tiles
+   share a WMMA. The proposal's "2 instructions" already prices this in.
+3. **The memory ceiling**: once the math collapses, weight/activation
+   streaming from VRAM becomes the next wall. Expect the gain curve to bend
+   there; that is the follow-on optimization target (LDS staging,
+   prefetch shape), not a reason to skip this.
+
+### Projection (with the above uncertainties)
+
+| platform | path | projected 1080p frame |
+|---|---|---|
+| RX 7900 XT (gfx1100) | m16n8k32 e4m3 → unpack → 2× f16 WMMA | **80–120 ms** (band: 40–150 depending on premises) |
+| RX 9070/9080 (gfx1200) | native fp8 WMMA (zero unpack) | **30–50 ms** — requires confirming the fork's LLVM carries the gfx12 fp8 WMMA intrinsic |
+| RX 6000 (gfx10) | no WMMA hardware | excluded — keeps the scalar path; fp8-inline still applies |
+
+The 640×360 case improves by the same ratio (84 ms → ~25–35 ms), since the
+same kernels run there.
+
+### Phased plan (risk-ordered, each phase self-verifying)
+
+1. **Single-kernel prototype**: extend CombineMMA with an e4m3→f16 unpack
+   stage for `m16n8k32`; A/B one kernel with `ZLUDA_LAUNCH_TIMING`. This
+   alone confirms or kills the 3–8× claim for the cost of one kernel's
+   work. Gate: measured per-launch improvement before touching anything
+   else.
+2. **Rollout**: all 15 modules; 588 compiler tests (new shape tests for the
+   unpack+WMMA form); end-to-end framebench on 640×360 and 1920×1076;
+   re-check spills via `llvm-readobj --notes`.
+3. **RDNA4 branch**: map `m16n8k32` e4m3 to the gfx12 fp8 WMMA intrinsic if
+   present in the vendored LLVM; otherwise scalar-fallback with a feature
+   test.
+
+### Artifacts
 
 - `build/framebench.cpp` (+ `build/framebench_build.bat`) — multi-frame
   per-frame timing harness (processor_smoke with N frames and a summary).
