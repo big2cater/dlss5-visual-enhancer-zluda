@@ -1055,8 +1055,11 @@ bool create_feature(const FeatureDesc &desc) {
         desc.render_height == g.current.render_height &&
         desc.output_width == g.current.output_width &&
         desc.output_height == g.current.output_height &&
-        desc.perf_quality == g.current.perf_quality && desc.create_flags == g.current.create_flags)
+        desc.perf_quality == g.current.perf_quality && desc.create_flags == g.current.create_flags) {
+        g.current.neural = desc.neural;
+        g.current.max_passes = desc.max_passes;
         return true;
+    }
 
     for (int i = 0; i < kMaxPasses; ++i) {
         if (g.features[i]) {
@@ -1406,6 +1409,19 @@ bool evaluate(const FrameDesc &frame, bool copy_output) {
         return false;
     }
 
+    // Safety net for a caller that chains passes at a non-1:1 ratio: pass 1
+    // and up take the previous pass's output-sized frame through a
+    // render-sized staging texture, which only copies cleanly at a 1:1
+    // feature. image_processor clamps this itself; anything else that gets
+    // here is refused rather than issuing an invalid dimension-mismatched
+    // copy.
+    if (frame.pass_index >= 1 &&
+        (g.current.render_width != g.current.output_width ||
+         g.current.render_height != g.current.output_height)) {
+        set_error("cascaded passes need matching render and output dimensions");
+        return false;
+    }
+
     // Stage the game's buffers into the shared textures.
     const bool has_d3d_uploads = !frame.color_is_shared || frame.depth || frame.motion_vectors;
     if (has_d3d_uploads) {
@@ -1416,7 +1432,9 @@ bool evaluate(const FrameDesc &frame, bool copy_output) {
             g.cmd->CopyResource(g.color.resource, frame.color);
             transition(g.color.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
 
-            if (g.backbuffer.resource && frame.pass_index == 0) {
+            if (g.backbuffer.resource && frame.pass_index == 0 &&
+                g.current.render_width == g.current.output_width &&
+                g.current.render_height == g.current.output_height) {
                 transition(g.backbuffer.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
                 g.cmd->CopyResource(g.backbuffer.resource, frame.color);
                 transition(g.backbuffer.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
@@ -1469,7 +1487,7 @@ bool evaluate(const FrameDesc &frame, bool copy_output) {
     // A direct host upload does not submit a new input command on the next
     // frame, so make the fallback output copy complete before its allocator is
     // reused. The normal direct-readback path never enters this branch.
-    return frame.color_is_shared ? flush_and_wait() : true;
+    return flush_and_wait();
 }
 
 bool upload_shared_colour(const void *src, size_t src_pitch, unsigned rows) {

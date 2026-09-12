@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 
 #pragma comment(lib, "psapi.lib")
 
@@ -60,6 +61,96 @@ std::wstring temporary_directory() {
     std::wstring directory = std::wstring(base) + L"dlss5-precompile";
     CreateDirectoryW(directory.c_str(), nullptr);
     return directory;
+}
+
+// ---- the warm-start stamp -------------------------------------------------
+//
+// precompile() cannot cheaply ask ZLUDA whether its cache already holds a
+// module: the answer lives behind the same driver load and context creation
+// that makes the child processes expensive in the first place. So the last
+// fully successful precompile signs the cache instead, with a small text
+// stamp written into ZLUDA's own cache directory. It records the identity of
+// the network library and of the driver build -- either changing means the
+// cached keys no longer describe what is on disk -- and the total size of the
+// cache databases at the time. The databases only grow in normal use, so a
+// smaller total than recorded means the cache was reset or rotated and the
+// entries are gone. Because the stamp lives inside the cache directory,
+// wiping the directory takes the stamp with it.
+//
+// The safe direction for every failure is "not warm": an unreadable stamp, a
+// missing cache directory or an environment without a discoverable one all
+// simply send the caller through the full precompile, as if the stamp were
+// not a thing.
+
+constexpr wchar_t kStampName[] = L"\\dlssnr-precompile.stamp";
+
+struct FileStamp {
+    unsigned long long size = 0;
+    unsigned long long mtime = 0;
+};
+
+bool file_stamp(const std::wstring &path, FileStamp &out) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return false;
+    out.size = ((unsigned long long)data.nFileSizeHigh << 32) | data.nFileSizeLow;
+    out.mtime = ((unsigned long long)data.ftLastWriteTime.dwHighDateTime << 32) |
+                data.ftLastWriteTime.dwLowDateTime;
+    return true;
+}
+
+std::wstring env_wstring(const wchar_t *name) {
+    DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
+    if (needed == 0) return {};
+    std::wstring value(needed, L'\0');
+    DWORD written = GetEnvironmentVariableW(name, value.data(), needed);
+    if (written == 0 || written >= needed) return {};
+    value.resize(written);
+    return value;
+}
+
+std::wstring cache_directory() {
+    // ZLUDA_CACHE_DIR moves the whole cache somewhere else (see zluda_cache),
+    // and a stamp written to the default directory would then vouch for a
+    // cache nobody is using -- possibly a stale one with plausible-looking
+    // databases still in it. The override is the whole directory, nothing
+    // appended.
+    if (std::wstring override_dir = env_wstring(L"ZLUDA_CACHE_DIR"); !override_dir.empty())
+        return override_dir;
+    std::wstring base = env_wstring(L"LOCALAPPDATA");
+    if (base.empty()) return {};
+    return base + L"\\zluda\\ComputeCache";
+}
+
+unsigned long long cache_database_bytes(const std::wstring &directory) {
+    WIN32_FIND_DATAW found{};
+    HANDLE search = FindFirstFileW((directory + L"\\*.db").c_str(), &found);
+    if (search == INVALID_HANDLE_VALUE) return 0;
+    unsigned long long total = 0;
+    do {
+        if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            total += ((unsigned long long)found.nFileSizeHigh << 32) | found.nFileSizeLow;
+    } while (FindNextFileW(search, &found));
+    FindClose(search);
+    return total;
+}
+
+void write_precompile_stamp(const std::wstring &library, const std::wstring &driver) {
+    const std::wstring directory = cache_directory();
+    if (directory.empty()) return;
+    // No database observed means nothing was verified about where the cache
+    // lives; stamping here would let a cold machine skip precompile forever.
+    const unsigned long long db_bytes = cache_database_bytes(directory);
+    if (db_bytes == 0) return;
+    FileStamp snippet{};
+    FileStamp cuda{};
+    if (!file_stamp(library, snippet) || !file_stamp(driver, cuda)) return;
+    CreateDirectoryW(directory.c_str(), nullptr);
+    std::ofstream out(directory + kStampName);
+    if (!out) return;
+    out << "v1\n"
+        << "snippet " << snippet.size << " " << snippet.mtime << "\n"
+        << "driver " << cuda.size << " " << cuda.mtime << "\n"
+        << "db " << db_bytes << "\n";
 }
 
 } // namespace
@@ -142,10 +233,13 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
 
     // Zero means "as many as the machine turns out to allow", which is decided
     // again every time one finishes rather than once at the start. The
-    // DLSSNR_PRECOMPILE_JOBS environment variable forces a fixed parallelism:
-    // 16 concurrent translation processes all write ZLUDA's cache database at
-    // once, and that contention is suspected to corrupt entries and cause the
-    // intermittent all-black evaluations -- so serial (1) is worth an A/B run.
+    // DLSSNR_PRECOMPILE_JOBS environment variable forces a fixed parallelism;
+    // otherwise the core count is the ceiling and free memory is the real
+    // limit. Sixteen concurrent children all writing ZLUDA's cache database
+    // was once suspected of corrupting entries, which is why this used to be
+    // pinned to four -- but zluda_cache now runs SQLite in WAL mode with a
+    // long busy_timeout, so the writes take care of themselves and the memory
+    // gate below is what keeps the machine from being swamped.
     unsigned ceiling = jobs;
     if (ceiling == 0) {
         char forced[16] = {};
@@ -153,10 +247,7 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
             atoi(forced) > 0)
             ceiling = (unsigned)atoi(forced);
     }
-    if (ceiling == 0) {
-        ceiling = logical_processors();
-        if (ceiling > 4) ceiling = 4;
-    }
+    if (ceiling == 0) ceiling = logical_processors();
     if (ceiling > 32) ceiling = 32;
     const bool adaptive = jobs == 0;
 
@@ -322,7 +413,37 @@ bool precompile(const std::wstring &library, const std::wstring &driver, unsigne
                 " modules could not be translated";
         return false;
     }
+    write_precompile_stamp(library, driver);
     return true;
+}
+
+bool precompile_cache_is_warm(const std::wstring &library, const std::wstring &driver) {
+    const std::wstring directory = cache_directory();
+    if (directory.empty()) return false;
+    std::ifstream in(directory + kStampName);
+    if (!in) return false;
+    std::string line;
+    if (!std::getline(in, line) || line != "v1") return false;
+    unsigned long long snippet_size = 0, snippet_mtime = 0;
+    unsigned long long driver_size = 0, driver_mtime = 0;
+    unsigned long long db_bytes = 0;
+    while (std::getline(in, line)) {
+        std::istringstream fields(line);
+        std::string kind;
+        fields >> kind;
+        if (kind == "snippet") fields >> snippet_size >> snippet_mtime;
+        else if (kind == "driver") fields >> driver_size >> driver_mtime;
+        else if (kind == "db") fields >> db_bytes;
+    }
+    if (db_bytes == 0) return false;
+    FileStamp snippet{};
+    FileStamp cuda{};
+    if (!file_stamp(library, snippet) || !file_stamp(driver, cuda)) return false;
+    if (snippet.size != snippet_size || snippet.mtime != snippet_mtime) return false;
+    if (cuda.size != driver_size || cuda.mtime != driver_mtime) return false;
+    // The databases only grow in normal use; smaller than recorded means the
+    // cache was reset or rotated and the entries behind the stamp are gone.
+    return cache_database_bytes(directory) >= db_bytes;
 }
 
 } // namespace enhancer

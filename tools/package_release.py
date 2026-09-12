@@ -18,7 +18,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.abspath(os.path.join(script_dir, ".."))
 
 parser = argparse.ArgumentParser(description="Package DLSS-NR Filter release")
-parser.add_argument("--version", default="v2026.09.12-v3", help="Release version tag")
+parser.add_argument("--version", default="v2026.09.12-v4", help="Release version tag")
 parser.add_argument("--nodlssnr", action="store_true", help="Explicitly mark without DLSS-NR dll")
 args, _ = parser.parse_known_args()
 
@@ -50,12 +50,12 @@ os.makedirs(os.path.join(staging_dir, "imageformats"), exist_ok=True)
 os.makedirs(os.path.join(staging_dir, "styles"), exist_ok=True)
 
 # Copy core binaries & dependencies
-# Search directories for binaries and runtimes - build_qt first where build.bat outputs
+# Search directories for binaries and runtimes - dist/build first where build.bat outputs
 bin_dirs = [
-    os.path.join(root_dir, "build_qt"),
     os.path.join(root_dir, "dist"),
     os.path.join(root_dir, "build"),
     os.path.join(root_dir, "run"),
+    os.path.join(root_dir, "build_qt"),
 ]
 
 # Discover MSVC redist directories dynamically

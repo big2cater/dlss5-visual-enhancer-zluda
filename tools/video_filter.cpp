@@ -1876,7 +1876,12 @@ int run_image_mode(int argc, char **argv) {
             if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", name); return nullptr; }
             return argv[++i];
         };
-        if (arg == "--passes") { const char *v = need("--passes"); if (!v) return 1; settings.passes = atoi(v); }
+        if (arg == "--passes") {
+            const char *v = need("--passes"); if (!v) return 1;
+            settings.passes = atoi(v);
+            if (settings.passes < 1) settings.passes = 1;
+            if (settings.passes > 10) settings.passes = 10;
+        }
         else if (arg == "--retries") { const char *v = need("--retries"); if (!v) return 1; retries = atoi(v); if (retries < 0) retries = 0; }
         else if (arg == "--gamma") { const char *v = need("--gamma"); if (!v) return 1; g_gamma = atof(v); if (g_gamma < 0.1) g_gamma = 0.1; }
         else if (arg == "--intensity") { const char *v = need("--intensity"); if (!v) return 1; settings.intensity = (float)atof(v); }
@@ -2223,8 +2228,17 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
         return s;
     };
 
-    std::string line0 = "file '" + to_u8(p0_norm) + "'\r\n";
-    std::string line1 = "file '" + to_u8(p1_norm) + "'\r\n";
+    auto escape_concat = [](const std::string &s) -> std::string {
+        std::string res;
+        for (char c : s) {
+            if (c == '\'') res += "'\\''";
+            else res += c;
+        }
+        return res;
+    };
+
+    std::string line0 = "file '" + escape_concat(to_u8(p0_norm)) + "'\r\n";
+    std::string line1 = "file '" + escape_concat(to_u8(p1_norm)) + "'\r\n";
     fwrite(line0.data(), 1, line0.size(), fconcat);
     fwrite(line1.data(), 1, line1.size(), fconcat);
     fclose(fconcat);
@@ -2689,6 +2703,7 @@ static int run_main_once(int argc, char **argv) {
                 failed = true;
                 retryable = true;
                 abort_pipeline.store(true);
+                free_output_pool.push(frame);
                 break;
             }
 
@@ -2700,6 +2715,7 @@ static int run_main_once(int argc, char **argv) {
                     failed = true;
                     abort_pipeline.store(true);
                 }
+                free_output_pool.push(frame);
                 break;
             }
 
@@ -2732,6 +2748,10 @@ static int run_main_once(int argc, char **argv) {
         if (!options.dump_dir.empty()) {
             CoUninitialize();
         }
+        free_output_pool.close();
+        ready_output_channel.close();
+        free_input_pool.close();
+        ready_input_channel.close();
     });
 
     // Stage 2: GPU inference (Main thread)
@@ -3013,13 +3033,10 @@ static int real_main(int argc, char **argv) {
         const std::wstring repl =
             token + L" " + std::to_wstring(retries > 0 ? retries - 1 : 0);
         if (pos != std::wstring::npos) {
-            size_t end = cmdline.find(L' ', pos + token.size());
-            if (end != std::wstring::npos)
-                cmdline.replace(pos, end - pos, repl);
-            else {
-                cmdline.erase(pos);
-                cmdline += L" " + repl;
-            }
+            size_t val_start = cmdline.find_first_not_of(L' ', pos + token.size());
+            size_t val_end = (val_start != std::wstring::npos) ? cmdline.find(L' ', val_start) : std::wstring::npos;
+            size_t replace_len = (val_end != std::wstring::npos) ? (val_end - pos) : (cmdline.size() - pos);
+            cmdline.replace(pos, replace_len, repl);
         } else {
             cmdline += L" " + repl;
         }

@@ -230,6 +230,12 @@ void log_to_window(const char *line);
 } // namespace
 
 void Worker::start(const Paths &paths) {
+    if (have_paths_ && (paths_.snippet != paths.snippet ||
+                        paths_.cuda_driver != paths.cuda_driver ||
+                        paths_.ngx_runtime != paths.ngx_runtime ||
+                        paths_.nvapi != paths.nvapi)) {
+        processor_.stop();
+    }
     paths_ = paths;
     have_paths_ = true;
     std::string error;
@@ -360,9 +366,14 @@ MainWindow::~MainWindow() {
     // instead of leaving to however long the translation was going to take.
     if (!worker_thread_.wait(2000)) {
         worker_thread_.terminate();
-        if (!worker_thread_.wait(1000)) {
-            std::_Exit(2);
-        }
+        // terminate() kills the thread wherever it stands, quite possibly
+        // holding the heap lock, a COM lock or a driver lock. Nothing past
+        // this point can be trusted to run: even ~QApplication touching its
+        // own state can deadlock against whatever the thread died holding,
+        // and a process that never exits takes main.cpp's job object down
+        // with it -- the children the job was meant to kill outlive it. What
+        // mattered has already happened above, so end the process here.
+        std::_Exit(2);
     }
 }
 
@@ -662,7 +673,9 @@ void MainWindow::load_image(const QString &path) {
     output_ = {};
     showing_output_ = false;
     display(input_);
-    run_button_->setEnabled(true);
+    if (!busy_) {
+        run_button_->setEnabled(true);
+    }
     save_button_->setEnabled(false);
     compare_button_->setEnabled(false);
     status_->setText(tr("Loaded %1 x %2").arg(input_.width).arg(input_.height));
@@ -715,6 +728,7 @@ void MainWindow::show_original(bool original) {
 }
 
 void MainWindow::set_busy(bool busy) {
+    busy_ = busy;
     run_button_->setEnabled(!busy && !input_.empty());
     save_button_->setEnabled(!busy && have_output_);
     compare_button_->setEnabled(!busy && have_output_);

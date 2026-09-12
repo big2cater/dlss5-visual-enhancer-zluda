@@ -43,6 +43,16 @@ std::vector<std::vector<unsigned char>> extract_modules(const std::wstring &libr
 bool precompile(const std::wstring &library, const std::wstring &driver, unsigned jobs,
                 const std::function<void(const Progress &)> &report, std::string &error);
 
+// Whether ZLUDA's cache already holds every module of this network: the word
+// of the stamp the last fully successful precompile left in the cache
+// directory, not a per-module question put to the driver -- each such
+// question costs a whole driver load and context creation, which is exactly
+// what the stamp exists to avoid. Anything it cannot vouch for -- no stamp, a
+// changed network library, a changed driver build, a cache directory that
+// shrank -- answers false, which only costs the precompile that would have
+// run anyway.
+bool precompile_cache_is_warm(const std::wstring &library, const std::wstring &driver);
+
 // Translates one module and exits: what the spawned copies run. Returns a
 // process exit code.
 int compile_one(const std::wstring &module_file, const std::wstring &driver);

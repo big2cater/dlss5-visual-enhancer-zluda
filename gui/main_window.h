@@ -140,6 +140,7 @@ private:
     Image input_;
     Image output_;
     bool have_output_ = false;
+    bool busy_ = false;
     // Which of the two is on screen, so a resize can redraw the right one.
     bool showing_output_ = false;
     // The picture at full size; what the label holds is a scaled copy.

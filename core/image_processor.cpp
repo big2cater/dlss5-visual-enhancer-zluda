@@ -203,6 +203,7 @@ struct Processor::State {
     double last_ms = 0.0;
     std::string device_name;
     bool dll_directory_set = false;
+    Paths paths;
 
     bool wait() {
         if (!queue || !fence) return false;
@@ -256,7 +257,15 @@ ID3D12CommandQueue *Processor::native_queue() const { return s->queue; }
 
 bool Processor::start(const Paths &paths, std::string &error,
                       const std::function<void(const std::string &)> &log) {
-    if (s->started) return true;
+    if (s->started) {
+        if (s->paths.snippet == paths.snippet &&
+            s->paths.cuda_driver == paths.cuda_driver &&
+            s->paths.ngx_runtime == paths.ngx_runtime &&
+            s->paths.nvapi == paths.nvapi) {
+            return true;
+        }
+        stop();
+    }
 
     // A previous attempt that failed left the network loaded and, depending on
     // how far it got, initialised. Initialising it twice in one process is
@@ -412,15 +421,18 @@ bool Processor::start(const Paths &paths, std::string &error,
     // serial -- one module at a time, tens of minutes for the largest one. Do
     // it here instead, in parallel, before that path is ever reached.
     //
-    // No attempt is made to tell a cold cache from a warm one, and it does not
-    // need one: measured, with ZLUDA's cache actually holding on to what it
-    // is given (see the busy_timeout fix in zluda_cache -- without it, up to
-    // sixteen translations finishing near enough together mostly lost the
-    // race to save their own result, so the *next* run found nothing there
-    // either, forever), a fully warm run of all fifteen modules of this
-    // network took 2.6 seconds. That is the cost paid every time this program
-    // starts, against tens of minutes the one time a module is actually
-    // missing -- not worth a per-module check to shave off.
+    // Whether the cache needs anything at all is answered by a stamp, not by
+    // asking the cache: each translation child pays a full process start, a
+    // driver load and a context creation before it even reaches its cache
+    // lookup, so fifteen children against a fully warm cache cost minutes of
+    // startup for seconds of work -- measured on the machine this was built
+    // on, a hot start spent over six of them. The stamp (see precompile.cpp)
+    // is written into ZLUDA's cache directory by the last fully successful
+    // precompile, and every way it can go wrong lands on the cautious side:
+    // wiping the cache takes the stamp with it, a changed network library or
+    // ZLUDA build fails the identity check, a reset or rotated cache fails
+    // the size check. Anything it cannot vouch for runs the translation as
+    // before.
     //
     // An empty field is checked first and on its own, ahead of asking what
     // driver it names: NVIDIA mode leaves this field empty on purpose (see
@@ -437,16 +449,20 @@ bool Processor::start(const Paths &paths, std::string &error,
         return GetEnvironmentVariableA("DLSSNR_PRECOMPILE_SKIP", b, 2) > 0 && b[0] == '1';
     }();
     if (!skip_precompile && !real_nvidia) {
-        std::string precompile_error;
-        const bool ok = precompile(
-            snippet, cuda_driver, 0,
-            [&log](const Progress &progress) {
-                if (log) log(progress.message);
-            },
-            precompile_error);
-        // Not fatal: whatever did not get translated here still gets translated
-        // the slow way when the network reaches for it, just as it always did.
-        if (!ok && log) log("precompile: " + precompile_error);
+        if (precompile_cache_is_warm(snippet, cuda_driver)) {
+            if (log) log("precompile: every module is already in the cache, nothing to translate");
+        } else {
+            std::string precompile_error;
+            const bool ok = precompile(
+                snippet, cuda_driver, 0,
+                [&log](const Progress &progress) {
+                    if (log) log(progress.message);
+                },
+                precompile_error);
+            // Not fatal: whatever did not get translated here still gets translated
+            // the slow way when the network reaches for it, just as it always did.
+            if (!ok && log) log("precompile: " + precompile_error);
+        }
     }
 
     // The network refuses anything below a Blackwell part, and asks NVAPI what
@@ -483,6 +499,7 @@ bool Processor::start(const Paths &paths, std::string &error,
         return false;
     }
 
+    s->paths = paths;
     s->started = true;
     return true;
 }
@@ -508,7 +525,7 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     const UINT padded = aligned_pitch(row_bytes);
     const UINT out_row_bytes = output_width * 8;
     const UINT out_padded = aligned_pitch(out_row_bytes);
-    // Direct readback/upload bypasses D3D12 resource barrier flushes. On AMD
+    // Direct readback bypasses D3D12 resource barrier flushes. On AMD
     // GPUs with ZLUDA, this causes L1/L2 cache desynchronization and severe
     // video flickering. Default to false (safe 09-08 D3D12 staging path),
     // requiring explicit opt-in with DLSS_DIRECT_READBACK=1 / DLSS_DIRECT_UPLOAD=1.
@@ -516,6 +533,13 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         char value[8] = {};
         return GetEnvironmentVariableA("DLSS_DIRECT_READBACK", value,
                                        sizeof value) > 0 && value[0] == '1';
+    }();
+    // DLSSNR_PHASE_TIMING=1: per-phase wall time on stderr, to answer where a
+    // frame's milliseconds actually go -- into the D3D12 upload, the network
+    // evaluate, or the readback. Off by default; fprintf on the hot path.
+    const bool phase_timing = [] {
+        char value[2] = {};
+        return GetEnvironmentVariableA("DLSSNR_PHASE_TIMING", value, 2) > 0 && value[0] == '1';
     }();
     const bool direct_upload = [] {
         char value[8] = {};
@@ -722,6 +746,7 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     frame.color = direct_upload ? nullptr : s->colour;
     frame.color_is_shared = direct_upload;
     frame.output = s->result;
+    const auto after_upload = std::chrono::steady_clock::now();
     if ((motion_gpu || (motion && !motion->empty())) && s->motion_tex) {
         frame.motion_vectors = s->motion_tex;
         frame.mv_scale_x = -1.0f / (float)in.width;
@@ -738,7 +763,24 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     frame.reset_accumulation = settings.reset_accumulation;
     const int passes = settings.passes < 1 ? 1 : settings.passes;
 
-    if (settings.is_video && passes >= 2 && s->intermediate) {
+    // The cascade feeds pass 1 with pass 0's output, which is output-sized,
+    // through a colour staging texture that is render-sized: the two only
+    // line up at a 1:1 ratio, and D3D12 refuses dimension-mismatched copies.
+    // A cascaded run at any other ratio degrades to the single-engine loop
+    // below rather than issuing invalid copies.
+    const bool cascade_dims_ok =
+        output_width == in.width && output_height == in.height;
+    const bool cascaded = settings.is_video && passes >= 2 && s->intermediate &&
+                          cascade_dims_ok;
+    if (!cascaded && settings.is_video && passes >= 2 && s->intermediate) {
+        // process() carries no logger; stderr is where the CLI tools listen
+        // and a no-op elsewhere.
+        fprintf(stderr, "[dlssnr] cascaded multi-pass needs matching input and "
+                        "output sizes; running a single-engine pass instead\n");
+        fflush(stderr);
+    }
+
+    if (cascaded) {
         // Cascaded dual-engine multipass for video:
         // Pass 0 -> Feature 0 -> intermediate (denoises raw frame, advances Feature 0 history once)
         dlss_cuda::FrameDesc f0 = frame;
@@ -780,6 +822,7 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
             }
         }
     }
+    const auto after_evaluate = std::chrono::steady_clock::now();
 
     out.width = output_width;
     out.height = output_height;
@@ -843,6 +886,15 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         s->readback->Unmap(0, nullptr);
     }
 
+    if (phase_timing) {
+        const auto ended = std::chrono::steady_clock::now();
+        fprintf(stderr, "[timing] upload %.1f ms, evaluate %.1f ms, readback %.1f ms\n",
+                std::chrono::duration<double, std::milli>(after_upload - began).count(),
+                std::chrono::duration<double, std::milli>(after_evaluate - after_upload).count(),
+                std::chrono::duration<double, std::milli>(ended - after_evaluate).count());
+        fflush(stderr);
+    }
+
     if (looks_like_blank_result(in, out)) {
         error = "DLSS returned a blank image (the GPU launch produced no pixels)";
         out.pixels.clear();
@@ -870,6 +922,8 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
     const auto began = std::chrono::steady_clock::now();
     const unsigned output_width = settings.output_width ? settings.output_width : width;
     const unsigned output_height = settings.output_height ? settings.output_height : height;
+    const UINT row_bytes = width * 8;
+    const UINT padded = aligned_pitch(row_bytes);
     const UINT out_row_bytes = output_width * 8;
     const UINT out_padded = aligned_pitch(out_row_bytes);
     const bool direct_readback = [] {
@@ -889,12 +943,14 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
         }
         s->readback = make_buffer(s->device, (UINT64)out_padded * output_height, D3D12_HEAP_TYPE_READBACK,
                                   D3D12_RESOURCE_STATE_COPY_DEST);
+        s->upload = make_buffer(s->device, (UINT64)padded * height, D3D12_HEAP_TYPE_UPLOAD,
+                                D3D12_RESOURCE_STATE_GENERIC_READ);
         s->motion_tex = make_motion_texture(s->device, width, height);
         s->motion_up = make_buffer(s->device,
                                    (UINT64)aligned_pitch((UINT)width * 4) * height,
                                    D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         if (!s->colour || !s->result || (need_intermediate && !s->intermediate) ||
-            !s->readback || !s->motion_tex || !s->motion_up) {
+            !s->upload || !s->readback || !s->motion_tex || !s->motion_up) {
             error = "the working images could not be created";
             return false;
         }
@@ -966,7 +1022,8 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
             out.pixels.clear();
             return false;
         }
-    } else if (motion && !motion->empty() && s->motion_tex && s->motion_up) {
+    } else if (motion && !motion->empty() && motion->width == width &&
+               motion->height == height && s->motion_tex && s->motion_up) {
         const UINT motion_pitch = aligned_pitch((UINT)width * 4);
         unsigned char *mapped = nullptr;
         D3D12_RANGE nothing{0, 0};
