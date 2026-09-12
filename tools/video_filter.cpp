@@ -326,6 +326,7 @@ struct OutputFrame {
     double ms = 0.0;
     bool is_eos = false;
     bool blank = false;
+    bool input_has_signal = false;
 };
 
 struct ChildProcess {
@@ -1008,6 +1009,7 @@ void half_rgba_to_rgb48(const enhancer::Image &image, unsigned char *rgb48, bool
     struct PartialStat {
         double sum = 0.0;
         double sum_sq = 0.0;
+        float max_channel = 0.0f;
         size_t samples = 0;
     };
     const size_t n_threads = WorkerPool::instance().thread_count();
@@ -1016,6 +1018,7 @@ void half_rgba_to_rgb48(const enhancer::Image &image, unsigned char *rgb48, bool
     WorkerPool::instance().parallel_for(count, [&](size_t start, size_t end, size_t tid) {
         double l_sum = 0.0;
         double l_sum_sq = 0.0;
+        float l_max = 0.0f;
         size_t l_samples = 0;
         for (size_t i = start; i < end; ++i) {
             const uint16_t r = lut[src[i * 4 + 0]];
@@ -1025,29 +1028,34 @@ void half_rgba_to_rgb48(const enhancer::Image &image, unsigned char *rgb48, bool
             dst[i * 3 + 1] = g;
             dst[i * 3 + 2] = b;
             if ((i & 7u) == 0) {
-                const double luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 65535.0;
-                l_sum += luma;
-                l_sum_sq += luma * luma;
+                const float mx = (float)(std::max({r, g, b})) / 65535.0f;
+                if (mx > l_max) l_max = mx;
+                l_sum += mx;
+                l_sum_sq += (double)mx * mx;
                 ++l_samples;
             }
         }
         if (tid < stats.size()) {
             stats[tid].sum = l_sum;
             stats[tid].sum_sq = l_sum_sq;
+            stats[tid].max_channel = l_max;
             stats[tid].samples = l_samples;
         }
     });
 
     double sum = 0.0, sum_sq = 0.0;
+    float max_ch = 0.0f;
     size_t samples = 0;
     for (const auto &s : stats) {
         sum += s.sum;
         sum_sq += s.sum_sq;
+        if (s.max_channel > max_ch) max_ch = s.max_channel;
         samples += s.samples;
     }
     const double mean = samples ? sum / (double)samples : 0.0;
     const double variance = samples ? sum_sq / (double)samples - mean * mean : 0.0;
-    blank = (mean < 0.005 && variance < 0.0001);
+    // Align with output_is_blank: per-channel max < 0.005 is the failed launch signature.
+    blank = (max_ch < 0.005f) || (mean < 0.002 && variance < 0.0001);
 }
 
 void resize_rgb48(const unsigned char *src, unsigned sw, unsigned sh,
@@ -2050,18 +2058,18 @@ bool output_is_blank(const enhancer::Image &image) {
     return (max_channel < 0.005f) || (mean < 0.002 && variance < 0.0001);
 }
 
-// True when the input picture carries visible content (any sampled sRGB-encoded
-// half above roughly 38/255). Dark frames -- fade-in openings, night scenes --
-// legitimately produce a near-black output, so the blank verdict on the output
-// must be gated by this.
+// True when the input picture carries visible content (any sampled RGB
+// above sRGB ~27/255, linear ~0.008, binary16 0x2000). Dark frames -- fade-in openings,
+// night scenes -- legitimately produce a near-black output, so the blank verdict
+// on the output must be gated by this.
 bool image_has_signal(const enhancer::Image &image) {
     if (image.empty()) return false;
     const uint16_t *src = image.pixels.data();
     const size_t count = (size_t)image.width * image.height;
     for (size_t i = 0; i < count; i += 8) {
-        if (enhancer::half_to_float(src[i * 4 + 0]) > 0.15f ||
-            enhancer::half_to_float(src[i * 4 + 1]) > 0.15f ||
-            enhancer::half_to_float(src[i * 4 + 2]) > 0.15f)
+        if ((src[i * 4 + 0] & 0x7fff) > 0x2000 ||
+            (src[i * 4 + 1] & 0x7fff) > 0x2000 ||
+            (src[i * 4 + 2] & 0x7fff) > 0x2000)
             return true;
     }
     return false;
@@ -2737,9 +2745,9 @@ static int run_main_once(int argc, char **argv) {
 
             bool blank = false;
             half_rgba_to_rgb48(frame->out, frame->model_output.data(), blank);
-            if (blank) {
+            if (blank && frame->input_has_signal) {
                 blank_count.fetch_add(1);
-                fprintf(stderr, "[warn] frame %u output looks blank\n", frame->index);
+                fprintf(stderr, "[warn] frame %u output looks blank despite input carrying signal\n", frame->index);
                 failed = true;
                 retryable = true;
                 abort_pipeline.store(true);
@@ -2889,6 +2897,7 @@ static int run_main_once(int argc, char **argv) {
         out_frame->index = in_frame->index;
         out_frame->ms = ms;
         out_frame->is_eos = false;
+        out_frame->input_has_signal = in_frame->input_has_signal;
 
         if (options.comp_opts.is_active()) {
             apply_post_composite(in_frame->in, out_frame->out, options.comp_opts);

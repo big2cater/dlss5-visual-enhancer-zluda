@@ -147,13 +147,20 @@ void release(IUnknown *&object) {
 
 // A successful DLSS call can occasionally return a near-zero texture when the
 // underlying HIP/ZLUDA launch was a no-op. Treat that as failure only when the
+// input carries visible signal (a black frame should stay black).
 bool looks_like_blank_result(const Image &in, const Image &out) {
     if (in.empty() || out.empty()) return false;
-    constexpr uint16_t signal = 0x2a00; // approximately 0.0469 in binary16
-    constexpr uint16_t blank = 0x0250;  // approximately 0.0186 in binary16
+    // Input signal threshold: sRGB ~27/255 -> linear ~0.0082 -> ~0x2000 in FP16.
+    constexpr uint16_t signal = 0x2000;
+    // Blank output threshold: 0.005 in linear FP16 is 0x191e.
+    constexpr uint16_t blank = 0x191e;
     bool input_has_signal = false;
-    for (size_t i = 0; i < in.pixels.size(); ++i) {
-        if ((in.pixels[i] & 0x7fff) > signal) {
+    const size_t in_pixels = in.pixels.size() / 4;
+    for (size_t p = 0; p < in_pixels; ++p) {
+        const uint16_t r = in.pixels[p * 4 + 0] & 0x7fff;
+        const uint16_t g = in.pixels[p * 4 + 1] & 0x7fff;
+        const uint16_t b = in.pixels[p * 4 + 2] & 0x7fff;
+        if (r > signal || g > signal || b > signal) {
             input_has_signal = true;
             break;
         }
@@ -161,17 +168,25 @@ bool looks_like_blank_result(const Image &in, const Image &out) {
     if (!input_has_signal) return false;
 
     uint16_t output_max = 0;
-    for (size_t i = 0; i < out.pixels.size(); ++i) {
-        output_max = (std::max)(output_max, (uint16_t)(out.pixels[i] & 0x7fff));
+    const size_t out_pixels = out.pixels.size() / 4;
+    for (size_t p = 0; p < out_pixels; ++p) {
+        const uint16_t r = out.pixels[p * 4 + 0] & 0x7fff;
+        const uint16_t g = out.pixels[p * 4 + 1] & 0x7fff;
+        const uint16_t b = out.pixels[p * 4 + 2] & 0x7fff;
+        output_max = (std::max)({output_max, r, g, b});
     }
     return output_max <= blank;
 }
 
 bool looks_like_blank_output(const Image &out) {
     if (out.empty()) return false;
-    constexpr uint16_t blank = 0x0250;  // approximately 0.0186 in binary16
-    for (size_t i = 0; i < out.pixels.size(); ++i) {
-        if ((out.pixels[i] & 0x7fff) > blank) return false;
+    constexpr uint16_t blank = 0x191e;  // approximately 0.005 in binary16
+    const size_t out_pixels = out.pixels.size() / 4;
+    for (size_t p = 0; p < out_pixels; ++p) {
+        const uint16_t r = out.pixels[p * 4 + 0] & 0x7fff;
+        const uint16_t g = out.pixels[p * 4 + 1] & 0x7fff;
+        const uint16_t b = out.pixels[p * 4 + 2] & 0x7fff;
+        if (r > blank || g > blank || b > blank) return false;
     }
     return true;
 }
