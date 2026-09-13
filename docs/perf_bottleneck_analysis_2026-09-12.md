@@ -102,9 +102,9 @@ ISA of the top kernel (`cc_split_swin_16h_qkv_512_chained_fp8`, module 14,
   code has ~400 `scratch_load` + ~400 `scratch_store` sites.
 - **13.8 % of all instructions are `s_delay_alu`** — the scheduler papering
   over long dependency chains it cannot fill.
-- fp8 is emulated: no fp8 ALU, no WMMA at all — every fp8 op goes through
+- fp8 is emulated: no native fp8 ALU on gfx11 — every fp8 op goes through
   `v_perm_b32`/`v_bfi_b32` unpack + `v_pk_mul_f16`/`v_pk_add_f16` +
-  `v_cvt_f16_f32` repack (~20 % of the code).
+  `v_cvt_f16_f32` repack (~20 % of the code). *(Note: while initially suspected that WMMA was absent, later detailed cache disassembly confirmed 24,319 WMMAs are present, but severely diluted by ~327 auxiliary ops per WMMA due to pass scheduling failure; see evening revision below)*.
 - 512 `s_swappc_b64` call sites — the "chained" network layers are real
   subroutine calls, not inlined.
 - The PTX carries **no tuning directives at all** (no `.maxnreg`,
@@ -169,140 +169,124 @@ run by a single wave. The levers that remain live are compiler-quality work
 
 ## The real smoking gun: fp8 mma.sync is fully emulated (evening revision)
 
-Counting instructions in NVIDIA's own PTX for the module carrying
-`cc_split_swin_16h_qkv_512_chained_fp8` (dumped by zluda_trace):
+Counting instructions in NVIDIA's own PTX for the model across all modules (dumped by zluda_trace in `build/trace/framebench.exe/*.ptx`):
 
-- **5056 `mma.sync`** module-wide — shapes `m16n8k16` (f16, 2880) and
-  `m16n8k32` (**e4m3 fp8 tensor core**, 2176). The qkv kernel alone contains
-  **256 mma.sync** plus 196 `cvt.rn.satfinite.e4m3x2.f16x2` (f16→fp8 packing
-  for the next layer). An earlier statement that NVIDIA "does not use tensor
-  cores for this layer" is wrong — it is a tensor-core network with fp8
-  storage.
+- **54,800 total `mma.sync` instructions** model-wide:
+  - **35,072** `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16` (64.0 %)
+  - **19,728** `mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16` (36.0 %)
+  - Exactly **0** `.f32` accumulator variants (all model MMAs interface via `.f16` accumulators/outputs).
+- The top kernel (`cc_split_swin_16h_qkv_512_chained_fp8`) alone contains **256 mma.sync** plus 196 `cvt.rn.satfinite.e4m3x2.f16x2` (f16→fp8 packing for the next layer). An earlier statement that NVIDIA "does not use tensor cores for this layer" is wrong — it is a tensor-core network with fp8 storage.
 
 ZLUDA's lowering of these on gfx11:
 
-- fp8 **conversions are lowered to real function calls**:
-  `replace_instructions_with_functions.rs` maps `cvt ... e4m3x2` to calls
-  into ptx_impl helpers (`cvt_rn_satfinite_e4m3x2_f16x2` etc.) — every call
-  is an `s_swappc_b64` with a scratch stack frame and a scheduling fence.
-  This is where the 512 calls in the compiled kernel come from: the calls
-  and the fp8 emulation tax are the **same root cause**.
-- fp8 **mma.sync is emulated scalar-wise**: the compiled kernel has no WMMA
-  and no fp8 ops — each m16n8k32 (4096 MACs) becomes hundreds of
-  perm/bfi/pk_f16 instructions with dependent chains (measured: ~182 cycles
-  per MAC on the qkv kernel). e4m3 values are exactly representable in f16,
-  so the mma could instead lower to unpack-e4m3→f16 + `v_wmma_f32_16x16x16_f16`
-  (which the fork's CombineMMA already supports for f16) — one WMMA per 4096
-  MACs instead of hundreds of scalar ops.
+- fp8 **conversions were lowered to real function calls**:
+  `replace_instructions_with_functions.rs` mapped `cvt ... e4m3x2` to calls into ptx_impl helpers (`cvt_rn_satfinite_e4m3x2_f16x2` etc.) — every call was an `s_swappc_b64` with a scratch stack frame and a scheduling fence.
+- fp8 **conversions inlined (done 2026-09-12)**:
+  Call-based lowering was replaced with direct inline emission in `ptx/src/pass/llvm/emit.rs` for all four f16x2/f32 ↔ e4m3x2/e5m2x2 directions, with direct bit-level RNE rounding from f32. Verified: 588/588 compiler tests, numeric sweeps, and measured 83.5 → 78.4 ms/frame (~6 % gain).
+- **The 0.5% WMMA metric decoded**:
+  `tools/analyze_vopd.py` on the compiled cache (`zluda2.db`) reveals **24,319 instances of `v_wmma_f32_16x16x16_f16`** physically present across modules 9–15 (e.g., 3,473 in module 14, 9,921 in module 15).
+  However, total Vector ALU instructions number **4,849,571** (plus 1.78M scalar ALU and 1.33M memory/LDS ops).
+  WMMA is not missing or dropped; rather, **each single WMMA instruction is diluted by ~327 auxiliary instructions** (DPP shuffles, `fp8_widen_pair` expansion, stack/alloca frames, and uncombined `dMatrixSplit` LDS bpermute trees).
 
-This makes the two concrete levers, both in `ptx/src/pass`:
+## Project proposal: lower fp8 mma.sync to WMMA & unblock fusion (2026-09-13)
 
-1. ~~Inline the fp8 conversion helpers~~ — **done the same day**: the
-   call-based lowering was replaced with inline emission for all four
-   f16x2/f32 ↔ e4m3x2/e5m2x2 directions (IEEE RNE, denormals, satfinite,
-   .relu), and the f32 sources round **directly from the f32 bits** — the
-   f32→f16→e4m3 two-step double-rounded (1.1875 − 2^-16 lands on 1.25
-   through f16, 1.125 directly). Verified: 588/588 compiler tests, the
-   real-GPU `_amdgpu` numeric tests for both f32 cvt forms, and a
-   315 762-value exhaustive sweep of the direct-RNE algorithm against a
-   spec reference. Measured: 83.5 → 78.4 ms/frame (~6 %); the remaining
-   `s_swappc_b64` calls in the hot kernels are the m16n8k16/m16n8k32
-   mma.sync software emulation.
-2. **Lower fp8 m16n8k32 mma.sync via f16 WMMA after unpacking** — the next
-   lever, unchanged.
+### Why existing WMMA is drowned: the Pass scheduling bottleneck
 
-Grid sizing question closed: the trace shows the snippet queried only four
-device attributes (compute capability major/minor) at init — the (6,2)-style
-grids are the snippet's own Swin-window decomposition, not something ZLUDA
-under-answered.
+In `ext/llvm-project/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp:897-908`:
+```cpp
+PB.registerOptimizerEarlyEPCallback(
+  [](ModulePassManager &PM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+    // TODO: maybe disable combining MMAs and just lower them individually
+    // if at O0
+    FunctionPassManager ZludaFPM;
+    ZludaFPM.addPass(CombineMMAPass());
+    if (Level != OptimizationLevel::O0) {
+      ZludaFPM.addPass(EarlyCSEPass());
+    }
+    ZludaFPM.addPass(LowerMatrixConversionsPass());
+    PM.addPass(createModuleToFunctionPassAdaptor(std::move(ZludaFPM)));
+  });
+```
 
-## Project proposal: lower fp8 mma.sync to WMMA (2026-09-13)
+1. **`OptimizerEarlyEPCallback` runs before the Inliner**:
+   When `CombineMMAPass` executes, the kernel contains only external function calls (`call @__zluda_ptx_impl_...`). The intrinsic `llvm.zluda.mma` is not yet visible in the kernel's basic blocks.
+2. **Subfunctions contain only 1 MMA each**:
+   Inside `zluda_ptx_impl`, each helper function encapsulates a single MMA instance. `CombineMMA.cpp:179` requires `FirstA == SecondA` within the same basic block to fuse two 16×8 MMAs into one 16×16 WMMA. Across separate helper functions before inlining, **pairing is structurally impossible**.
+3. **The author's TODO context (line 901-902)**:
+   The source comments `// TODO: maybe disable combining MMAs and just lower them individually / if at O0` demonstrate the author was weighing combining vs. individual lowering, but overlooked the pipeline scheduling order.
+4. **Pipeline anchors in `AMDGPUTargetMachine.cpp`**:
+   - Line 954 already provides `registerOptimizerLastEPCallback` (currently only hosting `AMDGPUAttributor`) — an existing hook running *after* function inlining.
+   - Line 894 has `AMDGPUAlwaysInlinePass()`, but it is enclosed inside line 849 (`registerFullLinkTimeOptimizationEarlyEPCallback`), which only executes during LTO pre-link. Since ZLUDA compiles module-by-module without LTO pre-link callbacks, inlining never ran prior to `registerOptimizerEarlyEPCallback`.
+5. **Forced fallback to `lowerMMA`**:
+   Every MMA falls into `lowerMMA` (unpaired 16×8 padded with zero B columns to 16×16). Immediately following, `LowerMatrixConversionsPass` emits `dMatrixSplit`—inserting heavy trees of `bpermuteLane` (LDS roundtrips), `select`, and shift operations to carve the 16×8 result back out of the 16×16 hardware fragment.
+6. **Post-inlining blindness**:
+   When the Inliner finally flattens the helper functions into the kernel basic blocks, `CombineMMAPass` is never registered or called again anywhere else in the pipeline. Adjacent MMAs that naturally share `A` (e.g. `module_0001_01.ptx:16870-16880`) remain permanently frozen as separate padded WMMAs wrapped in bpermute/LDS scaffolding.
+7. **Direct verification flag**:
+   Compiling with `-mllvm -print-after=zluda-combine-mma` (pass registered in `PassRegistry.def:574`) allows directly observing whether paired intrinsics are formed and how many `amdgcn_wmma` instructions are emitted.
 
-The fp8 conversion inlining shipped in v5 removed the call tax but left the
-mma arithmetic itself emulated scalar-wise. This section is the feasibility
-case for the next lever: lowering `m16n8k32` e4m3 `mma.sync` to unpacked-f16
-`v_wmma_f32_16x16x16_f16` (2 instructions per mma), reusing the fork's
-existing CombineMMA f16 path.
+### Why register spills happen — correcting the accumulator math
 
-### Why the scalar emulation is slow — the accumulator argument
+- In `m16n8k32`, matrix $C$ has $16 \times 8 = \mathbf{128}$ total elements for the **entire 32-thread warp**.
+- Each individual thread owns $\frac{128}{32} = \mathbf{4}$ output elements:
+  - In FP32 accumulation: **4 VGPRs per thread**.
+  - In packed FP16 accumulation: **2 VGPRs per thread**.
+- For a fused $16 \times 16$ tile, matrix $C$ has $16 \times 16 = \mathbf{256}$ total elements for the warp:
+  - In FP32 accumulation: $\frac{256}{32} = \mathbf{8}$ VGPRs per thread.
+  - In packed FP16 accumulation: $\frac{256}{32} = \mathbf{4}$ VGPRs per thread.
+- The number 4096 is warp MAC operations ($16 \times 8 \times 32$), corresponding to 128 MAC operations per thread, **not 128 accumulator slots**.
+- The measured `vgpr_spill_count: 118–184` is therefore **not** caused by accumulator count. It is caused by:
+  1. The scalar fallback / conversion scaffolding allocating multiple 8-element temporary row/col arrays (`upper_row[8]`, `lower_row[8]`, `left_column[8]`, `right_column[8]`).
+  2. The ~327 auxiliary DPP, unpack, and `bpermuteLane` instructions per MMA keeping live values across unrolled loop iterations.
 
-Each thread of a scalar-emulated m16n8k32 owns 4096/32 = **128 output
-elements**, each needing a live f32 accumulator across the whole k-loop.
-That is the root cause of the measured register state: `vgpr_count = 192`
-(at the ceiling) with **118–184 spill slots** per thread, and ~400 static
-scratch loads/stores per kernel dragging global-memory latency into the
-innermost loop. It also explains why raising the VGPR budget changed
-nothing (A/B in the register-allocation section above): the pressure is
-structural to the emulation, not a budget mistake.
+### Hardware WMMA comparison
 
-### Why WMMA collapses it
-
-| | scalar emulation | 2× `v_wmma_f32_16x16x16_f16` |
+| Metric | Unpaired 16×8 (Current) | Fused 2× `v_wmma_f32_16x16x16_f16` (16×16 tile) |
 |---|---|---|
-| math throughput per wave | ~4–8 MACs/cycle (dependent chains + unpack) | 8192 MACs in ~32–64 cycles ≈ **128–256 MACs/cycle** |
-| accumulator VGPRs per mma tile | ~128 (spilled) | **8** (F32 fragment) |
-| fp8 unpack per element | per use, interleaved | once per element, same total |
-
-The accumulator collapse kills the scratch traffic and the spill-driven
-dependency chains at the same time as the math speeds up — a compounding
-gain, not just an instruction swap.
+| Math throughput per wave | ~4–8 MACs/cycle (dependent chains + unpack) | 8192 MACs in ~32–64 cycles ≈ **128–256 MACs/cycle** |
+| Accumulator VGPRs per thread | **4** (F32) or **2** (packed F16) | **8** (F32) or **4** (packed F16) |
+| Padding / Truncation overhead | High (padded B + `dMatrixSplit` LDS bpermute tree) | **Zero** (natural 16×16 coverage, direct writeback) |
+| Auxiliary instructions per MMA | ~327 (LDS, DPP, pack/unpack, split) | **~12–16** (DPP quad-gather + bitwise widen) |
 
 ### Numerics: equivalent or better
 
-e4m3 is exactly representable in f16 (3-bit mantissa ⊂ 10-bit, ±448 ⊂
-±65504); products of two e4m3 values are exact in f16; accumulation happens
-in F32 inside the WMMA — the same accumulator precision NVIDIA's fp8
-`mma.sync.f32.e4m3` specifies. No precision is traded away.
+- NVIDIA PTX in DLSS-NR uses `.f16` accumulators (`mma.sync...f16.e4m3.e4m3.f16` and `mma.sync...f16.f16.f16.f16`).
+- In ZLUDA's lowering (`zluda_ptx_impl.cpp:1424-1438`), the `.f16` input is widened to `float4`, accumulated in F32 inside `v_wmma_f32_16x16x16_f16`, and converted back via `fptrunc` on return.
+- This preserves the exact mixed-precision behavior of NVIDIA Ada Lovelace Tensor Cores (F32 accumulation internally, rounded to F16 output). No precision is traded away.
 
-### The honest unknowns (what gates the 80–120 ms claim)
+### Implementation levers: Two viable architectural paths
 
-1. **Fragment layout conversion**: NVIDIA `mma.sync` thread layouts differ
-   from AMD WMMA layouts; e4m3→f16 unpack must land operands in the right
-   VGPR slots. Cost per element ~1–2 perm/bfi ops, paid once per operand —
-   but the layout shuffle itself is new code with its own register pressure.
-   Mitigation: the fork's CombineMMA already solves the f16 variant of this
-   exact problem; e4m3 prepends one unpack stage to a proven path.
-2. **n8→n16 padding**: 2× WMMA (m16n16k32) covers one m16n8k32 with the N
-   half padded — an effective ~50% efficiency loss unless adjacent n8 tiles
-   share a WMMA. The proposal's "2 instructions" already prices this in.
-3. **The memory ceiling**: once the math collapses, weight/activation
-   streaming from VRAM becomes the next wall. Expect the gain curve to bend
-   there; that is the follow-on optimization target (LDS staging,
-   prefetch shape), not a reason to skip this.
+1. **Route A (LLVM Pass timing — the definitive 2-line experiment)**:
+   In `ext/llvm-project/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp`, move `CombineMMAPass` and `LowerMatrixConversionsPass` from `registerOptimizerEarlyEPCallback` (line 897) to `registerOptimizerLastEPCallback` (line 954), after the Inliner has flattened subfunctions into kernel basic blocks.
+   - **Verification test**: Recompile a single module (e.g. module 14) with `-mllvm -print-after=zluda-combine-mma`, run `llvm-objdump -d`, and verify that `v_wmma` count halves, `bpermuteLane` / LDS overhead drops, and `ZLUDA_LAUNCH_TIMING=1` shows immediate per-launch latency reduction.
+2. **Route B (PTX IR AST Peephole Fusion in Rust)**:
+   In ZLUDA's `ptx/src/pass/`, implement a peephole fusion pass on the PTX AST prior to LLVM emission:
+   - *Why AST pass is required*: Line-by-line translation in `emit.rs` cannot observe adjacent instruction context or detect operand sharing across multiple `mma.sync` statements.
+   - In the PTX AST pass, inspect basic blocks to identify adjacent `mma.sync` pairs sharing identical matrix $A$ operands (e.g. `module_0001_01.ptx:16870-16880`: `mma.sync {%r623, %r635}, {%r595..598}, {%r593..594}` and `mma.sync {%r642, %r649}, {%r595..598}, {%r599..600}`).
+   - Fuse the two 16×8 operations into a single 16×16 node with combined $B=[B_0, B_1]$.
+   - Directly emit hardware WMMA intrinsics without relying on LLVM C++ pass pattern matching.
+3. **Unified target (FP16 + FP8)**:
+   Both the 35,072 FP16 MMAs and the 19,728 FP8 MMAs lower into `v_wmma_f32_16x16x16_f16`. Unblocking fusion at either layer optimizes both precisions simultaneously.
 
-### Projection (with the above uncertainties)
+### Projection (with uncertainties)
 
-| platform | path | projected 1080p frame |
+| Platform | Path | Projected 1080p frame |
 |---|---|---|
-| RX 7900 XT (gfx1100) | m16n8k32 e4m3 → unpack → 2× f16 WMMA | **80–120 ms** (band: 40–150 depending on premises) |
-| RX 9070/9080 (gfx1200) | native fp8 WMMA (zero unpack) | **30–50 ms** — requires confirming the fork's LLVM carries the gfx12 fp8 WMMA intrinsic |
-| RX 6000 (gfx10) | no WMMA hardware | excluded — keeps the scalar path; fp8-inline still applies |
+| RX 7900 XT (gfx1100) | m16n8k32 e4m3 → DPP widen → fused f16 WMMA | **80–120 ms** (band: 40–150 ms depending on memory bandwidth ceiling) |
+| RX 9070/9080 (gfx1200) | native fp8 WMMA (`v_wmma_f32_16x16x16_fp8_fp8`) | **30–50 ms** — confirmed: vendored LLVM carries `Intrinsic::amdgcn_wmma_f32_16x16x16_fp8_fp8` and gfx12 builtins |
+| RX 6000 (gfx10) | no WMMA hardware | excluded — keeps scalar path; fp8-inline still applies |
 
-The 640×360 case improves by the same ratio (84 ms → ~25–35 ms), since the
-same kernels run there.
+640×360 case improves proportionally from 78.4 ms down toward ~20–30 ms.
 
-### Phased plan (risk-ordered, each phase self-verifying)
+### Phased plan
 
-1. **Single-kernel prototype**: extend CombineMMA with an e4m3→f16 unpack
-   stage for `m16n8k32`; A/B one kernel with `ZLUDA_LAUNCH_TIMING`. This
-   alone confirms or kills the 3–8× claim for the cost of one kernel's
-   work. Gate: measured per-launch improvement before touching anything
-   else.
-2. **Rollout**: all 15 modules; 588 compiler tests (new shape tests for the
-   unpack+WMMA form); end-to-end framebench on 640×360 and 1920×1076;
-   re-check spills via `llvm-readobj --notes`.
-3. **RDNA4 branch**: map `m16n8k32` e4m3 to the gfx12 fp8 WMMA intrinsic if
-   present in the vendored LLVM; otherwise scalar-fallback with a feature
-   test.
+1. **Pass timing experiment (Route A)**: Move `CombineMMAPass` to `registerOptimizerLastEPCallback` in `AMDGPUTargetMachine.cpp`; test module 14 with `ZLUDA_LAUNCH_TIMING=1` and `-mllvm -print-after=zluda-combine-mma`.
+2. **Peephole fusion / direct lowering (Route B)**: If LLVM pass migration has unintended phase interactions, implement PTX AST peephole pairing in Rust (`ptx/src/pass`).
+3. **Numeric verification**: Run full test suite (`cargo test --test spirv_run`), verifying that F32 accumulation produces identical output to NVIDIA references across subnormals, NaNs (`0x7F`), and saturated values (`0x7E`).
+4. **RDNA4 branch**: Hook `__oclc_ISA_version >= 12000` directly to `amdgcn_wmma_f32_16x16x16_fp8_fp8`.
 
 ### Artifacts
 
-- `build/framebench.cpp` (+ `build/framebench_build.bat`) — multi-frame
-  per-frame timing harness (processor_smoke with N frames and a summary).
+- `build/framebench.cpp` (+ `build/framebench_build.bat`) — multi-frame per-frame timing harness (processor_smoke with N frames and summary).
 - `build/launchbench.cpp` (+ bat) — ZLUDA launch/sync microbenchmark.
-- `DLSSNR_PHASE_TIMING=1` in `core/image_processor.cpp` — permanent per-phase
-  stderr timing, default off.
-- zluda_trace usage that worked here:
-  `ZLUDA_LOG_DIR=<dir> zluda.exe --zluda-trace -- framebench.exe ...`
-  (driving `zluda_trace.dll` directly as `nvcuda.dll` does **not** work — the
-  NGX snippet's export resolution fails; go through the inject host).
+- `tools/analyze_vopd.py` — disassembly profiler for VOPD and WMMA counts in `zluda2.db`.
+- `DLSSNR_PHASE_TIMING=1` in `core/image_processor.cpp` — permanent per-phase stderr timing, default off.
