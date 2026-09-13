@@ -1,6 +1,6 @@
 # Performance bottleneck analysis — 2026-09-12
 
-Machine: RX 7900 XT (gfx1100), Windows, big2cater/ZLUDA @ 1d47bf4.
+Machine: RX 7900 XT (gfx1100), Windows, big2cater/ZLUDA @ 1d47bf4 (initial pass) through 5ac9102+ (fp8-inline build; later sections).
 Workload: DLSS-NR (nvngx_dlssnr 310.8.0, CG2R backbone `crazy-cuckoo`), 640×360,
 temporal path, WGP mode (fork default). All numbers from `build/framebench`
 (start + N frames, per-frame `last_ms`) and `DLSSNR_PHASE_TIMING=1`.
@@ -41,6 +41,10 @@ inside `EvaluateFeature`.
   the main remaining lever.
 
 ## What it IS bound by
+
+*(superseded 2026-09-13: the "latency-bound weight streaming" hypothesis below
+was the leading candidate from the first pass — the evening revision identifies
+MMA pad/split scaffolding as the dominant term. Read on before acting on it.)*
 
 The GPU Compute engine is 98 % busy while CPU spins in `cuCtxSynchronize` —
 evaluate is GPU-bound. But the kernel work is astonishingly small:
@@ -183,7 +187,13 @@ ZLUDA's lowering of these on gfx11:
   Call-based lowering was replaced with direct inline emission in `ptx/src/pass/llvm/emit.rs` for all four f16x2/f32 ↔ e4m3x2/e5m2x2 directions, with direct bit-level RNE rounding from f32. Verified: 588/588 compiler tests, numeric sweeps, and measured 83.5 → 78.4 ms/frame (~6 % gain).
 - **The 0.5% WMMA metric decoded**:
   `tools/analyze_vopd.py` on the compiled cache (`zluda2.db`) reveals **24,319 instances of `v_wmma_f32_16x16x16_f16`** physically present across modules 9–15 (e.g., 3,473 in module 14, 9,921 in module 15).
-  *(Note on module coverage: The cache currently holds 7 of the 15 modules compiled during benchmark runs. Across all 15 modules, the theoretical unpaired WMMA count would be $35,072 \text{ (FP16)} + 19,728 \times 2 \text{ (FP8 split)} = 74,528$. The measured 24,319 is $\approx 32.6\%$ of this full-model total, consistent with the partial module coverage).*
+  *(Note on module coverage: the measured cache holds 7 of the 15 modules —
+  46.7 % by count, but only ~32.6 % of the expected 74,528 unpaired WMMAs
+  (35,072 FP16 + 19,728 × 2 FP8-split). Two hypotheses, both alive: (a) MMA
+  density is strongly non-uniform — module 15 alone accounts for 9,921
+  (~41 % of all measured); (b) a fraction of expected WMMAs never
+  materialised (scalarised or merged downstream). Route A's before/after
+  count on module 14 separates the two at near-zero cost.)*
   Total Vector ALU instructions in the cache number **4,849,571** (plus 1.78M scalar ALU and 1.33M memory/LDS ops).
   Dividing total instructions by 24,319 yields **~327 total instructions per WMMA as a whole-cache macro dilution ratio** (or ~200 vector ALU/WMMA). This macro ratio spans the entire network's non-MMA computation (LayerNorm, softmax, GELU, residual additions, and layout transforms). At the kernel level (e.g. the qkv kernel with 28,220 total instructions and ~256–512 WMMAs), total instructions per WMMA is ~55–110 (including non-MMA kernel logic). Crucially: WMMA is not dropped by downstream compiler passes, but each uncombined WMMA is burdened by local scaffolding (operand widening, B-matrix zero padding, and LDS `bpermuteLane` split trees).
 
@@ -273,6 +283,11 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 | Local scaffolding per tile | ~40–80 ops | **~12–16 ops** |
 | Accumulator VGPRs per thread | 4 (F32) / 2 (packed F16) | 8 (F32) / 4 (packed F16) |
 
+  Per element the cost is identical (4/128 = 8/256 = 1 VGPR per 32 outputs).
+  The fused tile holds more accumulators because it covers twice the output,
+  not because fusion is more register-hungry; the register win comes from
+  deleting the operand-staging arrays.
+
 **Sizing the win honestly.** Using cache-consistent figures (24,319 WMMAs against ~7.96 M total instructions, both from the same 7 cached modules): removing ~30–65 scaffolding ops per tile removes **0.73–1.58 M instructions, i.e. 9–20 % of the total** — not the ~2–3× that comparing against scalar emulation would imply. These kernels are latency-bound, however, and serialized `bpermuteLane` LDS round-trips cost far more in cycle latency than in issue slots, so measured latency reduction may significantly outperform this static estimate. **That gap is precisely why Route A is a measurement, not an argument.**
 
 ### Numerics: equivalent or better
@@ -283,9 +298,52 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 
 ### Implementation levers: Two viable architectural paths
 
-1. **Route A (LLVM Pass timing — the definitive 2-line experiment)**:
-   In `ext/llvm-project/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp`, move `CombineMMAPass` and `LowerMatrixConversionsPass` from `registerOptimizerEarlyEPCallback` (line 897) to `registerOptimizerLastEPCallback` (line 954), after the Inliner has flattened subfunctions into kernel basic blocks.
-   - **Verification test**: Recompile a single module (e.g. module 14) with `-mllvm -print-after=zluda-combine-mma`, run `llvm-objdump -d`, and verify that `v_wmma` count halves, `bpermuteLane` / LDS overhead drops, and `ZLUDA_LAUNCH_TIMING=1` shows immediate per-launch latency reduction.
+0. **Step 0 (precondition for Route A — strip `noinline` from the ptx_impl
+   bitcode)**: disassembling the shipped `zluda_ptx_impl.bc` shows the mma
+   helpers carry `noinline` (attribute group #16:
+   `{ convergent mustprogress noinline nounwind ... }`) — a leftover of the
+   O0-compile `optnone` pairing that the bitcode build pipeline's sed strips
+   only half of (`optnone` is stripped, `noinline` survives; and LLVM's
+   inliner refuses noinline callees, `InlineCost.cpp:3246`). Evidence: the
+   compiled kernels contain live `s_swappc_b64` calls to the `_ZL49`
+   helpers, and the `_ZL49` call sites in the bitcode carry no
+   `alwaysinline` (attribute #23 = `{ convergent nounwind }`) — the
+   `[[clang::always_inline]]` hints in the C++ source did not survive the
+   O0 + sed rebuild. Consequence: **the intrinsics never reach the kernel's
+   basic blocks at any pipeline stage, so pairing is structurally
+   impossible until this is fixed.** Fix: add `sed 's/noinline//g'` to both
+   bitcode build pipelines (the two intentional `noinline` sites —
+   `__assert_fail`, `vprintf` — become inlineable, a harmless size change
+   worth watching in the vgpr/spill notes). `ZLUDA_PTX_IMPL_DIGEST` bumps,
+   invalidating the cache once by design.
+   - **Expected outcome of Step 0 alone**: the `s_swappc` calls disappear
+     (the O3 inliner flattens the now-inlineable helpers) but the WMMA
+     count does **not** halve — `CombineMMAPass` still runs at the early
+     extension point, before the inliner, so it still sees calls instead
+     of intrinsics. That asymmetry is what cleanly separates the two
+     variables (inlining failure vs pass timing).
+   - Empirical per-module state of the current cache (s_swappc calls vs
+     `v_wmma` instructions, static disassembly):
+
+     | module | KB | s_swappc | v_wmma |
+     |---|---|---|---|
+     | 15 | 12,950 | 9,776 | 9,921 |
+     | 13 | 9,618 | 7,216 | 3,001 |
+     | 14 | 9,434 | 6,960 | 3,473 |
+     | 12 | 8,302 | 6,608 | 2,705 |
+     | 11 | 7,509 | 4,288 | 3,713 |
+     | 10 | 4,739 | 4,352 | 1,441 |
+     | 9 | 396 | 256 | 65 |
+
+     Calls and WMMAs coexist at ~1:1 in every module — a partial, mixed
+     inlining state (some helper call sites flattened by the cost model,
+     others blocked), consistent with the noinline blocker rather than
+     with an all-or-nothing rule.
+1. **Route A (LLVM Pass timing — the definitive experiment)**:
+   After Step 0, in `ext/llvm-project/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp`, move `CombineMMAPass` and `LowerMatrixConversionsPass` from `registerOptimizerEarlyEPCallback` (line 897) to `registerOptimizerLastEPCallback` (line 954), after the Inliner has flattened subfunctions into kernel basic blocks.
+   - **Verification test**: Recompile a single module (e.g. module 14) with
+     `-mllvm -print-changed=diff -mllvm -filter-print-funcs=cc_split_swin_16h_qkv_512_chained_fp8`,
+     run `llvm-objdump -d`, and verify that `v_wmma` count halves, `bpermuteLane` / LDS overhead drops, and `ZLUDA_LAUNCH_TIMING=1` shows immediate per-launch latency reduction.
 2. **Route B (PTX IR AST Peephole Fusion in Rust)**:
    In ZLUDA's `ptx/src/pass/`, implement a peephole fusion pass on the PTX AST prior to LLVM emission:
    - *Why AST pass is required*: Line-by-line translation in `emit.rs` cannot observe adjacent instruction context or detect operand sharing across multiple `mma.sync` statements.
@@ -297,7 +355,7 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 
 ### Projection (with uncertainties)
 
-*(Projection derived under the earlier scalar-emulation premise; to be re-derived after Route A measures the actual pad/split removal and LDS latency reduction).*
+*(Two figures, two premises: **232–264 ms** is derived from cache-consistent static instruction scaling (the 9–20 % removal above) and is the defensible baseline; **80–120 ms** is the legacy figure from the earlier scalar-emulation premise and requires LDS-latency removal to compound. Route A replaces both with a measurement).*
 
 | Platform | Path | Projected 1080p frame |
 |---|---|---|
@@ -309,9 +367,19 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 
 ### Phased plan
 
-1. **Pass timing experiment (Route A)**: Move `CombineMMAPass` to `registerOptimizerLastEPCallback` in `AMDGPUTargetMachine.cpp`; test module 14 with `ZLUDA_LAUNCH_TIMING=1` and `-mllvm -print-after=zluda-combine-mma`.
+0. **Strip `noinline` from the ptx_impl bitcode** (both sed pipelines), rebuild
+   `zluda_ptx_impl.bc`, and measure alone: the `s_swappc` calls should vanish
+   while the WMMA count stays flat. This isolates the inlining variable from
+   the pass-timing variable and is an independent win on its own (helpers
+   become inlineable everywhere, not just for the mma pairing).
+1. **Pass timing experiment (Route A)**: Move `CombineMMAPass` to `registerOptimizerLastEPCallback` in `AMDGPUTargetMachine.cpp`; test module 14 with `ZLUDA_LAUNCH_TIMING=1` and
+   `-mllvm -print-changed=diff -mllvm -filter-print-funcs=cc_split_swin_16h_qkv_512_chained_fp8`.
 2. **Peephole fusion / direct lowering (Route B)**: If LLVM pass migration has unintended phase interactions, implement PTX AST peephole pairing in Rust (`ptx/src/pass`).
-3. **Numeric verification**: Run full test suite (`cargo test --test spirv_run`), verifying that F32 accumulation produces identical output to NVIDIA references across subnormals, NaNs (`0x7F`), and saturated values (`0x7E`).
+3. **Numeric verification**: run the full suite with `cargo test -p ptx`
+   (debug build — in release mode the IR fixture comparison hits a
+   pre-existing value-naming difference unrelated to the change), verifying
+   that F32 accumulation produces identical output to NVIDIA references
+   across subnormals, NaNs (`0x7F`), and saturated values (`0x7E`).
 4. **RDNA4 branch**: Add a `>= 12000` branch ahead of the existing `11000..13000` branch in `zluda_ptx_impl.cpp:1424`, so RDNA4 selects native `amdgcn_wmma_f32_16x16x16_fp8_fp8` instead of falling into the f16-widen path.
 
 ### Artifacts
