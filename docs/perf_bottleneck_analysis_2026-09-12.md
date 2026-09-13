@@ -189,7 +189,7 @@ ZLUDA's lowering of these on gfx11:
 - fp8 **conversions were lowered to real function calls**:
   `replace_instructions_with_functions.rs` mapped `cvt ... e4m3x2` to calls into ptx_impl helpers (`cvt_rn_satfinite_e4m3x2_f16x2` etc.) — every call was an `s_swappc_b64` with a scratch stack frame and a scheduling fence.
 - fp8 **conversions inlined (done 2026-09-12)**:
-  Call-based lowering was replaced with direct inline emission in `ptx/src/pass/llvm/emit.rs` for all four f16x2/f32 ↔ e4m3x2/e5m2x2 directions, with direct bit-level RNE rounding from f32. Verified: 588/588 compiler tests, numeric sweeps, and measured 83.5 → 78.4 ms/frame (~6 % gain).
+  Call-based lowering was replaced with direct inline emission in `ptx/src/pass/llvm/emit.rs` for all four f16x2/f32 ↔ e4m3x2/e5m2x2 directions, with direct bit-level RNE rounding from f32. Verified: 588/588 compiler tests, numeric sweeps, and measured 83.5 → 78.4 ms/frame (~6 % gain; two separate runs — the register A/B's 78.8 ms landing is the same magnitude, the 0.4 ms spread is run-to-run noise).
 - **The 0.5% WMMA metric decoded**:
   `tools/analyze_vopd.py` on the compiled cache (`zluda2.db`) reveals **24,319 instances of `v_wmma_f32_16x16x16_f16`** physically present across modules 9–15 (e.g., 3,473 in module 14, 9,921 in module 15).
   *(Note on module coverage: the measured cache holds 7 of the 15 modules —
@@ -378,11 +378,47 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 
 640×360 case: pending empirical measurement with Route A (static instruction scaling suggests ~63–71 ms, down from 78.4 ms; lower latencies depend on whether single-wave wait latency collapses with the removal of LDS bpermute).
 
+### RDNA4 (gfx12) field status — 2026-09-13: no successful run recorded
+
+All numbers above come from the RX 7900 XT (gfx1100). **No RDNA4 measurement
+exists**; the 30–50 ms figure is extrapolated from the intrinsic being present,
+not from a run.
+
+A field report on an RX 9070 XT (gfx1201) fails before any frame is produced:
+
+- `1 of 15 modules could not be translated` during precompile, and at runtime
+  `[CCNRDGpuInfo::CreateFeature:363] error: cuModuleLoadFile Function failed`
+  → `Init_Kernels failed: get kernel
+  "cc_tinlayout_fused_pre_block_swin_3h_32_3_ds_fp8" failed`.
+- The failing module is the one carrying the **fp8** Swin kernel.
+- Confounding factor on that machine: `HSA_OVERRIDE_GFX_VERSION` was set to
+  **11.0.0**, which suppresses the RDNA4 auto-config (`gpu_detection.h:109-119`
+  only injects 12.0.1 when the variable is unset) and makes ZLUDA compile gfx11
+  ELF for a gfx1201 device. **Not yet confirmed whether removing it fixes the
+  run** — that is the open question.
+
+Consequences:
+
+1. **Phase 4 may be a correctness prerequisite, not a performance nicety.**
+   Today gfx12 falls into the `>= 11000 && < 13000` f16-widen branch
+   (`zluda_ptx_impl.cpp:1424`), i.e. RDNA4 is handed the RDNA3 WMMA form.
+   Whether that is merely slow or genuinely uncompilable on gfx12 is exactly
+   what this report cannot yet distinguish — and resolving it should outrank the
+   gfx11 frame-rate work, because gfx11 users are "slow" while RDNA4 users may
+   be "broken".
+2. **`gpu_detection.h` must not defer to an obviously mismatched override.**
+   When the detected card is RDNA4 (name matches 9070) but
+   `HSA_OVERRIDE_GFX_VERSION` is not `12.*`, the auto-config currently prints a
+   line and stands aside. It should warn and override — and that warning has to
+   reach the GUI log, since `fprintf(stderr)` is invisible in `dlssnr_gui.exe`.
+
 ### Phased plan
 
 0. **Strip `noinline` from the ptx_impl bitcode** (both sed pipelines), rebuild
-   `zluda_ptx_impl.bc`, and measure alone: the `s_swappc` calls should vanish
-   while the WMMA count stays flat. This isolates the inlining variable from
+   `zluda_ptx_impl.bc`, and measure alone: the **mma-helper** `s_swappc` calls
+   should vanish (gate: mma-helper call count → 0, *not* total `s_swappc` → 0
+   — the chained layer calls, `__assert_fail` and `vprintf` stay) while the
+   WMMA count stays flat. This isolates the inlining variable from
    the pass-timing variable and is an independent win on its own (helpers
    become inlineable everywhere, not just for the mma pairing).
 1. **Pass timing experiment (Route A)**: Move `CombineMMAPass` to `registerOptimizerLastEPCallback` in `AMDGPUTargetMachine.cpp`; test module 14 with `ZLUDA_LAUNCH_TIMING=1` and
