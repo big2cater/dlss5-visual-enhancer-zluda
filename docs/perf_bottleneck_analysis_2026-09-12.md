@@ -396,10 +396,17 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 
 ### Artifacts
 
-- `build/framebench.cpp` (+ `build/framebench_build.bat`) — multi-frame per-frame timing harness (processor_smoke with N frames and summary).
-- `build/launchbench.cpp` (+ bat) — ZLUDA launch/sync microbenchmark.
+- `tools/framebench.cpp` — multi-frame per-frame timing harness (start once,
+  N frames, per-frame and steady-state summary). Same link line as
+  `build_smoke.bat`: `cl /std:c++17 /EHsc /O2 /utf-8 /I core /I dlss_layer
+  tools\framebench.cpp core\image_processor.cpp core\precompile.cpp
+  dlss_layer\dlss_cuda.cpp dlss_layer\frame_blit.cpp wintrust.lib d3d12.lib
+  dxgi.lib d3dcompiler.lib windowscodecs.lib ole32.lib shell32.lib user32.lib`.
+- `tools/launchbench.cpp` — ZLUDA launch/sync microbenchmark:
+  `cl /std:c++17 /EHsc /O2 /utf-8 tools\launchbench.cpp`, run as
+  `launchbench <nvcuda.dll> <module.ptx>`.
 - `tools/analyze_vopd.py` — disassembly profiler for VOPD and WMMA counts in `zluda2.db`.
 - `DLSSNR_PHASE_TIMING=1` in `core/image_processor.cpp` — permanent per-phase stderr timing, default off.
 - `zluda_trace` operational invocation:
   `ZLUDA_LOG_DIR=<dir> zluda.exe --zluda-trace -- framebench.exe ...`
-  *(Note: Driving `zluda_trace.dll` directly as `nvcuda.dll` does **not** work because the NGX snippet's export resolution fails; execution must proceed through the inject host `zluda.exe`).*
+  *(Note: Driving `zluda_trace.dll` directly as `nvcuda.dll` does **not** work because the NGX snippet's export resolution fails; execution must proceed through the inject host `zluda.exe`. The trace dump files referenced by line numbers above were one-off local artifacts and have been cleaned; the invocation line regenerates them.)*
