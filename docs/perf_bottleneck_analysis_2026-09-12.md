@@ -60,19 +60,15 @@ overhead (that is 0.6 µs) and not the `s_dcache.inv` prelude (one instruction).
 
 ## Recommended next steps
 
-1. **Per-kernel GPU timing from inside the fork.** An env-gated event pair
-   around each `hipModuleLaunchKernel` (or a rocprofv2 trace) would rank the
-   156 kernels by GPU duration and confirm the 0.5 ms uniformity. This is the
-   single most valuable measurement; RGP would show the same directly.
+1. ~~**Per-kernel GPU timing from inside the fork**~~ — **implemented and closed.**
+   Implemented via `ZLUDA_LAUNCH_TIMING=1` in `zluda/src/impl/function.rs` (event pair per launch). Measured kernel GPU time at 80.6 ms/frame and identified the top serialized attention kernels.
 2. **Chase the single-wave latency** for the top kernels: check whether the
    compiled ISA does scalar (s_load) weight fetches with long `s_waitcnt`
    chains, whether `glc`/coherent bits are forced on image accesses, and
    whether LDS staging of weights could turn per-kernel latency into
    throughput. `tools/analyze_vopd.py` is the starting toolkit.
-3. **More waves per kernel** — if grids are chosen by the snippet's host code
-   from device attributes, verify every attribute ZLUDA answers (SM count,
-   occupancy) matches what NVIDIA would return; an under-answer shrinks grids
-   and turns every kernel latency-bound.
+3. ~~**More waves per kernel / grid sizing**~~ — **verified and closed.**
+   Inspection of the snippet host code shows it queries only 4 basic device attributes (`CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK`, `WARP_SIZE`, `MAX_SHARED_MEMORY_PER_BLOCK`, `COMPUTE_CAPABILITY_MAJOR/MINOR`). The (6,2) grid reflects Swin transformer's own window partitioning (patch/window spatial layout), not ZLUDA under-reporting attributes.
 
 ## Per-kernel timing results (2026-09-12, later the same day)
 
@@ -185,8 +181,9 @@ ZLUDA's lowering of these on gfx11:
   Call-based lowering was replaced with direct inline emission in `ptx/src/pass/llvm/emit.rs` for all four f16x2/f32 ↔ e4m3x2/e5m2x2 directions, with direct bit-level RNE rounding from f32. Verified: 588/588 compiler tests, numeric sweeps, and measured 83.5 → 78.4 ms/frame (~6 % gain).
 - **The 0.5% WMMA metric decoded**:
   `tools/analyze_vopd.py` on the compiled cache (`zluda2.db`) reveals **24,319 instances of `v_wmma_f32_16x16x16_f16`** physically present across modules 9–15 (e.g., 3,473 in module 14, 9,921 in module 15).
-  However, total Vector ALU instructions number **4,849,571** (plus 1.78M scalar ALU and 1.33M memory/LDS ops).
-  WMMA is not missing or dropped; rather, **each single WMMA instruction is diluted by ~327 auxiliary instructions** (DPP shuffles, `fp8_widen_pair` expansion, stack/alloca frames, and uncombined `dMatrixSplit` LDS bpermute trees).
+  *(Note on module coverage: The cache currently holds 7 of the 15 modules compiled during benchmark runs. Across all 15 modules, the theoretical unpaired WMMA count would be $35,072 \text{ (FP16)} + 19,728 \times 2 \text{ (FP8 split)} = 74,528$. The measured 24,319 is $\approx 32.6\%$ of this full-model total, consistent with the partial module coverage).*
+  Total Vector ALU instructions in the cache number **4,849,571** (plus 1.78M scalar ALU and 1.33M memory/LDS ops).
+  Dividing total instructions by 24,319 yields **~327 total instructions per WMMA as a whole-cache macro dilution ratio** (or ~200 vector ALU/WMMA). This macro ratio spans the entire network's non-MMA computation (LayerNorm, softmax, GELU, residual additions, and layout transforms). At the kernel level (e.g. the qkv kernel with 28,220 total instructions and ~256–512 WMMAs), total instructions per WMMA is ~55–110 (including non-MMA kernel logic). Crucially: WMMA is not dropped by downstream compiler passes, but each uncombined WMMA is burdened by local scaffolding (operand widening, B-matrix zero padding, and LDS `bpermuteLane` split trees).
 
 ## Project proposal: lower fp8 mma.sync to WMMA & unblock fusion (2026-09-13)
 
@@ -224,6 +221,29 @@ PB.registerOptimizerEarlyEPCallback(
 7. **Direct verification flag**:
    Compiling with `-mllvm -print-after=zluda-combine-mma` (pass registered in `PassRegistry.def:574`) allows directly observing whether paired intrinsics are formed and how many `amdgcn_wmma` instructions are emitted.
 
+### Code proof: Why cross-instruction pairing is mathematically inevitable once inlined
+
+Inside `zluda_ptx_impl.cpp:1400-1417`, `fp8_mma_half` emits a single intrinsic:
+```cpp
+return __llvm_zluda_mma_m16n8k16_f32_f16_f16_f32_optnone(a, bb, acc);
+```
+In `zluda_ptx_impl.cpp:1426-1428`, one `m16n8k32` is lowered to two consecutive `fp8_mma_half` calls ($k \in [0..15]$ with `a_reg[0..1]`, and $k \in [16..31]$ with `a_reg[2..3]`).
+Internally within a single `m16n8k32`, `FirstA != SecondA` (`a_reg[0..1]` vs `a_reg[2..3]`), so intra-instruction pairing cannot occur.
+
+However, adjacent PTX instructions naturally share operand $A$:
+In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k32` instructions share `{%r595..%r598}` (matrix $A$). When inlined into the kernel, this expands into four intrinsics:
+
+| Intrinsic | $A$ Source | $B$ Source | Target 16×16 Tile Quadrant |
+|---|---|---|---|
+| `mma1_k0_15`  | `a_reg[0], a_reg[1]` | `b1[0]` | $k \in [0..15]$, Left half ($N \in [0..7]$) |
+| `mma1_k16_31` | `a_reg[2], a_reg[3]` | `b1[1]` | $k \in [16..31]$, Left half ($N \in [0..7]$) |
+| `mma2_k0_15`  | `a_reg[0], a_reg[1]` | `b2[0]` | $k \in [0..15]$, Right half ($N \in [8..15]$) |
+| `mma2_k16_31` | `a_reg[2], a_reg[3]` | `b2[1]` | $k \in [16..31]$, Right half ($N \in [8..15]$) |
+
+- `mma1_k0_15` and `mma2_k0_15` share the **exact same SSA values** for $A$ (originating from the same `fp8_widen_pair`). Once inlined, `EarlyCSEPass` exposes identical operands, causing `FirstA == SecondA` in `CombineMMA.cpp:179` to evaluate to `true`. They fuse into a single hardware 16×16 WMMA ($k \in [0..15]$) with combined $B = [b_1[0], b_2[0]]$.
+- `mma1_k16_31` and `mma2_k16_31` similarly fuse into a single hardware 16×16 WMMA ($k \in [16..31]$) with combined $B = [b_1[1], b_2[1]]$.
+- **Result: 4 intrinsics collapse into exactly 2 hardware WMMAs (50% reduction)**. The verification gate `v_wmma count halves` is not an empirical hope, but a mathematical necessity derived from the SSA graph.
+
 ### Why register spills happen — correcting the accumulator math
 
 - In `m16n8k32`, matrix $C$ has $16 \times 8 = \mathbf{128}$ total elements for the **entire 32-thread warp**.
@@ -236,7 +256,7 @@ PB.registerOptimizerEarlyEPCallback(
 - The number 4096 is warp MAC operations ($16 \times 8 \times 32$), corresponding to 128 MAC operations per thread, **not 128 accumulator slots**.
 - The measured `vgpr_spill_count: 118–184` is therefore **not** caused by accumulator count. It is caused by:
   1. The scalar fallback / conversion scaffolding allocating multiple 8-element temporary row/col arrays (`upper_row[8]`, `lower_row[8]`, `left_column[8]`, `right_column[8]`).
-  2. The ~327 auxiliary DPP, unpack, and `bpermuteLane` instructions per MMA keeping live values across unrolled loop iterations.
+  2. The local scaffolding instructions (DPP/widen, B-padding, and heavy `bpermuteLane` LDS split trees) keeping live values across unrolled loop iterations.
 
 ### Hardware WMMA comparison
 
@@ -245,7 +265,8 @@ PB.registerOptimizerEarlyEPCallback(
 | Math throughput per wave | ~4–8 MACs/cycle (dependent chains + unpack) | 8192 MACs in ~32–64 cycles ≈ **128–256 MACs/cycle** |
 | Accumulator VGPRs per thread | **4** (F32) or **2** (packed F16) | **8** (F32) or **4** (packed F16) |
 | Padding / Truncation overhead | High (padded B + `dMatrixSplit` LDS bpermute tree) | **Zero** (natural 16×16 coverage, direct writeback) |
-| Auxiliary instructions per MMA | ~327 (LDS, DPP, pack/unpack, split) | **~12–16** (DPP quad-gather + bitwise widen) |
+| Local MMA scaffolding per tile | **~40–80 ops** (2× B-padding, fp8-widen, + 2× LDS `bpermuteLane` split trees) | **~12–16 ops** (shared DPP quad-gather + bitwise widen for A, zero LDS split) |
+| Whole-cache instruction ratio | ~327 total ops/WMMA (macro dilution including non-MMA layers) | ~160 total ops/WMMA (WMMA halved, split scaffolding eliminated) |
 
 ### Numerics: equivalent or better
 
@@ -290,3 +311,6 @@ PB.registerOptimizerEarlyEPCallback(
 - `build/launchbench.cpp` (+ bat) — ZLUDA launch/sync microbenchmark.
 - `tools/analyze_vopd.py` — disassembly profiler for VOPD and WMMA counts in `zluda2.db`.
 - `DLSSNR_PHASE_TIMING=1` in `core/image_processor.cpp` — permanent per-phase stderr timing, default off.
+- `zluda_trace` operational invocation:
+  `ZLUDA_LOG_DIR=<dir> zluda.exe --zluda-trace -- framebench.exe ...`
+  *(Note: Driving `zluda_trace.dll` directly as `nvcuda.dll` does **not** work because the NGX snippet's export resolution fails; execution must proceed through the inject host `zluda.exe`).*
