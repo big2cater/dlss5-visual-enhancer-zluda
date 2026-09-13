@@ -22,6 +22,8 @@ derivation is SSA-exact. The *size* of the win is not, and Route A is the
 measurement that decides it — 9–20 % of instructions by whole-cache static
 scaling is the defensible floor, but the scaffolding is concentrated in the hot
 chained kernels, which sit well above that ratio (see the sizing note below).
+**This lever has since been built and measured, and it does not work: read the
+⚠️ note on Step 0 / Route A below before planning around this paragraph.**
 
 **Ordered plan (supersedes the "Phased plan" ordering further down).**
 
@@ -39,6 +41,41 @@ symptoms.
 - **Route A — pass timing** (move `CombineMMAPass` after the inliner), with
   CSE/GVN ahead of the relocated pass.
 - **Route B — PTX AST peephole fusion**, if Route A's phase interactions bite.
+
+  ⚠️ **Measured 2026-09-13: Step 0 + Route A are a 1.6× regression. Do not ship
+  them as they stand.** Both were implemented, built and run. Frame time at
+  640×360 went **86 ms → 139 ms** (avg GPU 127.5 → 186.0 ms, throughput 7.40 →
+  5.19 fps) on the same input, the same command line, the same snippet — only
+  the driver DLL swapped. Step 0 does exactly what it claimed: the mma-helper
+  call sites drop to zero, so the helpers really are inlined into the kernel. But
+  Route A does **not** pair them, and inlining without pairing is pure cost,
+  because the pad/split scaffolding is then duplicated at every call site. On the
+  two MMA-bearing modules measured (paired by PTX hash, so only the compiler
+  differs):
+
+  | module | `s_swappc` | `v_wmma` | `ds_bpermute` | `scratch_load` | size |
+  |---|---|---|---|---|---|
+  | 405 KB | 256 → **0** | 65 → 192 (**2.9×**) | 5 816 → 12 160 (**2.1×**) | 908 → 1 090 | +37% |
+  | 4.85 MB | 4 352 → **0** | 1 441 → 3 616 (**2.5×**) | 104 952 → 193 472 (**1.8×**) | 11 973 → 20 676 (**+73%**) | +47% |
+
+  The `v_wmma` column is the tell: 192 is 96 × 2 and 3 616 ≈ 1 808 × 2, i.e.
+  exactly the *unpaired* ratio. Pairing would have halved them.
+
+  **Why it does not pair — and this is the corrected lever.** `combineMMA` is
+  gated on `FirstA == SecondA` (`CombineMMA.cpp:179`), and
+  `tryToReorderOperands` gives up the moment a dependency between the two MMAs
+  `mayReadOrWriteMemory` (`CombineMMA.cpp:43-47`). After inlining, the second
+  MMA's `A` chain runs through the first one's `ds_bpermute`/LDS scaffolding. The
+  CSE/GVN placed ahead of the relocated pass does not help: the operands are not
+  duplicated expressions that CSE could unify, they are *ordered against each
+  other* by memory-visible operations. So the lever is not "run the combiner
+  later" but "make the operand chains reorderable, or fuse before the scaffolding
+  is emitted".
+
+  State left behind: deployment reverted (`run/`, `build/`, `dist/` all carry the
+  pre-change `8B6C9E8E…`), the fork changes left uncommitted in the working tree
+  so the experiment is reproducible, and the module cache holds both generations
+  (15 rows each) paired by PTX hash for further analysis.
 
 The two tests that decide whether either worked are both gfx11 and both cheap:
 the mma-helper `s_swappc` count going to zero, and `v_wmma` halving on module 14
