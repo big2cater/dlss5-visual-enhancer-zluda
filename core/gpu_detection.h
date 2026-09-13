@@ -146,11 +146,33 @@ inline void auto_configure_gpu_environment() {
                          name_lower.find(L"radeon 9") != std::wstring::npos ||
                          (best_gpu->device_id >= 0x7480 && best_gpu->device_id <= 0x74DF));
 
-        char msg[512] = {};
+        char msg[768] = {};
         if (is_rdna4) {
             char env_hsa[64] = {};
             DWORD len = GetEnvironmentVariableA("HSA_OVERRIDE_GFX_VERSION", env_hsa, sizeof(env_hsa));
-            if (len == 0 || env_hsa[0] == '\0') {
+            const bool has_override = (len > 0 && env_hsa[0] != '\0');
+            // A stale RDNA3-era override (11.*) on a gfx12 device makes the
+            // runtime build gfx11 ELF that the driver refuses to load: every
+            // module fails before the first frame (field report, RX 9070 XT,
+            // HSA_OVERRIDE_GFX_VERSION=11.0.0 -> cuModuleLoadFile failed).
+            // An override that does not name a gfx12 part is therefore
+            // corrected rather than honored -- loudly, because a manually set
+            // variable usually has a system-level copy that should be removed
+            // by hand.
+            const bool override_mismatch =
+                has_override && strncmp(env_hsa, "12", 2) != 0;
+            if (override_mismatch) {
+                SetEnvironmentVariableA("HSA_OVERRIDE_GFX_VERSION", "12.0.1");
+                _putenv("HSA_OVERRIDE_GFX_VERSION=12.0.1");
+                snprintf(msg, sizeof(msg),
+                         "[GPU-AutoConfig] Detected %ls (RDNA 4, %zu MB Dedicated VRAM) with "
+                         "HSA_OVERRIDE_GFX_VERSION=%s.\n"
+                         "[GPU-AutoConfig] Self-Healing: an override that does not name a gfx12 part "
+                         "breaks module loading on RDNA 4 -- corrected to 12.0.1.\n"
+                         "[GPU-AutoConfig] If you set this variable system-wide (older guides suggest "
+                         "11.0.0), remove it there too.\n",
+                         best_gpu->name.c_str(), best_gpu->dedicated_vram_mb, env_hsa);
+            } else if (!has_override) {
                 // Auto-inject HSA_OVERRIDE_GFX_VERSION=12.0.1 for RDNA 4
                 SetEnvironmentVariableA("HSA_OVERRIDE_GFX_VERSION", "12.0.1");
                 _putenv("HSA_OVERRIDE_GFX_VERSION=12.0.1");

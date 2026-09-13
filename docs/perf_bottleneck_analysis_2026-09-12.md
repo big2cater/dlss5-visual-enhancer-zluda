@@ -406,11 +406,15 @@ Consequences:
    what this report cannot yet distinguish — and resolving it should outrank the
    gfx11 frame-rate work, because gfx11 users are "slow" while RDNA4 users may
    be "broken".
-2. **`gpu_detection.h` must not defer to an obviously mismatched override.**
-   When the detected card is RDNA4 (name matches 9070) but
-   `HSA_OVERRIDE_GFX_VERSION` is not `12.*`, the auto-config currently prints a
-   line and stands aside. It should warn and override — and that warning has to
-   reach the GUI log, since `fprintf(stderr)` is invisible in `dlssnr_gui.exe`.
+2. ~~**`gpu_detection.h` must not defer to an obviously mismatched override.**~~ —
+   **implemented (2026-09-13)**: the RDNA4 branch now corrects a non-gfx12
+   override to 12.0.1 with a loud auto-config message, and the batch GUI
+   surfaces the same warning in its log window at startup
+   (`BatchWindow::hint_override_mismatch`). Note the original design intent
+   visible at `zluda_ptx_impl.cpp:1201` — the optnone wrapper exists to stop
+   ZLUDA-specific passes from optimizing away the intrinsic — which is why
+   the fix strips `noinline`/`optnone` in the bitcode build rather than
+   removing the wrapper blindly.
 
 ### External corroboration: a native HIP reimplementation hits the projection
 

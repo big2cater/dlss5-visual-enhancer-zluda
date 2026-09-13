@@ -1,10 +1,12 @@
 #include "batch_window.h"
 
 #include "compare_view.h"
+#include "gpu_detection.h"
 #include "../core/precompile.h"
 
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <cstring>
 #include <QColor>
 #include <QComboBox>
 #include <QCoreApplication>
@@ -146,6 +148,34 @@ BatchWindow::BatchWindow() {
     load_settings();
     update_mode_ui();
     hint_cold_cache();
+    hint_override_mismatch();
+}
+
+// RDNA4 machines with a stale RDNA3-era override get the env corrected by
+// gpu_detection.h for every child process -- but the person at the keyboard
+// set that variable somewhere system-wide, and a WIN32 GUI cannot print the
+// warning to a stderr nobody reads. The log window is the one channel that
+// reaches them.
+void BatchWindow::hint_override_mismatch() {
+    char env_hsa[64] = {};
+    const DWORD len = GetEnvironmentVariableA("HSA_OVERRIDE_GFX_VERSION", env_hsa, sizeof env_hsa);
+    if (len == 0 || env_hsa[0] == '\0' || strncmp(env_hsa, "12", 2) == 0) return;
+    for (const auto &gpu : dlssnr::enumerate_gpus()) {
+        std::wstring lower = gpu.name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+        if (gpu.is_virtual) continue;
+        if (lower.find(L"9070") != std::wstring::npos ||
+            lower.find(L"9060") != std::wstring::npos ||
+            lower.find(L"rx 9") != std::wstring::npos ||
+            lower.find(L"radeon 9") != std::wstring::npos) {
+            log_line(tr("提示：检测到 RDNA 4 显卡，但环境变量 HSA_OVERRIDE_GFX_VERSION=%1 "
+                         "是旧版覆盖值（会导致模块加载失败）。本程序已自动纠正为 12.0.1；"
+                         "建议删除系统环境变量里的这项手动设置。")
+                         .arg(QString::fromLocal8Bit(env_hsa)),
+                     QColor(255, 200, 90));
+            return;
+        }
+    }
 }
 
 QString BatchWindow::application_dir() { return QCoreApplication::applicationDirPath(); }

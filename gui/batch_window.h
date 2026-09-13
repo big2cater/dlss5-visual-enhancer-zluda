@@ -83,6 +83,7 @@ private:
     void on_prewarm_output();
     void on_prewarm_finished(int code, QProcess::ExitStatus status);
     void hint_cold_cache();
+    void hint_override_mismatch();
 
     QStringList arguments() const;
     bool validate(QString *problem) const;
