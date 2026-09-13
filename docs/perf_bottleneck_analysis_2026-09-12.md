@@ -614,11 +614,24 @@ improve.
 **Two ordering traps that make all of this a no-op if missed.**
 
 1. `ptx/lib/zluda_ptx_impl.bc` and `_constrained.bc` are committed **build
-   inputs**, and they have **not** been regenerated — that needs the Linux + ROCm
-   pipeline in the file header (`/opt/rocm/amdgcn/bitcode/ocml.bc`). Until they
-   are, the `.cpp` changes reach no artifact at all, and `ZLUDA_PTX_IMPL_DIGEST`
-   will not even move, because `zluda/build.rs` digests the `.bc` files, not the
-   `.cpp`.
+   inputs**, and they have **not** been regenerated. Until they are, the `.cpp`
+   changes reach no artifact at all, and `ZLUDA_PTX_IMPL_DIGEST` will not even
+   move, because `zluda/build.rs` digests the `.bc` files, not the `.cpp`.
+   *(corrected 2026-09-13: an earlier draft called this "the Linux + ROCm
+   pipeline". It is not platform-specific, and the only two things in that header
+   that look like they are prove to be nothing of the sort — `/opt/rocm/.../ocml.bc`
+   is the Linux spelling of a file the Windows HIP SDK ships at the same relative
+   path (`C:\Program Files\AMD\ROCm\7.1\amdgcn\bitcode\ocml.bc`, 209 104 bytes,
+   with `bin\clang.exe` beside it), and the POSIX shell is Git Bash
+   (`D:\Git\usr\bin\sed.exe`). What is genuinely required is **the LLVM built from
+   `ext/llvm-project`**, because that tree is where the intrinsics are defined:
+   `llvm/include/llvm/IR/IntrinsicsZLUDA.td` declares
+   `int_zluda_mma_m16n8k16_f32_f16_f16_f32` and friends with
+   `[IntrNoMem, IntrConvergent]`. The `__asm("llvm.zluda.mma...")` declarations in
+   the .cpp only become intrinsics at all under that build; a stock LLVM sees an
+   unknown `llvm.*` name, and the attributes the pairing and legalisation rely on
+   go with it. That build — not an operating system — is what is missing here.)*
+
 2. The LLVM change alters emitted code, but the module cache key
    (`zluda/src/impl/module.rs:407`) freezes `VERGEN_GIT_SHA` before the commit
    lands and its explicit marker covers only the Rust-side translation passes.
