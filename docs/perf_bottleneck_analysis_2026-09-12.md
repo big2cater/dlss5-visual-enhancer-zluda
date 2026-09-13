@@ -368,12 +368,12 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 
 ### Projection (with uncertainties)
 
-*(Two figures, two premises: **232–264 ms** is derived from cache-consistent static instruction scaling — the 9–20 % removal applied to the **290 ms measured GPU average** from the solid-color runs — and is the defensible baseline; **80–120 ms** is the legacy figure from the earlier scalar-emulation premise and requires LDS-latency removal to compound. Route A replaces both with a measurement).*
+*(Two figures, two premises: **232–264 ms** is derived from cache-consistent static instruction scaling — the 9–20 % removal, measured on the 640×360 cache, applied to the **290 ms measured GPU average** from the solid-color runs; the cross-resolution extrapolation is justified by the per-kernel latency being resolution-independent, see above — and is the defensible baseline; **80–120 ms** is the legacy figure from the earlier scalar-emulation premise and requires LDS-latency removal to compound. Route A replaces both with a measurement).*
 
 | Platform | Path | Projected 1080p frame |
 |---|---|---|
 | RX 7900 XT (gfx1100) | m16n8k32 e4m3 → DPP widen → fused f16 WMMA | **~232–264 ms** (static instruction scaling, cache-consistent); **80–120 ms** target only if LDS-latency removal compounds; the 40 ms lower end of some bands is a theoretical floor, not an expectation |
-| RX 9070/9080 (gfx1200) | native fp8 WMMA (`v_wmma_f32_16x16x16_fp8_fp8`) | **30–50 ms** — confirmed: vendored LLVM carries `Intrinsic::amdgcn_wmma_f32_16x16x16_fp8_fp8` and gfx12 builtins |
+| RX 9060 XT (gfx1200) / RX 9070, 9070 XT (gfx1201) | native fp8 WMMA (`v_wmma_f32_16x16x16_fp8_fp8`) | **30–50 ms** — confirmed: vendored LLVM carries `Intrinsic::amdgcn_wmma_f32_16x16x16_fp8_fp8` and gfx12 builtins |
 | RX 6000 (gfx10) | no WMMA hardware | excluded — keeps scalar path; fp8-inline still applies |
 
 640×360 case: pending empirical measurement with Route A (static instruction scaling suggests ~63–71 ms, down from 78.4 ms; lower latencies depend on whether single-wave wait latency collapses with the removal of LDS bpermute).
@@ -411,6 +411,12 @@ Consequences:
    `HSA_OVERRIDE_GFX_VERSION` is not `12.*`, the auto-config currently prints a
    line and stands aside. It should warn and override — and that warning has to
    reach the GUI log, since `fprintf(stderr)` is invisible in `dlssnr_gui.exe`.
+3. **Detection coverage note (verified)**: the name match covers RX 9060/9070
+   and the generic "rx 9"/"radeon 9" forms (`gpu_detection.h:141-147`), so the
+   gfx1200 cards ARE auto-configured. One stale piece: the device-id fallback
+   range (0x7480–0x74DF) predates RDNA4 — adapters reporting without a
+   standard 9000-series name fall through it. Worth widening or dropping when
+   Phase 4 ships.
 
 ### Phased plan
 
