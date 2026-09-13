@@ -45,7 +45,8 @@
 //   --max-frames N        stop after N frames (for short test runs)
 //   --dump-frames DIR     also write each output frame as PNG into DIR
 //
-// Exit codes: 0 ok, 1 runtime failure, 2 usage.
+// Exit codes: 0 ok, 1 runtime failure, 2 retryable (a blank first frame --
+// real_main re-runs those in a fresh process). A usage error exits 1.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -1216,6 +1217,9 @@ struct Options {
     int max_frames = 0;
     bool audio = true;
     std::wstring dump_dir;
+    // --upscale-mode: the output enlargement ratio, not a network resolution.
+    // In video mode the encoder applies it (the network still renders at the
+    // decoded size); in still mode the network is asked for the larger output.
     double upscale = 1.0;
     double model_scale = 1.0; // compatibility; legacy GUI flag is ignored
     std::string dlss_model_preset = "default";
@@ -2135,14 +2139,33 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
     int w0_max = 0;
     int w1_max = 0;
     if (options.max_frames > 0) {
-        unsigned w0_estimated = (unsigned)std::round(split_sec * params.fps);
-        w0_max = (int)std::min((unsigned)options.max_frames, w0_estimated);
-        int rem = options.max_frames - w0_max;
-        if (rem > 0) {
-            unsigned w1_warmup = (unsigned)std::round(warmup_sec * params.fps);
-            w1_max = rem + (int)w1_warmup;
+        // Shard 1 counts --max-frames from its own decode start, which begins
+        // warmup_sec early and discards those frames before emitting, so its
+        // net contribution is (w1_max - warmup_frames).
+        const double warmup_frames = (params.fps > 0.0) ? warmup_sec * params.fps : 0.0;
+        double estimate = 0.0;
+        if (params.fps > 0.0) {
+            estimate = split_sec * params.fps;
+        } else if (total_dur > 0.0) {
+            // The probe gave no usable frame rate. Share the budget by the
+            // duration of each half instead of letting a zero estimate make
+            // the first shard unbounded (--max-frames 0 means "no limit").
+            estimate = (double)options.max_frames * (split_sec / total_dur);
         } else {
-            w1_max = 1;
+            estimate = options.max_frames;
+        }
+        const unsigned w0_estimated = (unsigned)std::max(1.0, std::floor(estimate + 0.5));
+        w0_max = (int)std::min((unsigned)options.max_frames, w0_estimated);
+        const int rem = options.max_frames - w0_max;
+        if (rem > 0) {
+            w1_max = rem + (int)std::llround(warmup_frames);
+        } else {
+            // The first shard already spends the whole budget, so the second
+            // one has nothing of its own to add -- but the concat step still
+            // needs a non-empty part. Let it decode its warmup frames plus one
+            // so exactly one real frame survives the warmup discard, instead
+            // of the empty file a bare "--max-frames 1" produced.
+            w1_max = (int)std::llround(warmup_frames) + 1;
         }
     }
 
@@ -2598,6 +2621,10 @@ static int run_main_once(int argc, char **argv) {
 
     const size_t frame_bytes = (size_t)model_w * model_h * 6;
     enhancer::Settings settings = options.settings;
+    // The network renders at the decoded size and the encoder does any
+    // --upscale-mode enlargement (see output_w above); DLSS is not asked to
+    // upscale here, so render and output stay 1:1 and the cascade below stays
+    // valid.
     settings.output_width = model_w;
     settings.output_height = model_h;
     settings.is_video = true;
@@ -2682,10 +2709,10 @@ static int run_main_once(int argc, char **argv) {
     std::atomic<int> reset_count{0};
     std::atomic<int> blank_count{0};
     std::atomic<double> elapsed_total{0.0};
-    std::atomic<unsigned> frames_written{0};
     std::atomic<unsigned> frames_written_count{0};
     std::atomic<bool> failed{false};
     std::atomic<bool> retryable{false};
+    std::atomic<bool> cpu_flow_notice{false};
     const auto pipeline_began = std::chrono::steady_clock::now();
 
     // Stage 1: Decoder reader & preprocessor thread
@@ -2829,12 +2856,11 @@ static int run_main_once(int argc, char **argv) {
                     fprintf(stderr, "[warn] could not dump frame %u\n", display_idx);
             }
 
-            frames_written.store(display_idx + 1);
             frames_written_count.fetch_add(1);
             if ((display_idx % 5) == 0 || (frame->index < 5)) {
                 fprintf(stderr, "[%.5u] %.0f ms (avg %.1f, reset=%d, blanks=%d)\n",
                         display_idx, frame->ms,
-                        elapsed_total.load() / (frame->index + 1),
+                        elapsed_total.load() / (frames_written_count.load() ? frames_written_count.load() : 1),
                         reset_count.load(), blank_count.load());
                 fflush(stderr);
             }
@@ -2871,27 +2897,49 @@ static int run_main_once(int argc, char **argv) {
         if (in_frame->reset) reset_count.fetch_add(1);
         settings.reset_accumulation = in_frame->reset;
 
-        // GPU motion vectors if enabled
+        // Motion vectors if enabled. The GPU guide is the fast path and the
+        // CPU estimator is the fallback the startup log advertises, so a
+        // device/shader-creation failure or a dispatch that comes back empty
+        // must land on CpuFlow rather than zeroing the field for the rest of
+        // the run.
         ID3D12Resource *gpu_motion = nullptr;
         unsigned gpu_motion_pitch = 0;
         const bool useFlow = options.flow;
-        if (useFlow && gpu_flow_ready) {
-            if (in_frame->reset) gpuflow.reset();
-            const unsigned qw = (model_w + 3) / 4, qh = (model_h + 3) / 4;
-            flow_luma.resize((size_t)qw * qh);
-            const unsigned char *data_ptr = in_frame->mapped_ptr ? (const unsigned char *)in_frame->mapped_ptr : in_frame->raw_bytes.data();
-            for (unsigned y = 0; y < qh; ++y) for (unsigned x = 0; x < qw; ++x) {
-                unsigned px = std::min(model_w - 1, x * 4u);
-                unsigned py = std::min(model_h - 1, y * 4u);
-                const uint16_t *p = (const uint16_t *)(data_ptr + ((size_t)py * model_w + px) * 6);
-                flow_luma[(size_t)y * qw + x] = ((unsigned)p[0] * 19595u + (unsigned)p[1] * 38470u + (unsigned)p[2] * 7471u) >> 16;
+        if (useFlow) {
+            const unsigned char *flow_rgb = in_frame->mapped_ptr
+                                                ? (const unsigned char *)in_frame->mapped_ptr
+                                                : in_frame->raw_bytes.data();
+            bool generated = false;
+            if (gpu_flow_ready && flow_rgb) {
+                if (in_frame->reset) gpuflow.reset();
+                const unsigned qw = (model_w + 3) / 4, qh = (model_h + 3) / 4;
+                flow_luma.resize((size_t)qw * qh);
+                for (unsigned y = 0; y < qh; ++y) for (unsigned x = 0; x < qw; ++x) {
+                    unsigned px = std::min(model_w - 1, x * 4u);
+                    unsigned py = std::min(model_h - 1, y * 4u);
+                    const uint16_t *p = (const uint16_t *)(flow_rgb + ((size_t)py * model_w + px) * 6);
+                    flow_luma[(size_t)y * qw + x] = ((unsigned)p[0] * 19595u + (unsigned)p[1] * 38470u + (unsigned)p[2] * 7471u) >> 16;
+                }
+                generated = gpuflow.compute(flow_luma, qflow);
+                if (generated) {
+                    CpuFlow::median3(qflow, qw, qh);
+                    CpuFlow::upscale4(qflow, qw, qh, model_w, model_h, in_frame->motion.pixels);
+                }
             }
-            bool generated = gpuflow.compute(flow_luma, qflow);
-            if (generated) {
-                CpuFlow::median3(qflow, qw, qh);
-                CpuFlow::upscale4(qflow, qw, qh, model_w, model_h, in_frame->motion.pixels);
-            } else {
-                in_frame->motion.pixels.assign((size_t)model_w * model_h * 2, 0);
+            if (!generated) {
+                if (flow_rgb) {
+                    // Only the first fallback is worth a line; a run that fell
+                    // back stays on the CPU path for every later frame anyway.
+                    if (!cpu_flow_notice.exchange(true)) {
+                        fprintf(stderr, "[flow] GPU motion guide produced nothing; "
+                                        "continuing on the CPU estimator\n");
+                        fflush(stderr);
+                    }
+                    flowgen.compute(flow_rgb, model_w, model_h, in_frame->reset,
+                                    in_frame->motion.pixels);
+                } else {
+                    in_frame->motion.pixels.assign((size_t)model_w * model_h * 2, 0);
+                }
             }
         }
 
@@ -3120,8 +3168,12 @@ static int real_main(int argc, char **argv) {
             retries = atoi(argv[i + 1]);
             if (retries < 0) retries = 0;
         } else if (!strcmp(argv[i], "--retry-delay")) {
-            retry_delay_ms = atoi(argv[i + 1]) * 1000;
-            if (retry_delay_ms < 0) retry_delay_ms = 0;
+            // Seconds -> ms without letting a pathological value overflow the
+            // int; an hour of cool-down is already far more than anyone wants.
+            long long delay_s = atoll(argv[i + 1]);
+            if (delay_s < 0) delay_s = 0;
+            if (delay_s > 3600) delay_s = 3600;
+            retry_delay_ms = (int)(delay_s * 1000);
         }
     }
 
@@ -3138,9 +3190,18 @@ static int real_main(int argc, char **argv) {
     // line comes from Windows so quoting survives untouched.
     std::wstring cmdline = GetCommandLineW();
     {
-        // Replace an existing "--retries N" pair, or append one.
-        std::wstring token = L"--retries";
-        size_t pos = cmdline.find(token);
+        // Replace an existing "--retries N" pair, or append one. Match the
+        // switch only at an argument boundary: a path that merely contains
+        // "--retries" somewhere must not be rewritten.
+        const std::wstring token = L"--retries";
+        size_t pos = std::wstring::npos;
+        for (size_t at = cmdline.find(token); at != std::wstring::npos;
+             at = cmdline.find(token, at + 1)) {
+            const bool left_ok = (at == 0) || cmdline[at - 1] == L' ';
+            const size_t after = at + token.size();
+            const bool right_ok = (after >= cmdline.size()) || cmdline[after] == L' ';
+            if (left_ok && right_ok) { pos = at; break; }
+        }
         const std::wstring repl =
             token + L" " + std::to_wstring(retries > 0 ? retries - 1 : 0);
         if (pos != std::wstring::npos) {

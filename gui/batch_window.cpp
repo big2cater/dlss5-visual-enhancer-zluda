@@ -1333,7 +1333,14 @@ void BatchWindow::probe_total() {
                  QStringLiteral("stream=r_frame_rate:format=duration"),
                  QStringLiteral("-of"), QStringLiteral("default=noprint_wrappers=1:nokey=1"),
                  input_->text().trimmed()});
-    if (!probe.waitForFinished(5000)) return;
+    if (!probe.waitForFinished(5000)) {
+        // A wedged ffprobe must not outlive this function: without the kill the
+        // QProcess goes out of scope while it is still running, Qt warns about
+        // it, and the child lingers until the application exits.
+        probe.kill();
+        probe.waitForFinished(2000);
+        return;
+    }
 
     // Line 0 is r_frame_rate, Line 1 is format=duration.
     double rate = 0;

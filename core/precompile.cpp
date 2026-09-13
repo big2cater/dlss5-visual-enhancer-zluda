@@ -49,6 +49,30 @@ bool room_for_another(size_t running) {
     return free_mb > kReserveMb + kHeadroomMb;
 }
 
+// The same gate as room_for_another, asked as a question about the machine
+// rather than about the next spawn: a compile process that stops accumulating
+// CPU under memory pressure is usually being paged out, not hung.
+bool memory_pressure_low() {
+    return free_physical_mb() < kReserveMb + kHeadroomMb;
+}
+
+// TerminateProcess returns before the target has actually exited, and the
+// handles it owned (its module_*.bin in particular) stay open until it does.
+// Closing the handle and deleting the file straight away therefore races the
+// child's teardown and leaves the temporary directory behind. Wait first.
+void terminate_and_reap(HANDLE process, DWORD wait_ms = 5000) {
+    if (!process || process == INVALID_HANDLE_VALUE) return;
+    TerminateProcess(process, 1);
+    WaitForSingleObject(process, wait_ms);
+    CloseHandle(process);
+}
+
+// A child that makes no CPU progress at all for this many 60 s slices is a
+// hang. The window is doubled when the machine is short of memory, because a
+// process being paged out looks identical to one that is stuck.
+constexpr int kStallSlices = 6;
+constexpr int kStallSlicesLowMemory = 12;
+
 std::wstring own_path() {
     wchar_t buffer[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, buffer, MAX_PATH);
@@ -367,17 +391,14 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
         if (running.empty()) break;
 
         // Wait in 60 s slices: a translation that makes no CPU progress at
-        // all for three slices is a hung child, and killing it beats letting
-        // it stall the whole pipeline (and the GUI) forever.
+        // all across the stall window is a hung child, and killing it beats
+        // letting it stall the whole pipeline (and the GUI) forever.
         const DWORD which = WaitForMultipleObjects((DWORD)running.size(), running.data(), FALSE,
                                                    60000);
         if (which == WAIT_FAILED) {
             DWORD err = GetLastError();
             error = "WaitForMultipleObjects failed with error " + std::to_string(err);
-            for (HANDLE h : running) {
-                TerminateProcess(h, 1);
-                CloseHandle(h);
-            }
+            for (HANDLE h : running) terminate_and_reap(h);
             failures += (unsigned)running.size() + (unsigned)(files.size() - next);
             running.clear();
             break;
@@ -405,11 +426,12 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
                     ULONGLONG cur = (((ULONGLONG)kernel.dwHighDateTime << 32) | kernel.dwLowDateTime) +
                                     (((ULONGLONG)user.dwHighDateTime << 32) | user.dwLowDateTime);
                     if (cur == cpu[j]) {
-                        if (++stalled[j] >= 3) {
-                            TerminateProcess(running[j], 1);
+                        const int stall_limit = memory_pressure_low() ? kStallSlicesLowMemory
+                                                                     : kStallSlices;
+                        if (++stalled[j] >= stall_limit) {
+                            terminate_and_reap(running[j]);
                             ++failures;
                             ++progress.done;
-                            CloseHandle(running[j]);
                             running.erase(running.begin() + j);
                             cpu.erase(cpu.begin() + j);
                             stalled.erase(stalled.begin() + j);
@@ -443,13 +465,17 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
         if (report) report(progress);
     }
 
-    for (HANDLE h : running) {
-        TerminateProcess(h, 1);
-        CloseHandle(h);
-    }
+    for (HANDLE h : running) terminate_and_reap(h);
     running.clear();
 
-    for (const std::wstring &path : files) DeleteFileW(path.c_str());
+    for (const std::wstring &path : files) {
+        if (!DeleteFileW(path.c_str())) {
+            // A just-reaped child can still be releasing the file; one retry
+            // covers the teardown window without masking a real failure.
+            Sleep(50);
+            DeleteFileW(path.c_str());
+        }
+    }
     RemoveDirectoryW(directory.c_str());
 
     if (failures) {

@@ -310,7 +310,11 @@ bool Processor::start(const Paths &paths, std::string &error,
     size_t best_vram = 0;
 
     IDXGIAdapter1 *adapter = nullptr;
-    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+    // Only S_OK keeps the walk going: any other result leaves the out pointer
+    // unset, and dereferencing it as though it were an adapter would crash.
+    for (UINT i = 0;; ++i) {
+        adapter = nullptr;
+        if (factory->EnumAdapters1(i, &adapter) != S_OK || !adapter) break;
         DXGI_ADAPTER_DESC1 desc{};
         if (SUCCEEDED(adapter->GetDesc1(&desc))) {
             if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && !dlssnr::is_virtual_adapter(desc.Description)) {
@@ -333,7 +337,9 @@ bool Processor::start(const Paths &paths, std::string &error,
 
     // Fallback if all non-virtual adapters failed: try any non-software adapter
     if (!best_adapter) {
-        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        for (UINT i = 0;; ++i) {
+            adapter = nullptr;
+            if (factory->EnumAdapters1(i, &adapter) != S_OK || !adapter) break;
             DXGI_ADAPTER_DESC1 desc{};
             if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
                 if (SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&s->device)))) {
@@ -1097,7 +1103,19 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
     frame.reset_accumulation = settings.reset_accumulation;
     const int passes = settings.passes < 1 ? 1 : settings.passes;
 
-    if (settings.is_video && passes >= 2 && s->intermediate) {
+    // The same constraint process() enforces: the cascade hands pass 1 an
+    // output-sized intermediate through a render-sized colour texture, which
+    // only lines up at a 1:1 ratio. Any other ratio degrades to the
+    // single-engine loop below instead of failing the frame.
+    const bool cascaded = settings.is_video && passes >= 2 && s->intermediate &&
+                          output_width == width && output_height == height;
+    if (!cascaded && settings.is_video && passes >= 2 && s->intermediate) {
+        fprintf(stderr, "[dlssnr] cascaded multi-pass needs matching input and "
+                        "output sizes; running a single-engine pass instead\n");
+        fflush(stderr);
+    }
+
+    if (cascaded) {
         dlss_cuda::FrameDesc f0 = frame;
         f0.output = s->intermediate;
         f0.pass_index = 0;

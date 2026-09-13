@@ -1051,6 +1051,7 @@ bool create_feature(const FeatureDesc &desc) {
         force_recreate[0] == '1';
     const int wanted_passes = desc.max_passes > 1 ? 2 : 1;
     if (!always_recreate && g.features[0] && g.num_features >= wanted_passes &&
+        desc.feature == g.current.feature &&
         desc.render_width == g.current.render_width &&
         desc.render_height == g.current.render_height &&
         desc.output_width == g.current.output_width &&
