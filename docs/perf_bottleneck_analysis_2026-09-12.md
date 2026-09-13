@@ -25,22 +25,43 @@ chained kernels, which sit well above that ratio (see the sizing note below).
 
 **Ordered plan (supersedes the "Phased plan" ordering further down).**
 
-- **Phase -1 — RDNA4 retest (do this first).** One run on the RX 9070 XT with the
-  override corrected: `gpu_detection.h` now rewrites a non-gfx12
-  `HSA_OVERRIDE_GFX_VERSION` to `12.0.1` and says so, and the batch GUI surfaces
-  the same warning at startup. gfx11 users are *slow*; RDNA4 users may be
-  *broken*, and the failing module in the field report is the fp8 Swin kernel —
-  exactly what a gfx11 ELF fed to a gfx1201 device would explain. This run also
-  settles whether Phase 4 is a perf nicety or a correctness prerequisite, and a
-  gfx12 machine is the only instrument that can verify an fp8 fragment mapping.
-- **Step 0 — strip `noinline` from the ptx_impl bitcode**, and restore
-  `alwaysinline`; see the note in that section, removing `noinline` alone can
-  leave the gate inconclusive.
-- **Route A — pass timing** (move `CombineMMAPass` after the inliner), and run
-  CSE/GVN before the relocated pass; see the note in that section.
-- **Route B — PTX AST peephole fusion** if Route A's phase interactions bite.
-- **Phase 4 — native gfx12 fp8 path.** Not a one-line branch: the pass has no
-  FP8 case today and the fragment mapping is unverified; see the corrected item.
+Everything this project can measure is gfx11; everything gfx12 needs hardware it
+does not have. The order follows that line rather than the severity of the
+symptoms.
+
+**On the machine that exists (RX 7900 XT, gfx1100):**
+
+- **Step 0 — strip `noinline` from the ptx_impl bitcode.** No longer inferred:
+  `llvm-dis` of the committed `.bc` puts noinline on the wrapper definition
+  (`#16`), on the outer helpers (`#14`) and on the call sites (`#24`), with
+  `alwaysinline` nowhere in the module. Restoring the inline hint matters too —
+  removing noinline alone can leave the gate inconclusive.
+- **Route A — pass timing** (move `CombineMMAPass` after the inliner), with
+  CSE/GVN ahead of the relocated pass.
+- **Route B — PTX AST peephole fusion**, if Route A's phase interactions bite.
+
+The two tests that decide whether either worked are both gfx11 and both cheap:
+the mma-helper `s_swappc` count going to zero, and `v_wmma` halving on module 14
+under `-mllvm -print-after=zluda-combine-mma` — plus the two gates listed below.
+
+**Blocked, not deprioritised.** These were ranked first in an earlier draft of
+this section, on the reasoning that RDNA4 users may be broken while gfx11 users
+are only slow. The reasoning holds; the ranking does not, because this project
+has no gfx12 card — the development machine is gfx1100 — so it cannot run either
+of them.
+
+- **Phase -1 — RDNA4 retest: needs whoever owns the RX 9070 XT.** Until that
+  machine re-runs with `HSA_OVERRIDE_GFX_VERSION` corrected, "gfx12 is broken"
+  stays a field report rather than a reproduction, and the fp8-Swin module
+  failure has no confirmed cause.
+- **Phase 4 — native gfx12 fp8 path: do not attempt without a gfx12 card.** The
+  fork's own comment says why — an unverified fragment mapping "would compile and
+  silently produce wrong pixels" — and a gfx12 machine is the only instrument
+  that can verify one. This is the sharpest case of the block being a hardware
+  limit rather than a scheduling choice.
+- Every gfx12 number in this document (the 30–50 ms band, the HIP
+  corroboration) is **external**. None of it was measured here, and none of it
+  can be repeated here.
 
 **Two gates to add (both cheap, neither currently recorded).**
 
@@ -534,6 +555,12 @@ Consequences:
    what this report cannot yet distinguish — and resolving it should outrank the
    gfx11 frame-rate work, because gfx11 users are "slow" while RDNA4 users may
    be "broken".
+   *(2026-09-13: correct about severity, misleading as an instruction. This
+   project holds no gfx12 hardware — the development machine is a 7900 XT
+   (gfx1100) — so it cannot be worked on here at all, which is why the ordered
+   plan in Current conclusions puts the RDNA4 items under a separate "blocked"
+   list instead of first. The gfx11 lever is the only one that can be developed
+   and measured by whoever holds this repository.)*
 2. ~~**`gpu_detection.h` must not defer to an obviously mismatched override.**~~ —
    **implemented (2026-09-13)**: the RDNA4 branch now corrects a non-gfx12
    override to 12.0.1 with a loud auto-config message, and the batch GUI
