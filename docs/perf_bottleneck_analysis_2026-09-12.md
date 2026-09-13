@@ -36,7 +36,9 @@ inside `EvaluateFeature`.
   steady, CU 97.8 ms — WGP is already the right choice, keep it.
 - **VOPD dual-issue / WMMA share.** `tools/analyze_vopd.py` on the compiled
   cache: 6.9 % dual-issued (86 % of duals are `v_dual_mov_b32`), WMMA is 0.5 %
-  of vector ops. Micro-architectural, but it cannot explain the numbers below.
+  of vector ops. Micro-architectural, but it cannot explain the numbers below
+  *by itself* — see the evening revision for why the WMMA path is nevertheless
+  the main remaining lever.
 
 ## What it IS bound by
 
@@ -185,7 +187,7 @@ ZLUDA's lowering of these on gfx11:
   Total Vector ALU instructions in the cache number **4,849,571** (plus 1.78M scalar ALU and 1.33M memory/LDS ops).
   Dividing total instructions by 24,319 yields **~327 total instructions per WMMA as a whole-cache macro dilution ratio** (or ~200 vector ALU/WMMA). This macro ratio spans the entire network's non-MMA computation (LayerNorm, softmax, GELU, residual additions, and layout transforms). At the kernel level (e.g. the qkv kernel with 28,220 total instructions and ~256–512 WMMAs), total instructions per WMMA is ~55–110 (including non-MMA kernel logic). Crucially: WMMA is not dropped by downstream compiler passes, but each uncombined WMMA is burdened by local scaffolding (operand widening, B-matrix zero padding, and LDS `bpermuteLane` split trees).
 
-## Project proposal: lower fp8 mma.sync to WMMA & unblock fusion (2026-09-13)
+## Project proposal: pair the unpaired WMMAs & delete the pad/split scaffolding (2026-09-13)
 
 ### Why existing WMMA is drowned: the Pass scheduling bottleneck
 
@@ -299,7 +301,7 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 
 | Platform | Path | Projected 1080p frame |
 |---|---|---|
-| RX 7900 XT (gfx1100) | m16n8k32 e4m3 → DPP widen → fused f16 WMMA | **80–120 ms** *(static instruction scaling predicts ~232–264 ms; 80–120 ms requires LDS latency elimination to yield compounding gains; band: 40–150 ms depending on bandwidth ceiling)* |
+| RX 7900 XT (gfx1100) | m16n8k32 e4m3 → DPP widen → fused f16 WMMA | **~232–264 ms** (static instruction scaling, cache-consistent); **80–120 ms** target only if LDS-latency removal compounds; band: 40–264 ms pending Route A |
 | RX 9070/9080 (gfx1200) | native fp8 WMMA (`v_wmma_f32_16x16x16_fp8_fp8`) | **30–50 ms** — confirmed: vendored LLVM carries `Intrinsic::amdgcn_wmma_f32_16x16x16_fp8_fp8` and gfx12 builtins |
 | RX 6000 (gfx10) | no WMMA hardware | excluded — keeps scalar path; fp8-inline still applies |
 
