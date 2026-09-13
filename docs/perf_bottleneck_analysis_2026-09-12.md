@@ -100,7 +100,7 @@ ISA of the top kernel (`cc_split_swin_16h_qkv_512_chained_fp8`, module 14,
   over long dependency chains it cannot fill.
 - fp8 is emulated: no native fp8 ALU on gfx11 — every fp8 op goes through
   `v_perm_b32`/`v_bfi_b32` unpack + `v_pk_mul_f16`/`v_pk_add_f16` +
-  `v_cvt_f16_f32` repack (~20 % of the code). *(Note: while initially suspected that WMMA was absent, later detailed cache disassembly confirmed 24,319 WMMAs are present, but severely diluted by ~327 auxiliary ops per WMMA due to pass scheduling failure; see evening revision below)*.
+  `v_cvt_f16_f32` repack (~20 % of the code). *(Note: an earlier draft assumed WMMA was absent. Later cache disassembly confirmed 24,319 `v_wmma_f32_16x16x16_f16` are present — they are **unpaired and burdened by pad/split scaffolding**, not missing. See the evening revision; the "~327 ops per WMMA" figure sometimes quoted is a whole-cache dilution ratio, not MMA-local cost)*.
 - 512 `s_swappc_b64` call sites — the "chained" network layers are real
   subroutine calls, not inlined.
 - The PTX carries **no tuning directives at all** (no `.maxnreg`,
@@ -163,7 +163,7 @@ run by a single wave. The levers that remain live are compiler-quality work
 (fp8 lowering, scheduling, call inlining) in the fork, bounded by the same
 ~16 % scale the CU-mode A/B measured for halved registers.
 
-## The real smoking gun: fp8 mma.sync is fully emulated (evening revision)
+## The real smoking gun: fp8 mma.sync lands on unpaired, padded WMMA (evening revision)
 
 Counting instructions in NVIDIA's own PTX for the model across all modules (dumped by zluda_trace in `build/trace/framebench.exe/*.ptx`):
 
@@ -207,8 +207,8 @@ PB.registerOptimizerEarlyEPCallback(
 
 1. **`OptimizerEarlyEPCallback` runs before the Inliner**:
    When `CombineMMAPass` executes, the kernel contains only external function calls (`call @__zluda_ptx_impl_...`). The intrinsic `llvm.zluda.mma` is not yet visible in the kernel's basic blocks.
-2. **Subfunctions contain only 1 MMA each**:
-   Inside `zluda_ptx_impl`, each helper function encapsulates a single MMA instance. `CombineMMA.cpp:179` requires `FirstA == SecondA` within the same basic block to fuse two 16×8 MMAs into one 16×16 WMMA. Across separate helper functions before inlining, **pairing is structurally impossible**.
+2. **Subfunctions cannot pair internally**:
+   Inside `zluda_ptx_impl`, each helper encapsulates the MMA(s) of a single `mma.sync` — one for `m16n8k16`, two for `m16n8k32` ($k \in [0..15]$ and $k \in [16..31]$) — and none of them can pair internally because their $A$ operands differ (`FirstA != SecondA`). Across separate helper functions before inlining, **pairing is structurally impossible**.
 3. **The author's TODO context (line 901-902)**:
    The source comments `// TODO: maybe disable combining MMAs and just lower them individually / if at O0` demonstrate the author was weighing combining vs. individual lowering, but overlooked the pipeline scheduling order.
 4. **Pipeline anchors in `AMDGPUTargetMachine.cpp`**:
@@ -271,8 +271,7 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 | Local scaffolding per tile | ~40–80 ops | **~12–16 ops** |
 | Accumulator VGPRs per thread | 4 (F32) / 2 (packed F16) | 8 (F32) / 4 (packed F16) |
 
-**Sizing the win honestly.** Total cache instructions ≈ 7.96 M. Removing ~30–65 scaffolding ops per tile removes roughly **1.6–3.5 M instructions (20–44 %)** — not the ~2–3× that comparing against scalar emulation would imply.
-However, these kernels are latency-bound (see above: single-wave execution on 84 CUs), and serialized `bpermuteLane` LDS round-trips cost far more in cycle latency than raw issue slots, so the measured latency reduction may significantly outperform the static instruction count estimate. **This is exactly why Route A is a measurement, not an argument.**
+**Sizing the win honestly.** Using cache-consistent figures (24,319 WMMAs against ~7.96 M total instructions, both from the same 7 cached modules): removing ~30–65 scaffolding ops per tile removes **0.73–1.58 M instructions, i.e. 9–20 % of the total** — not the ~2–3× that comparing against scalar emulation would imply. These kernels are latency-bound, however, and serialized `bpermuteLane` LDS round-trips cost far more in cycle latency than in issue slots, so measured latency reduction may significantly outperform this static estimate. **That gap is precisely why Route A is a measurement, not an argument.**
 
 ### Numerics: equivalent or better
 
@@ -300,11 +299,11 @@ However, these kernels are latency-bound (see above: single-wave execution on 84
 
 | Platform | Path | Projected 1080p frame |
 |---|---|---|
-| RX 7900 XT (gfx1100) | m16n8k32 e4m3 → DPP widen → fused f16 WMMA | **80–120 ms** *(static instruction scaling predicts ~180–260 ms; 80–120 ms requires LDS latency elimination to yield compounding gains; band: 40–150 ms depending on bandwidth ceiling)* |
+| RX 7900 XT (gfx1100) | m16n8k32 e4m3 → DPP widen → fused f16 WMMA | **80–120 ms** *(static instruction scaling predicts ~232–264 ms; 80–120 ms requires LDS latency elimination to yield compounding gains; band: 40–150 ms depending on bandwidth ceiling)* |
 | RX 9070/9080 (gfx1200) | native fp8 WMMA (`v_wmma_f32_16x16x16_fp8_fp8`) | **30–50 ms** — confirmed: vendored LLVM carries `Intrinsic::amdgcn_wmma_f32_16x16x16_fp8_fp8` and gfx12 builtins |
 | RX 6000 (gfx10) | no WMMA hardware | excluded — keeps scalar path; fp8-inline still applies |
 
-640×360 case: pending empirical measurement with Route A (static instruction scaling suggests ~45–60 ms, down from 78.4 ms; lower latencies depend on whether single-wave wait latency collapses with the removal of LDS bpermute).
+640×360 case: pending empirical measurement with Route A (static instruction scaling suggests ~63–71 ms, down from 78.4 ms; lower latencies depend on whether single-wave wait latency collapses with the removal of LDS bpermute).
 
 ### Phased plan
 
