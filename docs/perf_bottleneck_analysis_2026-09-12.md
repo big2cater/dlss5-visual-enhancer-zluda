@@ -9,7 +9,7 @@ temporal path, WGP mode (fork default). All numbers from `build/framebench`
 
 | measurement | result |
 |---|---|
-| steady-state frame (640×360) | 83.5 ms |
+| steady-state frame (640×360) | 83.5 ms (pre-v5; 78.4 after the fp8-inline) |
 | ... at 320×180 (¼ pixels) | 79.8 ms |
 | ... at 160×90 (1/16 pixels) | 74.9 ms |
 | phase split (steady frame) | upload 0.3 ms, evaluate 82 ms, readback 0.4 ms |
@@ -68,11 +68,10 @@ overhead (that is 0.6 µs) and not the `s_dcache.inv` prelude (one instruction).
 
 1. ~~**Per-kernel GPU timing from inside the fork**~~ — **implemented and closed.**
    Implemented via `ZLUDA_LAUNCH_TIMING=1` in `zluda/src/impl/function.rs` (event pair per launch). Measured kernel GPU time at 80.6 ms/frame and identified the top serialized attention kernels.
-2. **Chase the single-wave latency** for the top kernels: check whether the
-   compiled ISA does scalar (s_load) weight fetches with long `s_waitcnt`
-   chains, whether `glc`/coherent bits are forced on image accesses, and
-   whether LDS staging of weights could turn per-kernel latency into
-   throughput. `tools/analyze_vopd.py` is the starting toolkit.
+2. ~~**Chase the single-wave latency**~~ — superseded the same way as the
+   section below: the evening revision reframes the per-kernel latency cause
+   as MMA pad/split scaffolding. The ISA checks listed here are still worth
+   one pass when Route A lands; `tools/analyze_vopd.py` is the toolkit.
 3. ~~**More waves per kernel / grid sizing**~~ — **verified and closed.**
    Inspection of the snippet host code shows it queries only 4 basic device attributes (`CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK`, `WARP_SIZE`, `MAX_SHARED_MEMORY_PER_BLOCK`, `COMPUTE_CAPABILITY_MAJOR/MINOR`). The (6,2) grid reflects Swin transformer's own window partitioning (patch/window spatial layout), not ZLUDA under-reporting attributes.
 
@@ -117,6 +116,10 @@ ISA of the top kernel (`cc_split_swin_16h_qkv_512_chained_fp8`, module 14,
   wave32 addressable max = 256).
 
 Levers, in order of expected value:
+
+*(superseded 2026-09-13: the project proposal further down subsumes items 2–3
+into its Route A/B; item 1 is closed by the A/B below. Kept for the
+measurement record.)*
 
 1. ~~**Raise the VGPR budget**~~ — **tested and closed.** `ZLUDA_NUM_VGPR=256`
    (implemented with cache-key isolation) recompiled every module: gfx11
@@ -364,11 +367,11 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 
 ### Projection (with uncertainties)
 
-*(Two figures, two premises: **232–264 ms** is derived from cache-consistent static instruction scaling (the 9–20 % removal above) and is the defensible baseline; **80–120 ms** is the legacy figure from the earlier scalar-emulation premise and requires LDS-latency removal to compound. Route A replaces both with a measurement).*
+*(Two figures, two premises: **232–264 ms** is derived from cache-consistent static instruction scaling — the 9–20 % removal applied to the **290 ms measured GPU average** from the solid-color runs — and is the defensible baseline; **80–120 ms** is the legacy figure from the earlier scalar-emulation premise and requires LDS-latency removal to compound. Route A replaces both with a measurement).*
 
 | Platform | Path | Projected 1080p frame |
 |---|---|---|
-| RX 7900 XT (gfx1100) | m16n8k32 e4m3 → DPP widen → fused f16 WMMA | **~232–264 ms** (static instruction scaling, cache-consistent); **80–120 ms** target only if LDS-latency removal compounds; band: 40–264 ms pending Route A |
+| RX 7900 XT (gfx1100) | m16n8k32 e4m3 → DPP widen → fused f16 WMMA | **~232–264 ms** (static instruction scaling, cache-consistent); **80–120 ms** target only if LDS-latency removal compounds; the 40 ms lower end of some bands is a theoretical floor, not an expectation |
 | RX 9070/9080 (gfx1200) | native fp8 WMMA (`v_wmma_f32_16x16x16_fp8_fp8`) | **30–50 ms** — confirmed: vendored LLVM carries `Intrinsic::amdgcn_wmma_f32_16x16x16_fp8_fp8` and gfx12 builtins |
 | RX 6000 (gfx10) | no WMMA hardware | excluded — keeps scalar path; fp8-inline still applies |
 
@@ -389,7 +392,7 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
    pre-existing value-naming difference unrelated to the change), verifying
    that F32 accumulation produces identical output to NVIDIA references
    across subnormals, NaNs (`0x7F`), and saturated values (`0x7E`).
-4. **RDNA4 branch**: Add a `>= 12000` branch ahead of the existing `11000..13000` branch in `zluda_ptx_impl.cpp:1424`, so RDNA4 selects native `amdgcn_wmma_f32_16x16x16_fp8_fp8` instead of falling into the f16-widen path.
+4. **RDNA4 branch**: Add a `>= 12000` branch ahead of the existing `11000..13000` branch in `zluda_ptx_impl.cpp:1424`, so RDNA4 selects native `amdgcn_wmma_f32_16x16x16_fp8_fp8` instead of falling into the f16-widen path. Note the shape difference: the gfx12 fp8 WMMA is a single k32 instruction (no k-split pairing needed), but its N dimension still needs the 8→16 handling — the RDNA3 pairing logic does not transfer one-to-one.
 
 ### Artifacts
 
