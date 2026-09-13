@@ -760,6 +760,60 @@ the writing side regardless of convenience, because a `.bc` written by the HIP
 SDK's LLVM 21 is not guaranteed to be readable by the older vendored LLVM that
 translates modules.
 
+### Toolchain: regenerating the bitcode on this machine (2026-09-13)
+
+Everything needed is already installed. Nothing has to be built except two tools,
+and no Linux is involved. Inventory, verified by running it rather than by
+reading the comment:
+
+| need | where | note |
+|---|---|---|
+| `clang` (compiles the `.cpp`) | `%HIP_PATH%bin\clang.exe` | HIP SDK 7.1, `clang 21.0.0git`; `HIP_PATH = C:\Program Files\AMD\ROCm\7.1` |
+| `ocml.bc` | `%HIP_PATH%amdgcn\bitcode\ocml.bc` | 209 104 bytes — this is the Windows spelling of the pipeline's `/opt/rocm/amdgcn/bitcode/ocml.bc` |
+| `llvm-dis` | `%HIP_PATH%bin\llvm-dis.exe` | reads the committed `.bc` cleanly (9 378 lines) |
+| `llvm-as` | `target\release\build\llvm_zluda-*\out\build\bin\llvm-as.exe` | **not built yet**; `ninja llvm-as llvm-dis` there links against libraries that are already built. That tree's `LLVM_MAIN_SRC_DIR` is `ext/llvm-project/llvm`, so it *is* the patched LLVM 22 |
+| a POSIX shell for the `sed` chain | `D:\Git\usr\bin\sed.exe` | or replicate the chain in PowerShell, which is what the script does |
+
+`clang` is deliberately not in the cached LLVM tree
+(`LLVM_ENABLE_PROJECTS=llvm;lld`), and adding it would mean a reconfigure. It
+turns out not to be needed, for the reason below.
+
+**The non-obvious part, and why mixing the two toolchains is safe.** A function's
+intrinsic-ness is not something the bitcode records — it is a **name lookup done
+by whoever reads the module** (`Function::getIntrinsicID` consults that LLVM's own
+table). An assembler that has never heard of `zluda_mma_*` can therefore write a
+valid `.bc` that contains the names, and the patched LLVM 22 which translates the
+modules will resolve them to its intrinsics when it reads the file. Verified:
+round-tripping the committed `.bc` through the HIP SDK's `llvm-dis`/`llvm-as`
+returns a file of **exactly the same size, 71 616 bytes** (sizes compared, not
+hashes), with the `llvm.zluda.mma.m16n8k16.f32.f16` names intact. What the
+writer's version *does* decide is the bitcode format version — which is the one
+reason the final assembly should still be the patched `llvm-as`, since the fork's
+LLVM has to read the result back.
+
+**The recipe** — also as `ptx/lib/rebuild-bitcode.ps1`, written next to the
+pipeline comment it implements. That script's parse is checked and its
+dis/sed/as half is exercised, but it has never been run end to end:
+
+1. `ninja llvm-as llvm-dis` in the cached LLVM tree above.
+2. Per variant: `clang` → `.bc`; `llvm-dis` → text; the `sed` chain including the
+   new `s/noinline//g`; patched `llvm-as` → the committed path.
+3. Bump the cache marker in `zluda/src/impl/module.rs`, then rebuild ZLUDA.
+
+**Gates, in order. No frame time is worth measuring before 0a.**
+
+| # | gate | how, and why it is the gate |
+|---|---|---|
+| 0a | `alwaysinline` present in the new `.bc` | `llvm-dis new.bc -o new.ll` then count `alwaysinline` in `new.ll`. The committed `.bc` has **0**, so this is the only *direct* evidence that Step 0 took effect; if it is still 0 the helpers will not inline, Route A is inert, and every later measurement is a no-op dressed as a result |
+| 0b | `noinline` gone | same dump, expecting 0. **Already verified** against the committed `.bc` with the sed applied: 5 → 0, `llvm-as` accepting the result, `llvm.zluda.mma` names preserved |
+| 1 | mma-helper `s_swappc` count → 0 | disassemble a compiled module; asymmetry with the total `s_swappc` count is what separates the two variables |
+| 2 | `v_wmma` halves on module 14 | `-mllvm -print-after=zluda-combine-mma` |
+
+**Verified vs not.** 0b, the read/write tool pair, the location of the LLVM tree
+and the existence of its `llvm-as` target are all observed. The `clang` step has
+never been run, the `.bc` has not been regenerated, and neither fork edit has
+been compiled.
+
 ### Artifacts
 
 - `tools/framebench.cpp` — multi-frame per-frame timing harness (start once,
