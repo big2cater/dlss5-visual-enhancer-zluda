@@ -601,15 +601,17 @@ machine**:
 | file | change |
 |---|---|
 | `ext/llvm-project/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp` | the `CombineMMAPass` / `LowerMatrixConversionsPass` FPM moved from `registerOptimizerEarlyEPCallback` to `registerOptimizerLastEPCallback`, with `EarlyCSEPass` + `GVNPass` inserted **ahead** of the combiner (pairing is gated on `FirstA == SecondA`, and inlining alone does not unify the duplicated inlined operand chains). 40 insertions, 13 deletions. |
-| `ptx/lib/zluda_ptx_impl.cpp` | `[[clang::optnone]]` removed from the three mma wrappers, so the `[[clang::always_inline]]` already at their call sites survives to the `.bc`; `sed 's/noinline//g'` added to **both** bitcode pipelines and the header comment updated to record that the block is the only description of how the committed `.bc` was produced; `__attribute__((const))` added to `sreg_laneid`. 74 insertions, 10 deletions. |
+| `ptx/lib/zluda_ptx_impl.cpp` | `[[clang::optnone]]` removed from the three mma wrappers, so the `[[clang::always_inline]]` already at their call sites survives to the `.bc`; `sed 's/noinline//g'` added to **both** bitcode pipelines, with the header comment updated to record that the block is the only description of how the committed `.bc` was produced — and how to read the result back. |
 
-The `sreg_laneid` annotation is the least obvious of the three and the reason it
-is there: `fp8_mma_half` chooses *which byte pair this lane takes* from
-`sreg_laneid()`, so the two halves of one `m16n8k32` only produce the same `A`
-operand if the two lane-id reads can be CSE'd. `FunctionAttrs` would probably
-infer `memory(none)` from the body on its own; it is stated because its absence
-fails **silently** — no error, just unpaired WMMAs and a frame time that did not
-improve.
+A third change was drafted and then dropped, and the way it died is the reason it
+is recorded here. The theory was that the fp8 path's `A` operand chain runs
+through a lane-id read (`fp8_mma_half` picks which byte pair this lane takes from
+`sreg_laneid()`), so an explicit `__attribute__((const))` on that function would
+be needed to make the two halves of one `m16n8k32` produce a CSE-able operand.
+Disassembling the shipped `.bc` retired it: the function has no call sites at all
+(it is fully inlined) and FunctionAttrs already annotates it `memory(none)`. It is
+left out rather than kept as harmless insurance, so the change set stays bounded
+by what the evidence supports.
 
 **Two ordering traps that make all of this a no-op if missed.**
 
@@ -639,13 +641,37 @@ improve.
    every user with a warm cache keeps running the modules the pre-change backend
    compiled and *nothing* of the above is observable.
 
-**Not verified here.** No LLVM build exists on this machine
-(`ext/llvm-project/build` is absent, no `llvm-dis` on PATH), so the bitcode
-could not be disassembled and neither edit has been compiled. To settle the
-attribute question without a build:
-`llvm-dis ptx/lib/zluda_ptx_impl.bc -o - | grep -n 'attributes #'` and read the
-groups belonging to the mma helpers — attribute names are enum-encoded, so
-grepping the binary for "noinline" returns zero and proves nothing either way.
+**Verified since (2026-09-13) — the attribute question is no longer open.** This
+machine has no `ext/llvm-project/build`, but it does not need one to *read* the
+bitcode: the HIP SDK ships the LLVM tools (`llvm-dis.exe`, `llvm-as.exe`,
+`clang.exe` under `%HIP_PATH%bin`, with `HIP_PATH = C:\Program Files\AMD\ROCm\7.1`),
+and `llvm-dis ptx/lib/zluda_ptx_impl.bc -o -` disassembles cleanly into 9 378
+lines of IR. What it shows:
+
+| site | attribute group |
+|---|---|
+| `_ZL49__llvm_zluda_mma_...` wrapper definition | `#16 = { convergent mustprogress noinline nounwind ... }` |
+| `__zluda_ptx_impl_mma_sync_aligned_*` outer helpers | `#14 = { mustprogress noinline nounwind ... }` |
+| the wrapper's call sites | `#24 = { convergent noinline nounwind }` |
+
+So noinline is on the callee *and* on the call site — the Step 0 premise holds
+as stated, and the group number and contents match the disassembly quoted above.
+One correction to that earlier note: the call-site group is `#24` and it does
+carry noinline (the note recorded `#23 = { convergent nounwind }`), which
+strengthens the case rather than weakening it. A second observation from the same
+dump, which retired a change: `__zluda_ptx_impl_sreg_laneid` has **no call sites
+at all** (fully inlined into its users) and FunctionAttrs already annotates its
+neighbours `memory(none)`, so an explicit `__attribute__((const))` on it would
+have been redundant and was dropped.
+
+**Still not verified.** Neither edit has been compiled, `llvm-dis` only reads,
+and the `.bc` has not been regenerated. The cargo-side LLVM tree
+(`target/release/build/llvm_zluda-*/out/build/`, which has a `build.ninja`) can
+supply the *writing* tools without a full rebuild — `ninja llvm-as llvm-dis clang`
+there links against libraries already built — and it should be the one used for
+the writing side regardless of convenience, because a `.bc` written by the HIP
+SDK's LLVM 21 is not guaranteed to be readable by the older vendored LLVM that
+translates modules.
 
 ### Artifacts
 
