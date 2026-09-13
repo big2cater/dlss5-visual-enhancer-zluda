@@ -2191,6 +2191,15 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
     const double max_wall_sec = std::max(120.0, total_dur * 60.0);
     bool timed_out = false;
 
+    // A worker exiting 2 means the retryable blank race hit its first frame.
+    // The blank is transient per the field record, so that chunk gets one
+    // in-place respawn (redrawing its own half) before the run is declared
+    // failed; a deterministic failure burns that pass and then fails honestly.
+    // The sibling keeps encoding throughout -- no mutual kill for retryable
+    // exits.
+    int w0_respawns = 0, w1_respawns = 0;
+    constexpr int MAX_CHUNK_RESPAWNS = 1;
+
     while (true) {
         DWORD wr = WaitForMultipleObjects(2, handles, FALSE, 500);
         if (wr == WAIT_FAILED) {
@@ -2203,13 +2212,53 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
         GetExitCodeProcess(pi0.hProcess, &code0);
         GetExitCodeProcess(pi1.hProcess, &code1);
         if (code0 != STILL_ACTIVE && code0 != 0) {
+            if (code0 == 2 && w0_respawns < MAX_CHUNK_RESPAWNS) {
+                ++w0_respawns;
+                fprintf(stderr, "[parallel] 分片 0 首帧空白竞态（重启 1/%d）：丢弃半截输出并重启该分片…\n",
+                        MAX_CHUNK_RESPAWNS);
+                CloseHandle(pi0.hProcess);
+                CloseHandle(pi0.hThread);
+                _wremove(out_part0.c_str());
+                Sleep(1000);
+                if (!CreateProcessW(nullptr, cmd0.data(), nullptr, nullptr, TRUE,
+                                    BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &si0, &pi0)) {
+                    fprintf(stderr, "[FAIL] 分片 0 重启失败 (错误码 %lu)，终止分片 1...\n", GetLastError());
+                    TerminateProcess(pi1.hProcess, 1);
+                    code0 = 1;
+                    break;
+                }
+                handles[0] = pi0.hProcess;
+                continue;
+            }
             fprintf(stderr, "[FAIL] 分片工作进程 0 异常失败 (退出码 %lu)，终止分片 1...\n", code0);
             TerminateProcess(pi1.hProcess, 1);
+            WaitForSingleObject(pi1.hProcess, 2000);
+            GetExitCodeProcess(pi1.hProcess, &code1);
             break;
         }
         if (code1 != STILL_ACTIVE && code1 != 0) {
+            if (code1 == 2 && w1_respawns < MAX_CHUNK_RESPAWNS) {
+                ++w1_respawns;
+                fprintf(stderr, "[parallel] 分片 1 首帧空白竞态（重启 1/%d）：丢弃半截输出并重启该分片…\n",
+                        MAX_CHUNK_RESPAWNS);
+                CloseHandle(pi1.hProcess);
+                CloseHandle(pi1.hThread);
+                _wremove(out_part1.c_str());
+                Sleep(1000);
+                if (!CreateProcessW(nullptr, cmd1.data(), nullptr, nullptr, TRUE,
+                                    BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &si1, &pi1)) {
+                    fprintf(stderr, "[FAIL] 分片 1 重启失败 (错误码 %lu)，终止分片 0...\n", GetLastError());
+                    TerminateProcess(pi0.hProcess, 1);
+                    code1 = 1;
+                    break;
+                }
+                handles[1] = pi1.hProcess;
+                continue;
+            }
             fprintf(stderr, "[FAIL] 分片工作进程 1 异常失败 (退出码 %lu)，终止分片 0...\n", code1);
             TerminateProcess(pi0.hProcess, 1);
+            WaitForSingleObject(pi0.hProcess, 2000);
+            GetExitCodeProcess(pi0.hProcess, &code0);
             break;
         }
         if (code0 != STILL_ACTIVE && code1 != STILL_ACTIVE) {

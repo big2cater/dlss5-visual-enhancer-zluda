@@ -1210,7 +1210,10 @@ static bool finish_evaluation() {
                 (ad.Format == CU_AD_FORMAT_FLOAT ? 4u : ad.Format == CU_AD_FORMAT_HALF ? 2u : 1u) *
                 ad.NumChannels;
             const size_t row_bytes = ad.Width * bytes_per_texel;
-            const size_t rows = ad.Height < 64 ? ad.Height : 64;
+            // Full height, not a sample: the interesting failure mode is a
+            // PARTIALLY written output (top band has content, the rest zero),
+            // which a first-rows sample cannot see.
+            const size_t rows = ad.Height;
             std::vector<unsigned char> host(row_bytes * rows, 0xCD);
             CUDA_MEMCPY2D copy{};
             copy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
@@ -1225,12 +1228,28 @@ static bool finish_evaluation() {
                 fprintf(stderr, "  [output] read back failed: %d\n", cr);
             } else {
                 size_t nonzero = 0;
-                for (unsigned char b : host)
-                    if (b) ++nonzero;
-                char line[224];
-                snprintf(line, sizeof line,
-                         "[dlss-cuda] network output: %zux%zu, %zu rows read back, %zu of %zu "
-                         "bytes non-zero\n", ad.Width, ad.Height, rows, nonzero, host.size());
+                size_t first_nz_row = rows, last_nz_row = rows;
+                for (size_t r = 0; r < rows; ++r) {
+                    const unsigned char *rp = host.data() + r * row_bytes;
+                    bool row_has_nz = false;
+                    for (size_t b = 0; b < row_bytes; ++b)
+                        if (rp[b]) { row_has_nz = true; ++nonzero; }
+                    if (row_has_nz) {
+                        if (first_nz_row == rows) first_nz_row = r;
+                        last_nz_row = r;
+                    }
+                }
+                char line[280];
+                if (first_nz_row == rows) {
+                    snprintf(line, sizeof line,
+                             "[dlss-cuda] network output: %zux%zu, all %zu rows read back, "
+                             "every byte zero (fully blank)\n", ad.Width, ad.Height, rows);
+                } else {
+                    snprintf(line, sizeof line,
+                             "[dlss-cuda] network output: %zux%zu, %zu of %zu bytes non-zero, "
+                             "non-zero rows %zu..%zu of %zu\n",
+                             ad.Width, ad.Height, nonzero, host.size(), first_nz_row, last_nz_row, rows);
+                }
                 fputs(line, stderr);
                 if (g_reshade_log) g_reshade_log(line);
             }
