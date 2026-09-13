@@ -5,6 +5,72 @@ Workload: DLSS-NR (nvngx_dlssnr 310.8.0, CG2R backbone `crazy-cuckoo`), 640×360
 temporal path, WGP mode (fork default). All numbers from `build/framebench`
 (start + N frames, per-frame `last_ms`) and `DLSSNR_PHASE_TIMING=1`.
 
+## Current conclusions (authoritative — read this and nothing else)
+
+Review pass 2026-09-13. Everything below this section is the measurement record,
+kept append-only, including the hypotheses it retracts. Where the two disagree,
+this section wins.
+
+**The one live lever.** The network's `mma.sync` lands on *unpaired, zero-padded*
+`v_wmma` because `CombineMMAPass` is registered at
+`registerOptimizerEarlyEPCallback` (`AMDGPUTargetMachine.cpp:897`) — before the
+inliner — while the mma helpers carry `noinline` and are therefore still calls at
+that point. Pairing is structurally impossible there. Once the helpers are
+inlineable **and** the pass runs after inlining, adjacent MMAs that share operand
+$A$ fuse: **4 intrinsics → 2 WMMAs, MAC utilisation 50 % → 100 %**. That
+derivation is SSA-exact. The *size* of the win is not, and Route A is the
+measurement that decides it — 9–20 % of instructions by whole-cache static
+scaling is the defensible floor, but the scaffolding is concentrated in the hot
+chained kernels, which sit well above that ratio (see the sizing note below).
+
+**Ordered plan (supersedes the "Phased plan" ordering further down).**
+
+- **Phase -1 — RDNA4 retest (do this first).** One run on the RX 9070 XT with the
+  override corrected: `gpu_detection.h` now rewrites a non-gfx12
+  `HSA_OVERRIDE_GFX_VERSION` to `12.0.1` and says so, and the batch GUI surfaces
+  the same warning at startup. gfx11 users are *slow*; RDNA4 users may be
+  *broken*, and the failing module in the field report is the fp8 Swin kernel —
+  exactly what a gfx11 ELF fed to a gfx1201 device would explain. This run also
+  settles whether Phase 4 is a perf nicety or a correctness prerequisite, and a
+  gfx12 machine is the only instrument that can verify an fp8 fragment mapping.
+- **Step 0 — strip `noinline` from the ptx_impl bitcode**, and restore
+  `alwaysinline`; see the note in that section, removing `noinline` alone can
+  leave the gate inconclusive.
+- **Route A — pass timing** (move `CombineMMAPass` after the inliner), and run
+  CSE/GVN before the relocated pass; see the note in that section.
+- **Route B — PTX AST peephole fusion** if Route A's phase interactions bite.
+- **Phase 4 — native gfx12 fp8 path.** Not a one-line branch: the pass has no
+  FP8 case today and the fragment mapping is unverified; see the corrected item.
+
+**Two gates to add (both cheap, neither currently recorded).**
+
+- `vgpr_spill_count` plus `scratch_load`/`scratch_store` site counts **before and
+  after**. Fusion raises the f32 accumulator per thread from 4 to 8 VGPRs, and
+  the "spills are not the bottleneck" result came from A/B runs that *lowered*
+  register pressure — the opposite direction is untested.
+- A back-to-back double launch of one kernel with independent data: if the second
+  does not add its full time, the kernels can overlap (latency-bound); if it
+  doubles, they are issue-bound. Cleaner than inferring from resolution scaling.
+
+**Shipping cost, and the trap under it.** Two separate things have to move for
+any of this to reach a user, and each has its own failure mode — see the
+"ordering traps" in *What was changed* below. Briefly: the committed `.bc` files
+are build inputs and must be regenerated (or the `.cpp` edit changes nothing and
+`ZLUDA_PTX_IMPL_DIGEST` does not even move, because the digest covers the `.bc`),
+and the LLVM-side change needs the module cache marker in
+`zluda/src/impl/module.rs` bumped (or a warm cache keeps serving modules the
+pre-change backend compiled). Either miss is silent. Expect one ~20–40 min
+re-prewarm per user once both are right.
+
+**Do not quote these until resolved.**
+
+| number | status |
+|---|---|
+| `~770 K threads = ~24 K wave32s` | **Contradicts** "average grid is 12–24 waves" by ~7–10×. Reconciliation: 770 K / 156 launches = 4 936 threads = 154 waves per launch; and 24 K waves / 84 CU = 286 waves/CU, which would kill the "shader units mostly idle" premise that the latency argument rests on. Reconcile both readings before quoting either. |
+| `80–120 ms` 1080p band | Legacy scalar-emulation premise; retracted (24 319 `v_wmma` are present). History only. |
+| `~327 total instructions per WMMA` | Whole-cache macro dilution ratio, **not** an MMA-local cost. The hot kernel is far denser. |
+| `vgpr_spill_count 118–184` vs `1110 / 886 / 1898` | Different kernels and different register-attribute generations; label the scope whenever cited. |
+
 ## Where a frame's milliseconds go
 
 | measurement | result |
@@ -52,6 +118,12 @@ evaluate is GPU-bound. But the kernel work is astonishingly small:
 - 156 launches per frame, total **~770 K threads = ~24 K wave32s** (640×360).
   The 7900 XT has 84 CUs; average grid is 12–24 waves — the shader units are
   mostly idle while the engine timeline is occupied.
+
+  *(⚠️ 2026-09-13: these two readings are inconsistent by ~7–10×. 770 K threads
+  over 156 launches is 4 936 threads = **154 waves per launch**, and 24 K waves on
+  84 CUs is **286 waves/CU** — in which case the shader units are *not* idle and
+  the latency argument loses the floor it stands on. One of the two numbers is
+  wrong. Resolve before quoting either.)*
 - Kernel grids barely change with resolution (the most common grids are
   (6,2)·32 threads at 640×360 vs (4,2)·32 at 160×90), and total time does not
   either: **~0.5 ms per kernel, independent of grid size and pixel count.**
@@ -101,6 +173,10 @@ ISA of the top kernel (`cc_split_swin_16h_qkv_512_chained_fp8`, module 14,
   **`vgpr_spill_count: 118–184`** across the module's kernels — every thread
   spills 118–184 register slots into scratch (global) memory, and the static
   code has ~400 `scratch_load` + ~400 `scratch_store` sites.
+  *(scope 2026-09-13: this is a per-kernel spread across one module. The
+  1110 / 886 / 1898 figures further down are the top kernel across three
+  register-attribute generations — a different measurement. Label which one is
+  meant whenever citing either.)*
 - **13.8 % of all instructions are `s_delay_alu`** — the scheduler papering
   over long dependency chains it cannot fill.
 - fp8 is emulated: no native fp8 ALU on gfx11 — every fp8 op goes through
@@ -257,7 +333,8 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 | `mma2_k0_15`  | `a_reg[0], a_reg[1]` | `b2[0]` | $k \in [0..15]$, Right half ($N \in [8..15]$) |
 | `mma2_k16_31` | `a_reg[2], a_reg[3]` | `b2[1]` | $k \in [16..31]$, Right half ($N \in [8..15]$) |
 
-- `mma1_k0_15` and `mma2_k0_15` share the **exact same SSA values** for $A$ (originating from the same `fp8_widen_pair`). Once inlined, `EarlyCSEPass` exposes identical operands, causing `FirstA == SecondA` in `CombineMMA.cpp:179` to evaluate to `true`. They fuse into a single hardware 16×16 WMMA ($k \in [0..15]$) with combined $B = [b_1[0], b_2[0]]$.
+- `mma1_k0_15` and `mma2_k0_15` share the **exact same SSA value** for $A$ — both derive from the same `fp8_widen_pair` argument — so `FirstA == SecondA` in `CombineMMA.cpp:179` evaluates to `true` and they fuse into a single hardware 16×16 WMMA ($k \in [0..15]$) with combined $B = [b_1[0], b_2[0]]$.
+  *(corrected 2026-09-13: the earlier draft credited `EarlyCSEPass` with exposing the identical operands, which it cannot do — in the quoted FPM `EarlyCSEPass` is registered **after** `CombineMMAPass` (`AMDGPUTargetMachine.cpp:903-906`), so it never runs ahead of it within one invocation. The real precondition is one of: $A$ is already a single SSA value as above, or the O3 pipeline has CSE/GVN'd the duplicated widening by the time the pass runs at `OptimizerLastEP`. Neither is guaranteed across pipeline changes, so the relocated FPM should run `EarlyCSE` (ideally `GVN`) **before** `CombineMMAPass`. Without that, a failed pairing is indistinguishable from a pass-ordering problem — two different bugs, one symptom.)*
 - `mma1_k16_31` and `mma2_k16_31` similarly fuse into a single hardware 16×16 WMMA ($k \in [16..31]$) with combined $B = [b_1[1], b_2[1]]$.
 - **Result: 4 intrinsics collapse into exactly 2 hardware WMMAs (50% reduction)**. The verification gate `v_wmma count halves` is not an empirical hope, but a mathematical necessity derived from the SSA graph — **conditional on Step 0 making the helpers inlineable and Route A moving the pass after the inliner** (without those, the intrinsics never share a function with each other or with the kernel at pairing time).
 
@@ -284,7 +361,7 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 | WMMA per 2× `m16n8k32` | 4 (half of each 16×16 wasted) | **2** (both halves useful) |
 | Useful MACs per WMMA | 2048 of 4096 (50 %) | **4096 of 4096 (100 %)** |
 | B-matrix handling | Zero-padded to 16 columns | Natural `[B₀, B₁]` concat |
-| Result extraction | `dMatrixSplit` + `bpermuteLane` LDS round-trips | Direct register fragment |
+| Result extraction | `dMatrixSplit` + `bpermuteLane` LDS round-trips | Direct register fragment — **unverified, see the note below** |
 | Local scaffolding per tile | ~40–80 ops | **~12–16 ops** |
 | Accumulator VGPRs per thread | 4 (F32) / 2 (packed F16) | 8 (F32) / 4 (packed F16) |
 
@@ -293,7 +370,26 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
   not because fusion is more register-hungry; the register win comes from
   deleting the operand-staging arrays.
 
+> **Open question on result extraction (2026-09-13).** The fused WMMA returns a
+> native 16×16 fragment, but the consuming PTX expects *two separate* m16n8
+> results — they accumulate into different registers (`{%r623,%r635}` vs
+> `{%r642,%r649}` in the quoted PTX). If the consumers do not accept the native
+> layout, the split cost **moves** rather than disappears: one split per fused
+> tile instead of two per unpaired pair. Still a win, but not zero. Route A's
+> `bpermuteLane`/LDS gate is what decides it; until then "direct register
+> fragment" is a hypothesis, not a property.
+
 **Sizing the win honestly.** Using cache-consistent figures (24,319 WMMAs against ~7.96 M total instructions, both from the same 7 cached modules): removing ~30–65 scaffolding ops per tile removes **0.73–1.58 M instructions, i.e. 9–20 % of the total** — not the ~2–3× that comparing against scalar emulation would imply. These kernels are latency-bound, however, and serialized `bpermuteLane` LDS round-trips cost far more in cycle latency than in issue slots, so measured latency reduction may significantly outperform this static estimate. **That gap is precisely why Route A is a measurement, not an argument.**
+  *(added 2026-09-13: the 9–20 % is a **whole-cache dilution ratio** and almost
+  certainly understates the hot kernels. This same document records the top
+  kernel at 28 220 instructions carrying 256 `mma.sync` — 512 unpaired WMMAs, or
+  128–256 tiles at 40–80 scaffolding ops each, i.e. **5 K–20 K instructions,
+  18–70 % of that one kernel**. Scaffolding is concentrated in the chained
+  kernels, so the honest projection is per-kernel: `ZLUDA_LAUNCH_TIMING=1`
+  per-kernel time × that kernel's scaffolding share, summed — not a cache-wide
+  ratio applied to the frame. Note "tile" is used in two senses in this document
+  (one `mma.sync`, or one fused 16×16 pair) and the range above spans both; pin
+  the definition before quoting it.)*
 
 ### Numerics: equivalent or better
 
@@ -314,13 +410,45 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
    helpers, and the `_ZL49` call sites in the bitcode carry no
    `alwaysinline` (attribute #23 = `{ convergent nounwind }`) — the
    `[[clang::always_inline]]` hints in the C++ source did not survive the
-   O0 + sed rebuild. Consequence: **the intrinsics never reach the kernel's
+   O0 + sed rebuild.
+   *(mechanically confirmed 2026-09-13 in the vendored tree rather than by
+   disassembly: `ext/llvm-project/llvm/lib/IR/Verifier.cpp:2352-2354` states
+   "Attribute 'optnone' requires 'noinline'!", so a source marked
+   `[[clang::optnone]]` is guaranteed to carry noinline in the IR and
+   `s/optnone//g` cannot help leaving it behind. The observation and the rule
+   agree, and the noinline is not a leftover of something else. Note the
+   companion rule at `:2348` — noinline and alwaysinline are mutually exclusive —
+   which is why the fix below cannot be a bare `sed 's/^define/define
+   alwaysinline/'`: it would produce a module `llvm-as` rejects unless the
+   noinline is stripped first.)* Consequence: **the intrinsics never reach the kernel's
    basic blocks at any pipeline stage, so pairing is structurally
-   impossible until this is fixed.** Fix: add `sed 's/noinline//g'` to both
+   impossible until this is fixed.**   Fix: add `sed 's/noinline//g'` to both
    bitcode build pipelines (the two intentional `noinline` sites —
    `__assert_fail`, `vprintf` — become inlineable, a harmless size change
    worth watching in the vgpr/spill notes). `ZLUDA_PTX_IMPL_DIGEST` bumps,
    invalidating the cache once by design.
+   *(added 2026-09-13: removing `noinline` is necessary but **not sufficient**,
+   and a Step 0 that stops there can return an inconclusive gate. Stripping the
+   attribute only makes inlining *legal*; it does not make it *happen*. The
+   callee will carry no inline hint of its own — the `[[clang::always_inline]]`
+   in the C++ source is exactly what the O0 + sed rebuild already fails to
+   preserve — while its body is large (8-element staging arrays plus
+   `bpermute`/gather scaffolding). LLVM's cost model is free to decline. So the
+   "mma-helper call count → 0" gate could fail for a reason that has nothing to
+   do with pass timing, re-merging the two variables Step 0 exists to separate.
+   Restore `alwaysinline` — and because noinline and alwaysinline are mutually
+   exclusive (`Verifier.cpp:2348`), the route taken is to stop clang emitting the
+   noinline at all: the `[[clang::optnone]]` was removed from the three mma
+   wrappers in `ptx/lib/zluda_ptx_impl.cpp`, which is what lets the
+   `[[clang::always_inline]]` already present at their call sites be honoured at
+   .bc build time (evidence that clang does inline these: `fp8_mma_half`, a
+   `static inline` neighbour, is absent from the shipped .bc's symbol table), and
+   `sed 's/noinline//g'` was added to both pipelines for whatever noinline is
+   still emitted. So the gate tests the hypothesis rather than the inliner's
+   budget. Second-order hazard to watch: the `optnone` wrapper that the
+   same build strips exists *because* ZLUDA's own passes can optimise the
+   intrinsic away — so gate on the `llvm.zluda.mma` intrinsic count remaining
+   unchanged as well, not merely on calls disappearing.)*
    - **Expected outcome of Step 0 alone**: the **mma-helper** `s_swappc`
      calls disappear (the O3 inliner flattens the now-inlineable helpers)
      but the WMMA count does **not** halve — `CombineMMAPass` still runs at
@@ -368,7 +496,7 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 
 ### Projection (with uncertainties)
 
-*(Two figures, two premises: **232–264 ms** is derived from cache-consistent static instruction scaling — the 9–20 % removal, measured on the 640×360 cache, applied to the **290 ms measured GPU average** from the solid-color runs; the cross-resolution extrapolation is justified by the per-kernel latency being resolution-independent, see above — and is the defensible baseline; **80–120 ms** is the legacy figure from the earlier scalar-emulation premise and requires LDS-latency removal to compound. Route A replaces both with a measurement).*
+*(Two figures, two premises: **232–264 ms** is derived from cache-consistent static instruction scaling — the 9–20 % removal, measured on the 640×360 cache, applied to the **290 ms measured GPU average** from the solid-color runs; the cross-resolution extrapolation rides on the **scaffolding share of the instruction mix** being resolution-independent (the earlier "per-kernel latency is resolution-independent" wording does not survive this document's own numbers — 78.4 ms at 640×360 against 290 ms at 1080p is 3.7× for 9× the pixels) — and is the defensible baseline; **80–120 ms** is the legacy figure from the earlier scalar-emulation premise and requires LDS-latency removal to compound. Route A replaces both with a measurement).*
 
 | Platform | Path | Projected 1080p frame |
 |---|---|---|
@@ -444,6 +572,10 @@ on video throughput and keeps NVIDIA's actual code paths (fidelity).
 
 ### Phased plan
 
+*(ordering superseded 2026-09-13: a Phase -1 (the RDNA4 retest, one run) now
+precedes Step 0 — see Current conclusions at the top. The steps themselves are
+unchanged and still accurate.)*
+
 0. **Strip `noinline` from the ptx_impl bitcode** (both sed pipelines), rebuild
    `zluda_ptx_impl.bc`, and measure alone: the **mma-helper** `s_swappc` calls
    should vanish (gate: mma-helper call count → 0, *not* total `s_swappc` → 0
@@ -459,7 +591,48 @@ on video throughput and keeps NVIDIA's actual code paths (fidelity).
    pre-existing value-naming difference unrelated to the change), verifying
    that F32 accumulation produces identical output to NVIDIA references
    across subnormals, NaNs (`0x7F`), and saturated values (`0x7E`).
-4. **RDNA4 branch**: Add a `>= 12000` branch ahead of the existing `11000..13000` branch in `zluda_ptx_impl.cpp:1424`, so RDNA4 selects native `amdgcn_wmma_f32_16x16x16_fp8_fp8` instead of falling into the f16-widen path. Note the shape difference: the gfx12 fp8 WMMA is a single k32 instruction (no k-split pairing needed), but its N dimension still needs the 8→16 handling — the RDNA3 pairing logic does not transfer one-to-one.
+4. **RDNA4 branch**: *(corrected 2026-09-13 against the fork's own source.)* The gate in `zluda_ptx_impl.cpp:1424` is `__oclc_ISA_version >= 11000 && __oclc_ISA_version < 13000`, which **already swallows gfx12** — so this is not "add a `>= 12000` branch ahead of it", it is "carve gfx12 out of it". More importantly, the blocker is not a branch: the comment at `zluda_ptx_impl.cpp:1312-1325` records that there is **deliberately no native fp8 path yet**, because (a) the PTX→AMD fragment mapping differs (PTX `m16n8k32` carries sixteen A bytes per lane over eight columns, the AMD instruction eight bytes over sixteen), so **pairs of PTX operations must be fused**, and (b) **`CombineMMAPass` has no case for a native fp8 instruction** — it recognises only `zluda_mma_m16n8k16_f32_f16_f16_f32`, its bf16 twin and `zluda_mma_m16n8k32_s32_s8_s8_s32` (`CombineMMA.cpp:66-91`). Read that narrowly: today's fp8 MMAs already lower through `fp8_mma_half` into the **f16** intrinsic, so they *are* pairable by Route A as things stand. What has no case is routing fp8 to gfx12's native fp8 WMMA. An unverified mapping "would compile and silently produce wrong pixels", which is why it was left out rather than guessed. Prerequisite ordering therefore is: fp8 pairing case in the pass + a hardware-verified fragment mapping, *then* the gfx12 gate. A gfx12 machine is the only instrument that can verify the mapping — which is the second reason the RDNA4 retest comes first.
+
+### What was changed (2026-09-13)
+
+Two edits, left uncommitted, and **neither is verified by a build on this
+machine**:
+
+| file | change |
+|---|---|
+| `ext/llvm-project/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp` | the `CombineMMAPass` / `LowerMatrixConversionsPass` FPM moved from `registerOptimizerEarlyEPCallback` to `registerOptimizerLastEPCallback`, with `EarlyCSEPass` + `GVNPass` inserted **ahead** of the combiner (pairing is gated on `FirstA == SecondA`, and inlining alone does not unify the duplicated inlined operand chains). 40 insertions, 13 deletions. |
+| `ptx/lib/zluda_ptx_impl.cpp` | `[[clang::optnone]]` removed from the three mma wrappers, so the `[[clang::always_inline]]` already at their call sites survives to the `.bc`; `sed 's/noinline//g'` added to **both** bitcode pipelines and the header comment updated to record that the block is the only description of how the committed `.bc` was produced; `__attribute__((const))` added to `sreg_laneid`. 74 insertions, 10 deletions. |
+
+The `sreg_laneid` annotation is the least obvious of the three and the reason it
+is there: `fp8_mma_half` chooses *which byte pair this lane takes* from
+`sreg_laneid()`, so the two halves of one `m16n8k32` only produce the same `A`
+operand if the two lane-id reads can be CSE'd. `FunctionAttrs` would probably
+infer `memory(none)` from the body on its own; it is stated because its absence
+fails **silently** — no error, just unpaired WMMAs and a frame time that did not
+improve.
+
+**Two ordering traps that make all of this a no-op if missed.**
+
+1. `ptx/lib/zluda_ptx_impl.bc` and `_constrained.bc` are committed **build
+   inputs**, and they have **not** been regenerated — that needs the Linux + ROCm
+   pipeline in the file header (`/opt/rocm/amdgcn/bitcode/ocml.bc`). Until they
+   are, the `.cpp` changes reach no artifact at all, and `ZLUDA_PTX_IMPL_DIGEST`
+   will not even move, because `zluda/build.rs` digests the `.bc` files, not the
+   `.cpp`.
+2. The LLVM change alters emitted code, but the module cache key
+   (`zluda/src/impl/module.rs:407`) freezes `VERGEN_GIT_SHA` before the commit
+   lands and its explicit marker covers only the Rust-side translation passes.
+   Bump that marker (it currently reads `/fp8-inline-r1`) in the same change, or
+   every user with a warm cache keeps running the modules the pre-change backend
+   compiled and *nothing* of the above is observable.
+
+**Not verified here.** No LLVM build exists on this machine
+(`ext/llvm-project/build` is absent, no `llvm-dis` on PATH), so the bitcode
+could not be disassembled and neither edit has been compiled. To settle the
+attribute question without a build:
+`llvm-dis ptx/lib/zluda_ptx_impl.bc -o - | grep -n 'attributes #'` and read the
+groups belonging to the mma helpers — attribute names are enum-encoded, so
+grepping the binary for "noinline" returns zero and proves nothing either way.
 
 ### Artifacts
 
