@@ -804,15 +804,38 @@ dis/sed/as half is exercised, but it has never been run end to end:
 
 | # | gate | how, and why it is the gate |
 |---|---|---|
-| 0a | `alwaysinline` present in the new `.bc` | `llvm-dis new.bc -o new.ll` then count `alwaysinline` in `new.ll`. The committed `.bc` has **0**, so this is the only *direct* evidence that Step 0 took effect; if it is still 0 the helpers will not inline, Route A is inert, and every later measurement is a no-op dressed as a result |
+| 0a | the mma wrapper is **gone** from the new `.bc` | `llvm-dis new.bc -o new.ll`, then count `_ZL49__llvm_zluda_mma` in `new.ll` and expect **0**. This is the Step 0 gate — deliberately *not* the `alwaysinline` count, which points the other way: the attribute is consumed by the inlining it causes, so success leaves nothing to count. An earlier version of this table specified `alwaysinline` and thereby reported a success as a failure |
 | 0b | `noinline` gone | same dump, expecting 0. **Already verified** against the committed `.bc` with the sed applied: 5 → 0, `llvm-as` accepting the result, `llvm.zluda.mma` names preserved |
 | 1 | mma-helper `s_swappc` count → 0 | disassemble a compiled module; asymmetry with the total `s_swappc` count is what separates the two variables |
 | 2 | `v_wmma` halves on module 14 | `-mllvm -print-after=zluda-combine-mma` |
 
-**Verified vs not.** 0b, the read/write tool pair, the location of the LLVM tree
-and the existence of its `llvm-as` target are all observed. The `clang` step has
-never been run, the `.bc` has not been regenerated, and neither fork edit has
-been compiled.
+**Step 0 is verified on the real artifact (2026-09-13).** Both `.bc` files were
+regenerated — clang from the HIP SDK compiled the source, the HIP SDK's
+`llvm-dis` disassembled it, the `sed` chain ran, and the patched LLVM 22's
+`llvm-as` reassembled it — and the result was checked structurally rather than by
+counting attributes:
+
+| | committed | regenerated |
+|---|---|---|
+| `noinline` | 5 | **0** |
+| mma wrapper (`_ZL49__llvm_zluda_mma`) references | 3 (one definition, two calls) | **0** |
+| direct `llvm.zluda.mma.m16n8k16` call sites | 2 — one inside the wrapper | **3, all inside `FUNC(...)` helpers** |
+| …of those, inside the fp8 helper | 0 | **2** (k 0..15 and k 16..31) |
+
+The wrapper disappearing *is* the result: it is gone because it was inlined, so
+the intrinsics now sit in the helper bodies instead of behind a `noinline` call.
+`noinline` reaching zero also frees the **outer** helpers, which carried it too
+(`#14 = { … noinline … }` in the committed file) and therefore could never be
+inlined into the kernel — meaning Route A could not have worked against the old
+`.bc` even with the pass moved. Sizes: 71 616 → 69 700 and 70 868 → 68 988 bytes;
+the two outputs remain distinct files.
+
+**Still open.** Whether those outer helpers then inline into the *kernel* at
+module-translation time — that is what gates 1 and 2 test — and neither fork edit
+has been compiled yet. The constrained variant also emits clang warnings
+(`-ffp-model=strict` overridden by `-ffp-exception-behavior=ignore`, and an
+unsupported rounding mode); those come from the flags in the pipeline header, not
+from the changes, and the two outputs differ.
 
 ### Artifacts
 
