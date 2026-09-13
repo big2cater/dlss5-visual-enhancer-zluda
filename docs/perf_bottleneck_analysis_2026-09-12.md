@@ -69,7 +69,7 @@ overhead (that is 0.6 µs) and not the `s_dcache.inv` prelude (one instruction).
 1. ~~**Per-kernel GPU timing from inside the fork**~~ — **implemented and closed.**
    Implemented via `ZLUDA_LAUNCH_TIMING=1` in `zluda/src/impl/function.rs` (event pair per launch). Measured kernel GPU time at 80.6 ms/frame and identified the top serialized attention kernels.
 2. ~~**Chase the single-wave latency**~~ — superseded the same way as the
-   section below: the evening revision reframes the per-kernel latency cause
+   section above: the evening revision reframes the per-kernel latency cause
    as MMA pad/split scaffolding. The ISA checks listed here are still worth
    one pass when Route A lands; `tools/analyze_vopd.py` is the toolkit.
 3. ~~**More waves per kernel / grid sizing**~~ — **verified and closed.**
@@ -117,9 +117,10 @@ ISA of the top kernel (`cc_split_swin_16h_qkv_512_chained_fp8`, module 14,
 
 Levers, in order of expected value:
 
-*(superseded 2026-09-13: the project proposal further down subsumes items 2–3
-into its Route A/B; item 1 is closed by the A/B below. Kept for the
-measurement record.)*
+*(superseded 2026-09-13: item 1 is closed by the A/B below; items 2–3 remain
+separate live levers — the project proposal further down adds the mma-pairing
+lever on top of them, it does not absorb them. Kept for the measurement
+record.)*
 
 1. ~~**Raise the VGPR budget**~~ — **tested and closed.** `ZLUDA_NUM_VGPR=256`
    (implemented with cache-key isolation) recompiled every module: gfx11
