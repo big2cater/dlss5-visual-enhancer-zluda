@@ -260,13 +260,19 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 
 ### Hardware WMMA comparison
 
-| Metric | Unpaired 16×8 (Current) | Fused 2× `v_wmma_f32_16x16x16_f16` (16×16 tile) |
+*(corrected 2026-09-13: the left column is **not** scalar emulation — the compiled code already emits `v_wmma_f32_16x16x16_f16` (24,319 instances). The fusion win is therefore "halve the WMMA count and delete the pad/split scaffolding", **not** "replace hundreds of scalar ops with one WMMA".)*
+
+| Metric | Unpaired 16×8 WMMA (Current) | Fused 16×16 WMMA (Target) |
 |---|---|---|
-| Math throughput per wave | ~4–8 MACs/cycle (dependent chains + unpack) | 8192 MACs in ~32–64 cycles ≈ **128–256 MACs/cycle** |
-| Accumulator VGPRs per thread | **4** (F32) or **2** (packed F16) | **8** (F32) or **4** (packed F16) |
-| Padding / Truncation overhead | High (padded B + `dMatrixSplit` LDS bpermute tree) | **Zero** (natural 16×16 coverage, direct writeback) |
-| Local MMA scaffolding per tile | **~40–80 ops** (2× B-padding, fp8-widen, + 2× LDS `bpermuteLane` split trees) | **~12–16 ops** (shared DPP quad-gather + bitwise widen for A, zero LDS split) |
-| Whole-cache instruction ratio | ~327 total ops/WMMA (macro dilution including non-MMA layers) | ~160 total ops/WMMA (WMMA halved, split scaffolding eliminated) |
+| WMMA per 2× `m16n8k32` | 4 (half of each 16×16 wasted) | **2** (both halves useful) |
+| Useful MACs per WMMA | 2048 of 4096 (50 %) | **4096 of 4096 (100 %)** |
+| B-matrix handling | Zero-padded to 16 columns | Natural `[B₀, B₁]` concat |
+| Result extraction | `dMatrixSplit` + `bpermuteLane` LDS round-trips | Direct register fragment |
+| Local scaffolding per tile | ~40–80 ops | **~12–16 ops** |
+| Accumulator VGPRs per thread | 4 (F32) / 2 (packed F16) | 8 (F32) / 4 (packed F16) |
+
+**Sizing the win honestly.** Total cache instructions ≈ 7.96 M. Removing ~30–65 scaffolding ops per tile removes roughly **1.6–3.5 M instructions (20–44 %)** — not the ~2–3× that comparing against scalar emulation would imply.
+However, these kernels are latency-bound (see above: single-wave execution on 84 CUs), and serialized `bpermuteLane` LDS round-trips cost far more in cycle latency than raw issue slots, so the measured latency reduction may significantly outperform the static instruction count estimate. **This is exactly why Route A is a measurement, not an argument.**
 
 ### Numerics: equivalent or better
 
@@ -290,20 +296,22 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 
 ### Projection (with uncertainties)
 
+*(Projection derived under the earlier scalar-emulation premise; to be re-derived after Route A measures the actual pad/split removal and LDS latency reduction).*
+
 | Platform | Path | Projected 1080p frame |
 |---|---|---|
-| RX 7900 XT (gfx1100) | m16n8k32 e4m3 → DPP widen → fused f16 WMMA | **80–120 ms** (band: 40–150 ms depending on memory bandwidth ceiling) |
+| RX 7900 XT (gfx1100) | m16n8k32 e4m3 → DPP widen → fused f16 WMMA | **80–120 ms** *(static instruction scaling predicts ~180–260 ms; 80–120 ms requires LDS latency elimination to yield compounding gains; band: 40–150 ms depending on bandwidth ceiling)* |
 | RX 9070/9080 (gfx1200) | native fp8 WMMA (`v_wmma_f32_16x16x16_fp8_fp8`) | **30–50 ms** — confirmed: vendored LLVM carries `Intrinsic::amdgcn_wmma_f32_16x16x16_fp8_fp8` and gfx12 builtins |
 | RX 6000 (gfx10) | no WMMA hardware | excluded — keeps scalar path; fp8-inline still applies |
 
-640×360 case improves proportionally from 78.4 ms down toward ~20–30 ms.
+640×360 case: pending empirical measurement with Route A (static instruction scaling suggests ~45–60 ms, down from 78.4 ms; lower latencies depend on whether single-wave wait latency collapses with the removal of LDS bpermute).
 
 ### Phased plan
 
 1. **Pass timing experiment (Route A)**: Move `CombineMMAPass` to `registerOptimizerLastEPCallback` in `AMDGPUTargetMachine.cpp`; test module 14 with `ZLUDA_LAUNCH_TIMING=1` and `-mllvm -print-after=zluda-combine-mma`.
 2. **Peephole fusion / direct lowering (Route B)**: If LLVM pass migration has unintended phase interactions, implement PTX AST peephole pairing in Rust (`ptx/src/pass`).
 3. **Numeric verification**: Run full test suite (`cargo test --test spirv_run`), verifying that F32 accumulation produces identical output to NVIDIA references across subnormals, NaNs (`0x7F`), and saturated values (`0x7E`).
-4. **RDNA4 branch**: Hook `__oclc_ISA_version >= 12000` directly to `amdgcn_wmma_f32_16x16x16_fp8_fp8`.
+4. **RDNA4 branch**: Add a `>= 12000` branch ahead of the existing `11000..13000` branch in `zluda_ptx_impl.cpp:1424`, so RDNA4 selects native `amdgcn_wmma_f32_16x16x16_fp8_fp8` instead of falling into the f16-widen path.
 
 ### Artifacts
 
