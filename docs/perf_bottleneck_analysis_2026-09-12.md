@@ -103,12 +103,13 @@ symptoms.
 
   State left behind: deployment is the pre-change DLL; the three builds are kept
   as `nvcuda-before-mma.dll`, `nvcuda-clean-5ac9102.dll` and
-  `nvcuda-mine-mma.dll` under `%TEMP%`; the cache holds 15 modules × 3
-  generations, which is what makes the table above possible; and the 15 module
-  inputs were harvested out of the snippet to `%TEMP%\dlss5-modules`, so a single
-  module can be recompiled with `video_filter --compile-one <module> <driver>` in
-  minutes instead of re-running a full prewarm. The fork changes stay uncommitted
-  in the working tree.
+  `nvcuda-mine-mma.dll` under `%TEMP%`; and the cache holds 15 modules × 3
+  generations, which is what makes the table above possible.
+  `tools/zluda_module_ab.py` is the tool for this: it extracts the module inputs
+  out of the snippet, compiles them one at a time with each driver, and prints the
+  table above from the cache, so the next attempt at pairing can be judged in
+  seconds instead of another twenty-minute prewarm. The fork changes stay
+  uncommitted in the working tree.
 
 The two tests that decide whether either worked are both gfx11 and both cheap:
 the mma-helper `s_swappc` count going to zero, and `v_wmma` halving on module 14
