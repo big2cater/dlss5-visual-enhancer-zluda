@@ -44,9 +44,10 @@ symptoms.
 
   ⚠️ **Measured 2026-09-13: Step 0 + Route A are a 1.6× regression. Do not ship
   them as they stand.** Both were implemented, built and run. Frame time at
-  640×360 went **86 ms → 139 ms** (avg GPU 127.5 → 186.0 ms, throughput 7.40 →
-  5.19 fps) on the same input, the same command line, the same snippet — only
-  the driver DLL swapped. Step 0 does exactly what it claimed: the mma-helper
+  640×360 went **88–89 ms → 142–144 ms** (avg GPU ~129 → ~189 ms, throughput
+  7.40 → 4.95 fps) on the same input, the same command line, the same snippet —
+  only the driver DLL swapped, and with the order alternated across rounds so
+  that drift cannot line up with one binary. Step 0 does exactly what it claimed: the mma-helper
   call sites drop to zero, so the helpers really are inlined into the kernel. But
   Route A does **not** pair them, and inlining without pairing is pure cost,
   because the pad/split scaffolding is then duplicated at every call site. On the
@@ -72,10 +73,42 @@ symptoms.
   later" but "make the operand chains reorderable, or fuse before the scaffolding
   is emitted".
 
-  State left behind: deployment reverted (`run/`, `build/`, `dist/` all carry the
-  pre-change `8B6C9E8E…`), the fork changes left uncommitted in the working tree
-  so the experiment is reproducible, and the module cache holds both generations
-  (15 rows each) paired by PTX hash for further analysis.
+  **Isolated on one revision.** Two more builds pin the cause down. Plain
+  `5ac9102` (the fp8-inline commit alone, no experiment) was built and measured
+  against both the DLL that predates that commit and the experiment build:
+
+  | driver | 640×360 frame | avg GPU | throughput |
+  |---|---|---|---|
+  | pre-`5ac9102` | 88–89 ms | 128.7–130.9 ms | 7.37–7.40 fps |
+  | plain `5ac9102` | 89 ms | 128.9 ms | 7.41–7.43 fps |
+  | `5ac9102` + this experiment | 142–144 ms | 189.1–189.3 ms | 4.95 fps |
+
+  The first two rows are the same number, and the compiled modules say why. Of
+  the modules that now exist in all three generations, the pre-`5ac9102` and
+  plain-`5ac9102` cached images are **byte-identical** (equal SHA-256), and for
+  eight of them the experiment build is byte-identical too — those are the ones
+  with no MMA in them. So the fp8-inline commit is not a factor here, and the
+  whole 89 → 144 ms belongs to the experiment: **+62 % on one revision with the
+  commit held constant.**
+
+  One module (`105d6e59a254…`, MMA-bearing), all three generations:
+
+  | metric | pre-`5ac9102` | plain `5ac9102` | experiment |
+  |---|---|---|---|
+  | bytes | 7 689 968 | 7 689 968 | 10 914 200 (+41.9 %) |
+  | `v_wmma` | 3 713 | 3 713 | 8 000 (+115.5 %) |
+  | `s_swappc` | 4 288 | 4 288 | 0 |
+  | `ds_bpermute` | 131 980 | 131 980 | 219 412 (+66.2 %) |
+  | `scratch_store` | 25 382 | 25 382 | 47 398 (+86.7 %) |
+
+  State left behind: deployment is the pre-change DLL; the three builds are kept
+  as `nvcuda-before-mma.dll`, `nvcuda-clean-5ac9102.dll` and
+  `nvcuda-mine-mma.dll` under `%TEMP%`; the cache holds 15 modules × 3
+  generations, which is what makes the table above possible; and the 15 module
+  inputs were harvested out of the snippet to `%TEMP%\dlss5-modules`, so a single
+  module can be recompiled with `video_filter --compile-one <module> <driver>` in
+  minutes instead of re-running a full prewarm. The fork changes stay uncommitted
+  in the working tree.
 
 The two tests that decide whether either worked are both gfx11 and both cheap:
 the mma-helper `s_swappc` count going to zero, and `v_wmma` halving on module 14
