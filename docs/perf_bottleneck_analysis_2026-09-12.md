@@ -411,6 +411,26 @@ Consequences:
    `HSA_OVERRIDE_GFX_VERSION` is not `12.*`, the auto-config currently prints a
    line and stands aside. It should warn and override — and that warning has to
    reach the GUI log, since `fprintf(stderr)` is invisible in `dlssnr_gui.exe`.
+
+### External corroboration: a native HIP reimplementation hits the projection
+
+`danielblnc/DLSS-NR-on-AMD` (the execution backend of
+`eikkapine/DLSS5-AMD-Video`) is a **ground-up HIP/ROCm reimplementation** of
+the DLSS-NR runtime — no CUDA translation, no ZLUDA; weights are extracted
+from the user's `nvngx_dlssnr.dll` into a custom `.bin`, inference is
+hand-written HIP. Its measured **~33 FPS at 1080p on an RX 9070 XT
+(~30 ms/frame)** independently corroborates this document's 30–50 ms RDNA4
+projection: the number is achievable on gfx12 when the fp8 math runs natively
+instead of through any form of translation.
+
+Two caveats keep it honest: (a) their figure is a game-integration claim at
+unknown internal settings, not a like-for-like video benchmark; (b) the
+eikkapine video pipeline built on top of it measured 3.41 s/frame at 1080p —
+10× slower than this project's ZLUDA pipeline (~0.3 s/frame at 1080p) — so
+the orchestration overhead around the runtime, not the GPU, dominates that
+particular pipeline. The strategic reading: the reimplementation route has
+the higher ceiling on RDNA4, while this project's ZLUDA route currently wins
+on video throughput and keeps NVIDIA's actual code paths (fidelity).
 3. **Detection coverage note (verified)**: the name match covers RX 9060/9070
    and the generic "rx 9"/"radeon 9" forms (`gpu_detection.h:141-147`), so the
    gfx1200 cards ARE auto-configured. One stale piece: the device-id fallback
