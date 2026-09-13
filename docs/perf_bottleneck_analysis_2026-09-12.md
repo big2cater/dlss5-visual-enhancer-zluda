@@ -53,7 +53,9 @@ of them.
 - **Phase -1 — RDNA4 retest: needs whoever owns the RX 9070 XT.** Until that
   machine re-runs with `HSA_OVERRIDE_GFX_VERSION` corrected, "gfx12 is broken"
   stays a field report rather than a reproduction, and the fp8-Swin module
-  failure has no confirmed cause.
+  failure has no confirmed cause. The run, and the four things worth sending
+  back, are spelled out in *For whoever has the RX 9070 XT* below — written as
+  one run so the answer does not cost another round trip.
 - **Phase 4 — native gfx12 fp8 path: do not attempt without a gfx12 card.** The
   fork's own comment says why — an unverified fragment mapping "would compile and
   silently produce wrong pixels" — and a gfx12 machine is the only instrument
@@ -541,10 +543,14 @@ A field report on an RX 9070 XT (gfx1201) fails before any frame is produced:
   "cc_tinlayout_fused_pre_block_swin_3h_32_3_ds_fp8" failed`.
 - The failing module is the one carrying the **fp8** Swin kernel.
 - Confounding factor on that machine: `HSA_OVERRIDE_GFX_VERSION` was set to
-  **11.0.0**, which suppresses the RDNA4 auto-config (`gpu_detection.h:109-119`
-  only injects 12.0.1 when the variable is unset) and makes ZLUDA compile gfx11
-  ELF for a gfx1201 device. **Not yet confirmed whether removing it fixes the
-  run** — that is the open question.
+  **11.0.0**, which at the time suppressed the RDNA4 auto-config (injection then
+  ran only when the variable was unset) and made ZLUDA compile gfx11 ELF for a
+  gfx1201 device. **Still not confirmed whether removing it fixes the run** —
+  that is the open question, and it is what the hand-off section below exists to
+  close.
+  *(line reference corrected 2026-09-13: that injection is at
+  `gpu_detection.h:162-174`, not `:109-119`, and it no longer merely defers to an
+  unset variable — it corrects a mismatched one. See consequence 2.)*
 
 Consequences:
 
@@ -570,6 +576,60 @@ Consequences:
    ZLUDA-specific passes from optimizing away the intrinsic — which is why
    the fix strips `noinline`/`optnone` in the bitcode build rather than
    removing the wrapper blindly.
+
+### For whoever has the RX 9070 XT — what to run, and what to send back
+
+*(added 2026-09-13. Neither the retest nor Phase 4 can be run by this repository
+— the development machine is a 7900 XT (gfx1100) — so the gfx12 question is
+handed over rather than worked on. This is written so that one run produces
+everything needed, instead of another round trip.)*
+
+**Run the job that failed, on the build that carries the override correction, and
+change nothing else.** `gpu_detection.h` now rewrites a non-gfx12
+`HSA_OVERRIDE_GFX_VERSION` to `12.0.1` and says so in the startup log; the batch
+GUI repeats the warning in its log window. The only question this run answers is
+whether the fp8-Swin translation failure was the stale override or something in
+gfx12 itself — every other variable you change destroys that answer.
+
+**Remove the stale value at the source first.** If `HSA_OVERRIDE_GFX_VERSION` was
+set system-wide (the older guides that recommend `11.0.0` are the usual cause),
+delete it there rather than relying on the auto-correction. A machine-level value
+is precisely what that correction is warning about, and leaving it set means the
+next tool you run — not this one — inherits the stale value.
+
+**Send back:**
+
+1. The complete `[GPU-AutoConfig]` line from startup. It names the detected card
+   and either the injected or the corrected override, and that is what separates
+   "the override was the cause" from "the override was irrelevant".
+2. `rocminfo` (or `hipInfo`) output, or at minimum the **gfx target** it reports.
+   `gfx1200` and `gfx1201` are different parts and the auto-injection hardcodes
+   `12.0.1` for both — if your card reports `gfx1200`, that value is being
+   assumed rather than known.
+3. The full precompile log, not just the summary line, from
+
+   ```
+   video_filter.exe --precompile nvngx_dlssnr.dll nvcuda.dll 1
+   ```
+
+   The trailing `1` is the job count: it serialises the translation so the
+   failing module is unambiguously the one the failure appears after, and it
+   bypasses the adaptive memory gate (`adaptive` is true only when the count is
+   0). Budget for a full pass: the warm-start stamp is written only when every
+   module succeeds, so a failed precompile leaves the cache cold and this re-runs
+   all fifteen rather than short-circuiting. What matters is the module index and
+   whether the child failed to *translate* or the module translated but then
+   would not *load* — different bugs behind the same headline.
+4. Whether a frame now appears, and **whether it is visually correct**. gfx12
+   takes the `__oclc_ISA_version >= 11000 && < 13000` branch
+   (`zluda_ptx_impl.cpp:1424`) — the RDNA3-shaped f16-widen path, which has only
+   ever been measured on gfx11. "It ran" and "it is right" are separate answers,
+   and this project cannot check the second one.
+
+**What not to send back: a frame time.** It is interesting and it is not the
+question, and a number from a machine whose translation path is still
+unconfirmed would get quoted out of context in exactly the way the gfx12
+projection already was.
 
 ### External corroboration: a native HIP reimplementation hits the projection
 
