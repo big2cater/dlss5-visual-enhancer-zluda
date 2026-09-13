@@ -107,8 +107,9 @@ ISA of the top kernel (`cc_split_swin_16h_qkv_512_chained_fp8`, module 14,
 - fp8 is emulated: no native fp8 ALU on gfx11 — every fp8 op goes through
   `v_perm_b32`/`v_bfi_b32` unpack + `v_pk_mul_f16`/`v_pk_add_f16` +
   `v_cvt_f16_f32` repack (~20 % of the code). *(Note: an earlier draft assumed WMMA was absent. Later cache disassembly confirmed 24,319 `v_wmma_f32_16x16x16_f16` are present — they are **unpaired and burdened by pad/split scaffolding**, not missing. See the evening revision; the "~327 ops per WMMA" figure sometimes quoted is a whole-cache dilution ratio, not MMA-local cost)*.
-- 512 `s_swappc_b64` call sites — the "chained" network layers are real
-  subroutine calls, not inlined.
+- 512 `s_swappc_b64` call sites — a mix of the "chained" network layer calls
+  and the non-inlined mma helpers; see Step 0, which shows the mma helper
+  calls are blocked by a surviving `noinline` attribute.
 - The PTX carries **no tuning directives at all** (no `.maxnreg`,
   `.minnctapersm`, `.reqntid`), so neither the fork's `amdgpu-num-vgpr`
   mapping nor occupancy directives cause the cap; it is LLVM's own occupancy
@@ -254,7 +255,7 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
 
 - `mma1_k0_15` and `mma2_k0_15` share the **exact same SSA values** for $A$ (originating from the same `fp8_widen_pair`). Once inlined, `EarlyCSEPass` exposes identical operands, causing `FirstA == SecondA` in `CombineMMA.cpp:179` to evaluate to `true`. They fuse into a single hardware 16×16 WMMA ($k \in [0..15]$) with combined $B = [b_1[0], b_2[0]]$.
 - `mma1_k16_31` and `mma2_k16_31` similarly fuse into a single hardware 16×16 WMMA ($k \in [16..31]$) with combined $B = [b_1[1], b_2[1]]$.
-- **Result: 4 intrinsics collapse into exactly 2 hardware WMMAs (50% reduction)**. The verification gate `v_wmma count halves` is not an empirical hope, but a mathematical necessity derived from the SSA graph.
+- **Result: 4 intrinsics collapse into exactly 2 hardware WMMAs (50% reduction)**. The verification gate `v_wmma count halves` is not an empirical hope, but a mathematical necessity derived from the SSA graph — **conditional on Step 0 making the helpers inlineable and Route A moving the pass after the inliner** (without those, the intrinsics never share a function with each other or with the kernel at pairing time).
 
 ### Why register spills happen — correcting the accumulator math
 
@@ -316,12 +317,16 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
    `__assert_fail`, `vprintf` — become inlineable, a harmless size change
    worth watching in the vgpr/spill notes). `ZLUDA_PTX_IMPL_DIGEST` bumps,
    invalidating the cache once by design.
-   - **Expected outcome of Step 0 alone**: the `s_swappc` calls disappear
-     (the O3 inliner flattens the now-inlineable helpers) but the WMMA
-     count does **not** halve — `CombineMMAPass` still runs at the early
-     extension point, before the inliner, so it still sees calls instead
-     of intrinsics. That asymmetry is what cleanly separates the two
-     variables (inlining failure vs pass timing).
+   - **Expected outcome of Step 0 alone**: the **mma-helper** `s_swappc`
+     calls disappear (the O3 inliner flattens the now-inlineable helpers)
+     but the WMMA count does **not** halve — `CombineMMAPass` still runs at
+     the early extension point, before the inliner, so it still sees calls
+     instead of intrinsics. Other `s_swappc` calls (the chained layer
+     calls, `__assert_fail`, `vprintf`) are unaffected — possibly they even
+     become inlined now that their `noinline` is gone, so the verification
+     gate is **"the mma-helper call count drops to zero"**, not "the
+     `s_swappc` total drops to zero". That asymmetry is what cleanly
+     separates the two variables (inlining failure vs pass timing).
    - Empirical per-module state of the current cache (s_swappc calls vs
      `v_wmma` instructions, static disassembly):
 
@@ -335,10 +340,14 @@ In real PTX dumps (e.g. `module_0001_01.ptx:16870-16880`), two adjacent `m16n8k3
      | 10 | 4,739 | 4,352 | 1,441 |
      | 9 | 396 | 256 | 65 |
 
-     Calls and WMMAs coexist at ~1:1 in every module — a partial, mixed
-     inlining state (some helper call sites flattened by the cost model,
-     others blocked), consistent with the noinline blocker rather than
-     with an all-or-nothing rule.
+     Calls and WMMAs coexist in every module, but the ratio varies widely
+     (0.99:1 in module 15, up to 3.94:1 in module 9; 1.62:1 overall). That
+     ratio does **not** measure inlining: `s_swappc_b64` counts *all* calls
+     (mma helpers, the chained layer calls, `__assert_fail`, `vprintf`), so
+     >1 is expected regardless. The inlining state is settled by the
+     attribute evidence instead — the `_ZL49` call sites carry no
+     `alwaysinline` and the callee carries `noinline`, so **no** mma helper
+     call is inlined on either the f16 or the fp8 path.
 1. **Route A (LLVM Pass timing — the definitive experiment)**:
    After Step 0, in `ext/llvm-project/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp`, move `CombineMMAPass` and `LowerMatrixConversionsPass` from `registerOptimizerEarlyEPCallback` (line 897) to `registerOptimizerLastEPCallback` (line 954), after the Inliner has flattened subfunctions into kernel basic blocks.
    - **Verification test**: Recompile a single module (e.g. module 14) with
