@@ -75,13 +75,31 @@ Unchanged by this: the race the gate exists for is rarer than this report measur
 — 0 of 24 fresh processes on 2026-09-14 against 2/5 to 4/6 on 2026-09-10 — but it
 has not been shown to be gone.
 
-Deliberately not changed here: the **still-image** path gates on
-`output_is_blank(out) && image_has_signal(in)` — the same pair of tests whose
-collision at a fade-in boundary this fix addressed for video — so a dark still can
-be retried as a false blank. The symptom is milder (a still cannot deadlock an
-entire film; it burns a few retries and reports blank), and fixing it means giving
-that path its own brightness measure instead of reusing the video gate's
-frame-level one.
+**Superseded the same evening (v2026.09.14-v3): the still path was fixed too, and
+so were two sites this note had not found.** A review of every place that judged a
+black output turned up four more than the two the v2 fix addressed: the encoder
+stage's gate, `video_filter`'s still-image gate, and two inside the processor —
+`looks_like_blank_result` (used by `process`) and `looks_like_blank_output` (used
+by `process_raw_rgb48`, which is the video path and does not see the input at all).
+They now share the v2 shape: the video side wants an input far brighter than the
+blank bar and the condition to persist for three frames; the still side, which has
+no run of frames to work with, uses a higher bar (linear 0.25) and logs its
+measured peak and threshold so a verdict can be checked afterwards; and the
+output-only check, which has no input brightness to compare against, is narrowed
+to the one signature that cannot be anything else — every channel exactly zero.
+
+The processing-stage check also runs on every frame now, not just the first ~2
+seconds, so a race that begins after a long dark opening — or on a shard whose
+opening is dark — is caught too.
+
+Both video gates' firing paths were exercised with a temporary forced verdict (two
+consecutive warnings, abort on the third, exit 2, `blanks=1`), the encoder one
+forced in isolation so the other gate could not answer first. Measured after the
+change: the trailer 120 frames at exit 0 with `blanks=0`, the regression clip exit
+0 at ~106 ms/frame with `blanks=0`, and the dark still that the video gate once
+flagged going through, its log reading "input peak 12517/65535 (bar 13312) → not
+judged blank" — a margin of 6 %, which is worth knowing if a dimmer still ever
+comes up.
 
 ## Requests
 
