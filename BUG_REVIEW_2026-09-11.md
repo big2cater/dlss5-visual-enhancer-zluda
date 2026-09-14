@@ -6,6 +6,24 @@
 
 ---
 
+## 归档说明（2026-09-14）
+
+`dlss5-image-enhancer` 目标与 `gui/main.cpp`、`gui/main_window.{cpp,h}` 已于当日删除（提交
+`4d06992`；理由写在 `CMakeLists.txt` 留下的注释里 —— 它是第二个 Qt 前端，自己做进程内处理
+而不像 `dlssnr_gui` 那样驱动 `video_filter`，从不出现在发布包里，参数却会与出货路径分叉）。
+因此下列条目**转为历史记录**，原文保留、不再修复：
+
+- A21 —— 僵尸 target：**已执行删除**。
+- A7 —— windeployqt 指向错误的 exe：早已修复，且该 exe 现已不存在。
+- 「老工具 `gui/main_window.cpp`」整节（B22–B25）。
+- D13 —— `main_window.cpp` 的 `g_window` 数据竞争。
+- 复核覆盖表中列出 `gui/main_window.cpp/.h`、`main.cpp` 的那一行。
+
+**其余条目依然有效**，尤其是落在共享文件里的那些（`core/`、`dlss_layer/`、`tools/`、
+`ngx_runtime/`、构建与打包配置），例如 D9/D10/D11、A5/A6、C7 —— 删掉的只是前端，不是它们的落点。
+
+---
+
 ## 环境事实（已核实，作为后续判断的前提）
 
 | 项 | 实际值 |

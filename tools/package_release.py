@@ -51,11 +51,16 @@ os.makedirs(os.path.join(staging_dir, "styles"), exist_ok=True)
 
 # Copy core binaries & dependencies
 # Search directories for binaries and runtimes - dist/build first where build.bat outputs
+#
+# build_qt is deliberately not in this list. It was a second build tree that
+# build_qt_gui.bat populated, and find_file() takes the first directory that has
+# the name -- so a file missing from dist/build/run would have been taken from a
+# stale tree without a word. build_qt_gui.bat now builds into build\ like
+# everything else.
 bin_dirs = [
     os.path.join(root_dir, "dist"),
     os.path.join(root_dir, "build"),
     os.path.join(root_dir, "run"),
-    os.path.join(root_dir, "build_qt"),
 ]
 
 # Discover MSVC redist directories dynamically
