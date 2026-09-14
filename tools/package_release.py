@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import os
+import re
 import shutil
+import time
 import zipfile
 import sys
 
@@ -18,13 +20,70 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.abspath(os.path.join(script_dir, ".."))
 
 parser = argparse.ArgumentParser(description="Package DLSS-NR Filter release")
-parser.add_argument("--version", default="v2026.09.12-v4", help="Release version tag")
+# Required, not defaulted. The old default was the tag of a release from days
+# earlier, so a run that forgot the flag produced a package whose name described
+# a version it was not -- a trap of exactly the kind this repository keeps
+# removing.
+parser.add_argument("--version", required=True, help="Release version tag, e.g. v2026.09.14-v2")
 parser.add_argument("--nodlssnr", action="store_true", help="Explicitly mark without DLSS-NR dll")
 args, _ = parser.parse_known_args()
 
 version_tag = args.version
 if not version_tag.startswith("v"):
     version_tag = f"v{version_tag}"
+
+# Keep the machine-readable version slots in README.md in step, and say out loud
+# what cannot be kept in step automatically.
+#
+# The README carries the release tag in two places that are pure data -- the
+# badge and the example download filename -- and both were stale when this was
+# added (badge said v2026.09.10-multipass, the example named a 09-11 zip) because
+# nothing tied them to the packaging step. Everything else that mentions a
+# version is prose: the FAQ refers to the version that fixed the fog, for
+# instance, and rewriting that would be a lie. So this updates the two slots and
+# lists the other versions it finds for a human to review.
+def sync_readme(tag):
+    path = os.path.join(root_dir, "README.md")
+    if not os.path.isfile(path):
+        return
+    # newline="" keeps whatever line endings the file already has; without it a
+    # rewrite would convert every line and bury the real change in a whole-file
+    # diff.
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        original = f.read()
+    # shields.io renders "--" as "-", so the URL form doubles the dashes.
+    badge_tag = tag.replace("-", "--")
+    text, n_badge = re.subn(r"(badge/release-)[^)]*(-brightgreen)",
+                            lambda m: m.group(1) + badge_tag + m.group(2), original)
+    text, n_example = re.subn(r"`DLSSNRFilter-[^`]*-nodlssnr\.zip`",
+                              "`DLSSNRFilter-" + tag + "-nodlssnr.zip`", text)
+    if text != original:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+    print(f"README.md: release badge updated ({n_badge}), download example updated ({n_example})")
+    if n_badge == 0 or n_example == 0:
+        print("README.md: [!] one of the two slots was not found -- check the patterns in tools/package_release.py")
+    others = sorted({m for m in re.findall(r"v20\d\d\.\d\d\.\d\d[\w.\-]*", text) if m != tag})
+    if others:
+        print("README.md: prose still names other versions -- confirm each is historical on purpose: "
+              + ", ".join(others))
+
+# The release note is hand-written for every release, which is the point, but its
+# title carries the date and a forgotten title is how a note dated yesterday
+# ships under today's tag.
+def check_note_date():
+    path = os.path.join(root_dir, "发布包说明.txt")
+    if not os.path.isfile(path):
+        print("发布包说明.txt: not found")
+        return
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        title = f.readline().strip()
+    today = time.strftime("%Y-%m-%d")
+    marker = "OK" if today in title else "CHECK"
+    print(f"发布包说明.txt: title = {title!r}  ({marker}: today is {today})")
+
+sync_readme(version_tag)
+check_note_date()
 
 release_name = f"DLSSNRFilter-{version_tag}-nodlssnr"
 staging_dir = os.path.join(root_dir, release_name)

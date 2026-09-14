@@ -3022,6 +3022,10 @@ static int run_main_once(int argc, char **argv) {
                             "[FAIL] frame %u: 输出空白而输入明亮（输入峰值 %u/65535，输出低于空白阈值）"
                             "——ZLUDA 竞态，交由外层重跑\n",
                             in_frame->index, in_frame->input_max16);
+                    // Counted so [done] reports blanks=N honestly. It used to stay
+                    // 0 on this path, which made the field actively misleading as
+                    // a way to tell whether a run came out black.
+                    blank_count.store(blank_count.load() + 1);
                     failed = true;
                     retryable = true;
                     abort_pipeline.store(true);
