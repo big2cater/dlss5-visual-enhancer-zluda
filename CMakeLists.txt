@@ -21,26 +21,16 @@ set(CMAKE_AUTOMOC ON)
 find_package(Qt6 QUIET COMPONENTS Widgets)
 
 if(Qt6_FOUND)
-    add_executable(dlss5-image-enhancer WIN32
-        gui/main.cpp
-        gui/main_window.cpp
-        gui/main_window.h
-        gui/half_float.h
-        core/image_processor.cpp
-        core/image_processor.h
-        core/precompile.cpp
-        core/precompile.h
-        dlss_layer/dlss_cuda.cpp
-        dlss_layer/frame_blit.cpp
-    )
-
-    target_include_directories(dlss5-image-enhancer PRIVATE dlss_layer)
-    target_link_libraries(dlss5-image-enhancer PRIVATE Qt6::Widgets d3d12 dxgi d3dcompiler)
-
-    # A console alongside the window: the DLSS layer and the network both report
-    # through standard error, and those messages are the only explanation when
-    # something is refused.
-    target_compile_definitions(dlss5-image-enhancer PRIVATE UNICODE _UNICODE NOMINMAX)
+    # The dlss5-image-enhancer target used to sit here, removed 2026-09-14. It
+    # was a second Qt front end that did its own processing in-process instead of
+    # driving video_filter.exe the way the one below does, so its parameters could
+    # drift from the shipping path with nobody watching -- and it was never in a
+    # release: tools/package_release.py ships dlssnr_gui.exe and video_filter.exe
+    # only. The project's own review had it as a zombie target (BUG_REVIEW_2026-
+    # 09-11.md A21): compiled every time, shipped never.
+    #
+    # gui/main.cpp and gui/main_window.* went with it. gui/half_float.h stays:
+    # tools/video_filter.cpp includes it.
 
     # The batch front end: Qt 6 modern unified GUI (dlssnr_gui). It
     # holds no processing of its own -- it builds the command line and drives
