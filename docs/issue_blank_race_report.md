@@ -150,3 +150,48 @@ the next step is to make those loud and re-measure before looking further down.
 and record, per run, (a) blank or not and (b) whether any module was translated that
 run. If blankness correlates with a fresh translation, the fault is in the
 first-load path; if it does not, it is per-process state somewhere else.
+
+
+## Experiment 2026-09-14 late: twenty clean runs, zero blank, and one straggler per cold run
+
+Setup: the still path from the top of this report (`--image still.png out.png
+nvngx_dlssnr.dll nvcuda.dll nvngx.dll nvapi64.dll --passes 3`, a 640x360 frame taken
+from the regression clip), a fresh process for every run, and blankness measured from
+the output image itself -- mean luma via ffmpeg, not the tool's own blank verdict,
+since that verdict is the thing under audit. Two arms of twenty.
+
+**Arm A, the normal path** (cache warm, precompile stamp present): 20 of 20 runs
+exit 0 with an identical output, mean luma 165/255, no translation attempted
+("every module is already in the cache"), no blank frames, no variance at all. The
+race does not reproduce here, which agrees with the 0 of 24 recorded on 09-14.
+
+**Arm B, the stamp deleted before each run** so that every run re-enters precompile:
+this is where something reproducible appeared, and it is not the race. All three runs
+that got that far stalled on the last one or two modules.
+
+| run | last line written | outcome |
+|---|---|---|
+| B01 | `translated 14 of 15, 1 running` | still there after 180 s, killed by the harness |
+| B02 | `translated 15 of 15, 0 running` | good frame (luma 165) in about four seconds — B01's straggler had produced the missing entry in the meantime |
+| B03 | `translated 13 of 15, 2 running` | stopped |
+
+The outstanding children were **working, not parked**. The watchdog in
+`core/precompile.cpp` fires on zero CPU progress across `kStallSlices` slices, so a
+child that keeps burning CPU while making no visible progress is never caught, and the
+parent waits for it with no overall deadline. That is item 3 of this report with the
+mechanism narrowed: not a parked child, an unbounded one.
+
+**What it does not settle**: whether blankness correlates with a fresh translation.
+No blank output occurred in any of the twenty-one runs that completed, and the cold
+arm cannot test the correlation while it is dominated by the straggler. The
+discriminating experiment needs either a machine where the race reproduces, or the
+cold arm fixed first.
+
+Next, in this order:
+
+1. Give precompile an overall deadline, and name the module that is outstanding in the
+   progress and error output. The current progress line counts finished modules without
+   saying which one is not among them, which is why localising this needed a pass over
+   the run logs.
+2. Then re-run the cold arm. With the straggler bounded, "blank against freshly
+   translated" becomes measurable.
