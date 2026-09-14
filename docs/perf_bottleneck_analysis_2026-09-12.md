@@ -22,9 +22,62 @@ derivation is SSA-exact. The *size* of the win is not, and Route A is the
 measurement that decides it — 9–20 % of instructions by whole-cache static
 scaling is the defensible floor, but the scaffolding is concentrated in the hot
 chained kernels, which sit well above that ratio (see the sizing note below).
-**This lever has since been built and measured: the pairing itself works and is
-worth 12 %, but the inlining it depends on costs 81 % — read the ⚠️ note on
-Step 0 / Route A below before planning around this paragraph.**
+**Superseded 2026-09-14: the pairing is reachable without paying that 81 %. 87 →
+67 ms, output frame-for-frame identical. Read the paragraph below; the ⚠️ note on
+Step 0 / Route A further down is the earlier, superseded measurement.**
+
+**2026-09-14 — reaching the pairing and paying only for it.** Same machine, same
+clip, same command line, same snippet, only the driver DLL swapped:
+
+| driver | 640×360 frame | avg GPU | throughput |
+|---|---|---|---|
+| plain `5ac9102` | **87 ms** | 126.6 ms | 7.37 fps |
+| `5ac9102` + this change | **67–68 ms** | 105.2–105.9 ms | 8.52–8.61 fps |
+
+All 30 output frames came out **byte-identical** (`--dump-frames`, PNG SHA-256).
+That is what pairing two MMAs over one shared A should give: the products and
+their accumulation order are unchanged, only the padding goes away.
+
+What produced it is *not* the helper that was built to produce it (that one never
+fires — see below). It is the pair of attribute decisions around the inliner:
+
+- The mma wrappers no longer carry `[[clang::optnone]]`, so the
+  `[[clang::always_inline]]` on their call sites is honoured and the intrinsics
+  land in the `FUNC(...)` helper bodies and then in the kernel, where
+  `CombineMMAPass` can see and pair them. Its own report, with
+  `ZLUDA_MMA_STATS=1`, on one module: `saw 512 intrinsic(s), combined 256
+  pair(s), lowered alone 0, refused 0` for each `swin_2h_64_2` kernel. In the
+  baseline those intrinsics sit behind a `noinline` wrapper call, so the pass
+  sees nothing to pair.
+- The **fp8** mma helper stays a call — it is marked `noinline` in the source.
+  The earlier attempt stripped `noinline` from the whole bitcode instead, which
+  inlines the fp8 pad/split scaffolding into every call site, and that is the
+  81 %. Holding that one helper out of line is what keeps the win.
+
+Not every kernel pairs: on another module the same pass refuses all of them
+(`saw 528, combined 0, refused 444 (an operand of the second MMA touches
+memory)`) and pays the inlining for nothing. Across the clip the net is still
+−23 %.
+
+**The AST-level pair helper is in the tree and does not fire.** It was built to
+buy pairing with no inlining at all:
+`replace_instructions_with_functions.rs` emits one call to
+`mma_sync_aligned_m16n8k32_row_col_f16_e4m3_e4m3_f16_pair` for two adjacent
+`mma.sync` sharing an A operand, and that helper's body holds the four intrinsics
+as two same-A pairs inside one basic block — verified in the shipped `.bc`. On
+the real network it never triggers: one module lowers **3 608** `mma.sync` to the
+single e4m3 helper and **0** to the pair helper. The gate is narrow on purpose
+and for a correctness reason, not a missed match: fusing two MMAs into one call
+**moves the second one's computation earlier**, so it is legal only if the second
+instruction's operands are already live and nothing between them has memory
+effects. In these kernels the second MMA's `B` is loaded in between — which is
+exactly what the LLVM pass reports (`an operand of the second MMA touches
+memory`) when it refuses the same pair. Widening the gate would change what the
+kernels compute.
+
+So the fusion is reachable only through the inliner: the AMDGPU pass is the only
+place with enough information to reorder operands legally. The lever that makes it
+pay is *which* helpers are allowed to inline, not avoiding inlining altogether.
 
 **Ordered plan (supersedes the "Phased plan" ordering further down).**
 
