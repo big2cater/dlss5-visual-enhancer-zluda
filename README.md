@@ -2,11 +2,13 @@
 
 > 在 AMD GPU（RDNA 3 / RDNA 4）上通过深度优化版 ZLUDA 满血运行 NVIDIA DLSS 5 Neural Rendering (DLSS-NR) 的图片增强与超清视频降噪工具。
 > High-performance DLSS 5 Neural Rendering image enhancement and video denoising pipeline running on AMD GPUs via ZLUDA.
+>
+> 最新发布：**v2026.09.14-v2** —— 含 MMA 配对融合提速（RX 7900 XT @640×360：单帧 87 → 67 ms）与"淡入黑场片头被误判为竞态"的判定修复。
 
 ![Platform](https://img.shields.io/badge/platform-Windows_10%2F11-0078D4)
 ![GPU](https://img.shields.io/badge/GPU-AMD%20Radeon%20(RDNA3%20%2F%20RDNA4)-red)
 ![Acceleration](https://img.shields.io/badge/backend-ZLUDA%20%2B%20HIP%20%2B%20D3D12-orange)
-![Release](https://img.shields.io/badge/release-v2026.09.10--multipass-brightgreen)
+![Release](https://img.shields.io/badge/release-v2026.09.14--v2-brightgreen)
 
 ---
 
@@ -55,7 +57,7 @@
 
 ### 4. 视频管道 D3D12 映射显存零拷贝（Zero-Copy Video Pipeline）
 - **管道流显存直写**：FFmpeg 解码流通过 `D3D12_HEAP_TYPE_UPLOAD` 映射内存直接灌入 GPU VRAM/GTT 显存，彻底消灭 CPU 堆内存分配与数据拷贝；
-- **GPU Compute 着色器硬件解包**：编写专用 HLSL 计算着色器 `kRawComputeSource`，直接在 GPU 向量算力上完成 16-bit RGB48 解包与 IEC 61966-2-1 物理转换（耗时 $< 0.05$ ms），大幅降低 CPU 负载并提升吞吐（实测 720p 稳定态仅 **146 ms/帧**）。
+- **GPU Compute 着色器硬件解包**：编写专用 HLSL 计算着色器 `kRawComputeSource`，直接在 GPU 向量算力上完成 16-bit RGB48 解包与 IEC 61966-2-1 物理转换（耗时 $< 0.05$ ms），大幅降低 CPU 负载并提升吞吐（实测 RX 7900 XT 720p 稳定态 **129~130 ms/帧**；MMA 配对融合前的驱动为 146 ms/帧）。
 
 ### 5. 全链路防驱动崩溃与防 TDR 超时让出机制
 - **轮次间/帧间自适应让出**：在多轮 Pass 间与视频帧间主动引入毫秒级调度让出点（`yield_ms`，支持命令行 `--yield-ms`），给 Windows 桌面窗口管理器（DWM）保留调度心跳，彻底终结大分辨率/多轮次下的 Windows 驱动超时重置（`LiveKernelEvent 0x141`）；
@@ -104,7 +106,7 @@
 - **FFmpeg 支持**：视频处理需要 `ffmpeg.exe` 与 `ffprobe.exe`，请将其所在目录添加至系统环境变量 `PATH`。
 
 ### 2. 使用方法
-1. 从 [Releases 页面](https://github.com/big2cater/dlss5-visual-enhancer-zluda/releases) 下载最新的发布包（例如 `DLSSNRFilter-v2026.09.11-multipass-nodlssnr.zip`）；
+1. 从 [Releases 页面](https://github.com/big2cater/dlss5-visual-enhancer-zluda/releases) 下载最新的发布包（例如 `DLSSNRFilter-v2026.09.14-v2-nodlssnr.zip`）；
 2. 解压整个文件夹（**请解压至全英文路径**，不要单独拷贝某个 DLL）；
 3. **放置专有模型文件**：将合法的 `nvngx_dlssnr.dll`（推荐 Build 310.8.0）放入解压后的根目录（与 `video_filter.exe` / `dlssnr_gui.exe` 同级目录）；
 4. 双击运行 `dlssnr_gui.exe`（Qt 6 统一现代图形界面；视频批处理与单图增强都在这一个窗口里，旧单图界面已退役）；
