@@ -3,12 +3,12 @@
 > 在 AMD GPU（RDNA 3 / RDNA 4）上通过深度优化版 ZLUDA 满血运行 NVIDIA DLSS 5 Neural Rendering (DLSS-NR) 的图片增强与超清视频降噪工具。
 > High-performance DLSS 5 Neural Rendering image enhancement and video denoising pipeline running on AMD GPUs via ZLUDA.
 >
-> 最新发布：**v2026.09.14-v3** —— 含 MMA 配对融合提速（RX 7900 XT @640×360：单帧 87 → 67 ms）、"淡入黑场片头被误判为竞态"的判定修复，以及空白判定在编码 / 单图 / 处理器三处的同类补齐。
+> 最新发布：**v2026.09.14-v4** —— 含 MMA 配对融合提速（RX 7900 XT @640×360：单帧 87 → 67 ms）、"淡入黑场片头被误判为竞态"的判定修复、空白判定在编码 / 单图 / 处理器三处的同类补齐，以及单图明亮门槛的上调（余量 4.8% → 47%）。
 
 ![Platform](https://img.shields.io/badge/platform-Windows_10%2F11-0078D4)
 ![GPU](https://img.shields.io/badge/GPU-AMD%20Radeon%20(RDNA3%20%2F%20RDNA4)-red)
 ![Acceleration](https://img.shields.io/badge/backend-ZLUDA%20%2B%20HIP%20%2B%20D3D12-orange)
-![Release](https://img.shields.io/badge/release-v2026.09.14--v3-brightgreen)
+![Release](https://img.shields.io/badge/release-v2026.09.14--v4-brightgreen)
 
 ---
 
@@ -106,7 +106,7 @@
 - **FFmpeg 支持**：视频处理需要 `ffmpeg.exe` 与 `ffprobe.exe`，请将其所在目录添加至系统环境变量 `PATH`。
 
 ### 2. 使用方法
-1. 从 [Releases 页面](https://github.com/big2cater/dlss5-visual-enhancer-zluda/releases) 下载最新的发布包（例如 `DLSSNRFilter-v2026.09.14-v3-nodlssnr.zip`）；
+1. 从 [Releases 页面](https://github.com/big2cater/dlss5-visual-enhancer-zluda/releases) 下载最新的发布包（例如 `DLSSNRFilter-v2026.09.14-v4-nodlssnr.zip`）；
 2. 解压整个文件夹（**请解压至全英文路径**，不要单独拷贝某个 DLL）；
 3. **放置专有模型文件**：将合法的 `nvngx_dlssnr.dll`（推荐 Build 310.8.0）放入解压后的根目录（与 `video_filter.exe` / `dlssnr_gui.exe` 同级目录）；
 4. 双击运行 `dlssnr_gui.exe`（Qt 6 统一现代图形界面；视频批处理与单图增强都在这一个窗口里，旧单图界面已退役）；

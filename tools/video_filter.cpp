@@ -1853,10 +1853,16 @@ uint16_t image_peak(const enhancer::Image &);  // defined below the mode
 // The still path gets a higher bar than the video gate: a still is judged on one
 // frame, with no run of frames to tell a dark scene from a failed launch, so it
 // only judges images bright enough that a black output cannot be right (linear
-// 0.25, sRGB ~138/255). Dim stills are left alone; the trade is that a race
+// 0.35, sRGB ~159/255). Dim stills are left alone; the trade is that a race
 // hitting one goes unreported rather than being guessed at. Defined here rather
-// than beside the video gate's constants because run_image_mode below uses it.
-constexpr uint16_t kStillBlankInput = 0x3400; // linear 0.25 in FP16
+// than beside the video gate's constants because run_image_mode below uses it,
+// and mirrored in core/image_processor.cpp (looks_like_blank_result).
+//
+// 0.35 rather than 0.25 because the first version of this left almost no room: on
+// the frame that exposed the whole problem -- the trailer's first dark frame, peak
+// 0.239 -- a bar of 0.25 sat only 4.8 % above it. That is not a margin, it is a
+// coincidence. At 0.35 the same frame has 47 % of headroom.
+constexpr uint16_t kStillBlankInput = 0x359A; // linear 0.35 in FP16
 
 bool load_image(IWICImagingFactory *wic, const std::wstring &path, enhancer::Image &image) {
     IWICBitmapDecoder *decoder = nullptr;

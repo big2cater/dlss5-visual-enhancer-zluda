@@ -149,19 +149,21 @@ void release(IUnknown *&object) {
 // underlying HIP/ZLUDA launch was a no-op. Treat that as failure only when the
 // input is bright enough that no correct output could be this dark.
 //
-// The bar is deliberately high (linear 0.25, sRGB ~138/255) rather than the
+// The bar is deliberately high (linear 0.35, sRGB ~159/255) rather than the
 // bare "carries signal" level of sRGB 27/255. This check has no temporal context
 // -- it sees one image -- so it cannot use the consecutive-frame rule the video
 // path applies. Judging at 27/255 meant a dim but perfectly good photograph
 // whose output came back darker than 15/255 was reported as a failed launch and
-// retried; a still has no way to tell that apart from a real no-op. At 0.25 the
+// retried; a still has no way to tell that apart from a real no-op. At 0.35 the
 // only stills judged are ones bright enough that black output cannot be right,
 // and a race that hits a genuinely dim image goes unreported instead of being
-// guessed at -- which is the honest side of that trade.
+// guessed at -- which is the honest side of that trade. Kept equal to
+// kStillBlankInput in tools/video_filter.cpp, which is where the number is
+// explained.
 bool looks_like_blank_result(const Image &in, const Image &out) {
     if (in.empty() || out.empty()) return false;
-    // Bright input threshold: linear 0.25 -> 0x3400 in FP16.
-    constexpr uint16_t signal = 0x3400;
+    // Bright input threshold: linear 0.35 -> 0x359A in FP16.
+    constexpr uint16_t signal = 0x359A;
     // Blank output threshold: 0.005 in linear FP16 is 0x191e.
     constexpr uint16_t blank = 0x191e;
     bool input_has_signal = false;
