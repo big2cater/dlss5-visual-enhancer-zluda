@@ -9,4 +9,5 @@
 speed-test-staging*
 DLSSNRFilter-*/
 /build_gpu_check/
-/bin
+/bin# Written next to the script by fix_tdr.ps1; belongs to the machine, not the repo
+tdr_backup_before_fix.txt
