@@ -106,3 +106,47 @@ comes up.
 - Any hint on the blank race: the deterministic near-zero output with identical NGX logs suggests a launch that returns success without executing — is there a `hipGetLastError`-style check that could be surfaced per kernel? Happy to run diagnostic builds.
 - Why does the cache not persist? Disk path/keying/env (`ZLUDA_CACHE_*`?) — would love the expected layout so we can verify writes.
 - For the hang: is the driver/HIP initialization serialization between concurrent processes known? We'd be glad to collect whatever trace you need (we can run with extra logging on this card).
+
+## Audit 2026-09-14 (late): the three items, against the tree as it stands
+
+**The gate and retry work is in the tree.** The follow-ups above are not a wish
+list: the video gate requires an input far brighter than the blank bar and three
+consecutive frames, the still gate uses a higher bar and logs its measured peak,
+the output-only check is narrowed to all-channels-zero, and the checks run on every
+frame rather than the first two seconds.
+
+**The cache does persist here, and the key has one fragile field.** Measured on the
+development machine, `%LOCALAPPDATA%\ZLUDA\ComputeCache\zluda2.db` holds 98 rows,
+six `zluda_version` variants that match the six driver builds used that day, and a
+constant `backend_key` (`{"is_debug":false,"clock_rate":2025000,"cumode":false,
+"codegen_parts":1}`) — so `hash` and `device` do not drift, and "every process
+re-translates" is not reproducible here. The fragile part is `clock_rate`: it is
+read from HIP's device properties, and it *does* belong in the key because it
+reaches code generation (`nanosleep`'s nanosecond-to-cycle conversion,
+`zluda_ptx_impl.cpp`, `ATTR(CLOCK_RATE) / 1000000`). But it also means that anything
+which changes the number the driver reports — a different driver version, an
+overclock profile, a different card — silently invalidates every entry at once,
+which is worth knowing before attributing a translation burst to something else.
+
+**The hung child has a watchdog.** `core/precompile.cpp` waits in 60 s slices and
+kills a child that makes no CPU progress for `kStallSlices` = 6 slices, doubled when
+the machine is short of memory (a paged-out process looks like a stuck one);
+`room_for_another()` gates starts on free physical memory; `DLSSNR_PRECOMPILE_JOBS`
+forces a fixed parallelism. The four-way cap this report calls a local workaround was
+deliberately *removed* later — with `zluda_cache` in WAL mode and a long
+`busy_timeout`, concurrent cache writes take care of themselves — so "cap 4 was not
+merged" is not the current state.
+
+**Root cause of the blank output: still open, and the evidence points one way.** The
+measurements say the kernels were never dispatched rather than that they computed
+wrong values: a deterministic ~2/255 output, ~300 ms per pass against ~830 ms for a
+good run, sticky for the life of the process, and NGX logs identical to a good run.
+On this code base the loudest silent-failure suppression sits in the enhancer's own
+CUDA layer rather than in ZLUDA — a `flush_and_wait` whose false return is dropped,
+and `static` "reported" flags that stop a warning from ever being printed twice — so
+the next step is to make those loud and re-measure before looking further down.
+
+**An experiment that would discriminate cheaply**: run the still-image repro N times
+and record, per run, (a) blank or not and (b) whether any module was translated that
+run. If blankness correlates with a fresh translation, the fault is in the
+first-load path; if it does not, it is per-process state somewhere else.
