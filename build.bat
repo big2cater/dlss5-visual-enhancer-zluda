@@ -70,4 +70,21 @@ robocopy build dist /MIR /NFL /NDL /NJH /NJS ^
 REM robocopy's own exit codes are a bitmask where 0-7 all mean success (0 =
 REM nothing needed copying); only 8 and above is a real failure.
 if errorlevel 8 exit /b 1
+
+REM The three build products also live in run\, which is scratch space for test
+REM inputs and hand-staged DLLs and is not managed by anything. A stale copy of
+REM video_filter.exe there is easy to run by accident and easy to mistake for a
+REM fresh build -- it happened: a fix was built, verified and packaged while
+REM run\ still held the previous day's exe. Refresh only the products this build
+REM owns; nvcuda.dll, nvapi64.dll and nvngx_dlssnr.dll in that folder are staged
+REM by hand and must not be touched. /Y because a plain copy prompts, and in a
+REM non-interactive shell that prompt is answered by defaulting to "no".
+if exist run\ (
+    copy /Y build\video_filter.exe run\video_filter.exe >nul
+    if errorlevel 1 exit /b 1
+    copy /Y build\dlssnr_gui.exe run\dlssnr_gui.exe >nul
+    if errorlevel 1 exit /b 1
+    copy /Y build\nvngx.dll run\nvngx.dll >nul
+    if errorlevel 1 exit /b 1
+)
 exit /b 0

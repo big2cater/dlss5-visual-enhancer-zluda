@@ -75,6 +75,14 @@ Unchanged by this: the race the gate exists for is rarer than this report measur
 — 0 of 24 fresh processes on 2026-09-14 against 2/5 to 4/6 on 2026-09-10 — but it
 has not been shown to be gone.
 
+Deliberately not changed here: the **still-image** path gates on
+`output_is_blank(out) && image_has_signal(in)` — the same pair of tests whose
+collision at a fade-in boundary this fix addressed for video — so a dark still can
+be retried as a false blank. The symptom is milder (a still cannot deadlock an
+entire film; it burns a few retries and reports blank), and fixing it means giving
+that path its own brightness measure instead of reusing the video gate's
+frame-level one.
+
 ## Requests
 
 - Any hint on the blank race: the deterministic near-zero output with identical NGX logs suggests a launch that returns success without executing — is there a `hipGetLastError`-style check that could be surfaced per kernel? Happy to run diagnostic builds.
