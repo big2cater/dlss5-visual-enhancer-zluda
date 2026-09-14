@@ -52,6 +52,29 @@ Observations:
 - **Watchdog**: translation children with zero CPU progress for 3 minutes are killed and counted failed.
 - **Concurrency cap**: default translation parallelism capped at 4 (was adaptive up to 16); `DLSSNR_PRECOMPILE_JOBS=1` forces serial.
 
+## Follow-up 2026-09-14: the local gate was over-eager
+
+The first-frame gate described above condemned a whole class of footage. It asked
+"output blank" and "input carries signal", and a fade-in from black satisfies both
+on the frame that first crosses sRGB 27/255 — that frame is itself nearly black,
+with a black network history behind it, so a correct output sits under the blank
+bar too. Every retry re-reached that same frame, so the result was a deterministic
+deadlock rather than the intermittent fault the gate was built for: a trailer with
+a 0.23 s black opening failed at frame 7 in five consecutive fresh processes, then
+an orchestrator shard restart, then a user-facing abort.
+
+The gate now requires the input to be far brighter than the blank bar (sRGB
+~93/255, about 22x the 0.005 linear bar) and the condition to persist for three
+consecutive frames. Verified on that file (it now completes, warning once at a
+genuinely dark frame — input 24672/65535 — that did not persist), on the ordinary
+regression clip (unchanged: 106.4 ms/frame, `blanks=0`, exit 0), and on the abort
+path itself with a temporarily forced blank verdict (warns on two consecutive
+frames, aborts on the third, exit code 2).
+
+Unchanged by this: the race the gate exists for is rarer than this report measured
+— 0 of 24 fresh processes on 2026-09-14 against 2/5 to 4/6 on 2026-09-10 — but it
+has not been shown to be gone.
+
 ## Requests
 
 - Any hint on the blank race: the deterministic near-zero output with identical NGX logs suggests a launch that returns success without executing — is there a `hipGetLastError`-style check that could be surfaced per kernel? Happy to run diagnostic builds.

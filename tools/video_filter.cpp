@@ -306,6 +306,14 @@ struct InputFrame {
     // black output for a black input is the network doing its job -- the
     // blank verdict only means failure when the input carries signal.
     bool input_has_signal = false;
+    // The same sample's actual peak, in the sRGB-encoded 16-bit space the decoder
+    // reads. input_has_signal answers "could a black output be legitimate here",
+    // and at a fade-in boundary that answer is yes for frames whose own content is
+    // still almost black -- so it cannot be the only thing standing between a
+    // dark scene and a false race verdict. This is what lets the gate ask the
+    // stricter question: is the input bright enough that no correct output could
+    // be this dark?
+    unsigned input_max16 = 0;
     ID3D12Resource *upload_buf = nullptr;
     void *mapped_ptr = nullptr;
 
@@ -2028,6 +2036,29 @@ int run_image_mode(int argc, char **argv) {
 // the program"); empirically a re-evaluation flips the result to a good one.
 // --------------------------------------------------------------------------
 
+// What it takes for a black output to count as a failed launch rather than dark
+// footage.
+//
+// input_has_signal (sRGB ~27/255) answers "could a black output be legitimate
+// here", and near a fade-in the answer is yes for frames that are themselves
+// still almost black -- which made a whole class of films unprocessable: the
+// gate fired on the first frame above the bar, the run aborted, and because
+// every retry reaches that same frame it was a deterministic deadlock, not the
+// intermittent race it was meant to catch (a trailer whose opening is black for
+// 0.23 s was enough). These two conditions replace it:
+//
+//   - the input must be far brighter than the blank bar (sRGB ~93/255 here,
+//     about 22x the 0.005 linear blank bar) so that no correct output could be
+//     that dark, and
+//   - the condition must hold for several consecutive frames. A launch race
+//     blacks out every frame; a fade-in, a dark scene or a history reset clears
+//     within a frame or two.
+//
+// Both values are printed when the gate fires, so the next report carries the
+// measurements instead of just a verdict.
+constexpr unsigned kBlankGateInput16 = 24000; // sRGB ~93/255, ~22x the blank bar
+constexpr int kBlankGateStreak = 3;
+
 // True when the frame looks blank: luma mean near zero and almost no variance.
 // Samples every 8th pixel, so a 4K frame costs a few thousand half->float
 // conversions only.
@@ -2708,6 +2739,9 @@ static int run_main_once(int argc, char **argv) {
     std::atomic<bool> abort_pipeline{false};
     std::atomic<int> reset_count{0};
     std::atomic<int> blank_count{0};
+    // Consecutive frames whose input is bright while the output is blank; only a
+    // run of them is a failed launch (see kBlankGateStreak).
+    std::atomic<int> blank_streak{0};
     std::atomic<double> elapsed_total{0.0};
     std::atomic<unsigned> frames_written_count{0};
     std::atomic<bool> failed{false};
@@ -2766,6 +2800,7 @@ static int run_main_once(int argc, char **argv) {
                 max16 = std::max({max16, r, g, b});
             }
             frame->input_has_signal = max16 > 7000; // sRGB ~27/255: below this a correct output is itself under the blank bar, and the two are indistinguishable
+            frame->input_max16 = max16;
 
             // Reset determination
             bool reset = false;
@@ -2972,23 +3007,40 @@ static int run_main_once(int argc, char **argv) {
         elapsed_total.store(elapsed_total.load() + ms);
 
         // Guard against the ZLUDA sticky race (a launch that silently no-ops
-        // and leaves the frame black) -- but only when the INPUT actually
-        // carries signal: cinematic videos open on a fade-in from black, and
-        // a black output for a black input is the network doing its job.
-        // Checked over the first ~2 seconds of frames; a launch race blanks
-        // every frame, dark content does not.
+        // and leaves the frame black) -- but a black output only counts as
+        // failure when the input is bright enough that no correct output could
+        // be this dark AND the condition persists (kBlankGateInput16,
+        // kBlankGateStreak; see their definition for why the earlier version of
+        // this check condemned fade-in openings). Checked over the first ~2
+        // seconds of frames, relative to this shard.
         if (in_frame->index < 64 && output_is_blank(out_frame->out)) {
-            if (in_frame->input_has_signal) {
-                fprintf(stderr, "[FAIL] frame %u: 输出空白而输入有内容（ZLUDA 竞态），交由外层重跑\n",
-                        in_frame->index);
-                failed = true;
-                retryable = true;
-                abort_pipeline.store(true);
-                break;
+            if (in_frame->input_max16 > kBlankGateInput16) {
+                const int streak = blank_streak.load() + 1;
+                blank_streak.store(streak);
+                if (streak >= kBlankGateStreak) {
+                    fprintf(stderr,
+                            "[FAIL] frame %u: 输出空白而输入明亮（输入峰值 %u/65535，输出低于空白阈值）"
+                            "——ZLUDA 竞态，交由外层重跑\n",
+                            in_frame->index, in_frame->input_max16);
+                    failed = true;
+                    retryable = true;
+                    abort_pipeline.store(true);
+                    break;
+                }
+                fprintf(stderr,
+                        "[warn] frame %u: 输入明亮（%u/65535）但输出空白，连续第 %d 帧；"
+                        "再观察 %d 帧，仍空白才判为竞态\n",
+                        in_frame->index, in_frame->input_max16, streak,
+                        kBlankGateStreak - streak);
+            } else {
+                blank_streak.store(0);
+                if (in_frame->index == 0) {
+                    fprintf(stderr, "[info] 首帧为黑场（输入峰值 %u/65535），跳过空白判定\n",
+                            in_frame->input_max16);
+                }
             }
-            if (in_frame->index == 0) {
-                fprintf(stderr, "[info] 首帧为黑场（输入无信号），跳过空白判定\n");
-            }
+        } else {
+            blank_streak.store(0);
         }
 
         out_frame->index = in_frame->index;
