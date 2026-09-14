@@ -336,6 +336,9 @@ struct OutputFrame {
     bool is_eos = false;
     bool blank = false;
     bool input_has_signal = false;
+    // Carried through so the encoder-stage gate can apply the same brightness
+    // rule as the processing-stage one instead of the bare signal test.
+    unsigned input_max16 = 0;
 };
 
 struct ChildProcess {
@@ -1846,6 +1849,14 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
 };
 bool output_is_blank(const enhancer::Image &); // defined below the mode
 bool image_has_signal(const enhancer::Image &); // defined below the mode
+uint16_t image_peak(const enhancer::Image &);  // defined below the mode
+// The still path gets a higher bar than the video gate: a still is judged on one
+// frame, with no run of frames to tell a dark scene from a failed launch, so it
+// only judges images bright enough that a black output cannot be right (linear
+// 0.25, sRGB ~138/255). Dim stills are left alone; the trade is that a race
+// hitting one goes unreported rather than being guessed at. Defined here rather
+// than beside the video gate's constants because run_image_mode below uses it.
+constexpr uint16_t kStillBlankInput = 0x3400; // linear 0.25 in FP16
 
 bool load_image(IWICImagingFactory *wic, const std::wstring &path, enhancer::Image &image) {
     IWICBitmapDecoder *decoder = nullptr;
@@ -2011,9 +2022,14 @@ int run_image_mode(int argc, char **argv) {
         }
         return 1;
     }
-    const bool blank = output_is_blank(out) && image_has_signal(in);
+    const unsigned in_peak = image_peak(in);
+    const bool blank = output_is_blank(out) && in_peak > kStillBlankInput;
+    // Printed either way: the whole reason the fade-in deadlock took this long to
+    // find was that a blank verdict arrived with no measurement attached to it.
+    fprintf(stderr, "[info] 单帧空白判定：输入峰值 %u/65535（门槛 %u），输出%s\n",
+            in_peak, (unsigned)kStillBlankInput, blank ? "低于空白阈值 ⇒ 判为竞态" : "未判定为空白");
     if (blank)
-        fprintf(stderr, "[warn] 输出空白：本轮求值竞态，交给外层重跑\n");
+        fprintf(stderr, "[warn] 单帧输出空白（输入峰值 %u/65535）：本轮求值竞态，交给外层重跑\n", in_peak);
     else if (comp_opts.is_active()) {
         apply_post_composite(in, out, comp_opts);
     }
@@ -2093,21 +2109,29 @@ bool output_is_blank(const enhancer::Image &image) {
     return (max_channel < 0.005f) || (mean < 0.002 && variance < 0.0001);
 }
 
-// True when the input picture carries visible content (any sampled RGB
-// above sRGB ~27/255, linear ~0.008, binary16 0x2000). Dark frames -- fade-in openings,
-// night scenes -- legitimately produce a near-black output, so the blank verdict
-// on the output must be gated by this.
-bool image_has_signal(const enhancer::Image &image) {
-    if (image.empty()) return false;
+// The peak value in a linear half-float image, as raw FP16 bits (positive values
+// order the same as their magnitudes, so a bit comparison is a value comparison).
+uint16_t image_peak(const enhancer::Image &image) {
+    if (image.empty()) return 0;
     const uint16_t *src = image.pixels.data();
     const size_t count = (size_t)image.width * image.height;
+    uint16_t peak = 0;
     for (size_t i = 0; i < count; i += 8) {
-        if ((src[i * 4 + 0] & 0x7fff) > 0x2000 ||
-            (src[i * 4 + 1] & 0x7fff) > 0x2000 ||
-            (src[i * 4 + 2] & 0x7fff) > 0x2000)
-            return true;
+        const uint16_t r = src[i * 4 + 0] & 0x7fff;
+        const uint16_t g = src[i * 4 + 1] & 0x7fff;
+        const uint16_t b = src[i * 4 + 2] & 0x7fff;
+        if (r > peak) peak = r;
+        if (g > peak) peak = g;
+        if (b > peak) peak = b;
     }
-    return false;
+    return peak;
+}
+
+// True when the input picture carries visible content (any sampled RGB
+// above sRGB ~27/255, linear ~0.008, binary16 0x2000). Kept for the places that
+// want the bare question; the blank verdicts below use the brighter bar.
+bool image_has_signal(const enhancer::Image &image) {
+    return image_peak(image) > 0x2000;
 }
 
 static int run_parallel_orchestrator(int argc, char **argv, const Options &options,
@@ -2837,6 +2861,7 @@ static int run_main_once(int argc, char **argv) {
     std::thread encode_thread([&]() {
         IWICImagingFactory *wic = nullptr;
         bool dump_ok = false;
+        int blank_streak_here = 0;
         if (!options.dump_dir.empty()) {
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             dump_ok = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
@@ -2856,14 +2881,32 @@ static int run_main_once(int argc, char **argv) {
 
             bool blank = false;
             half_rgba_to_rgb48(frame->out, frame->model_output.data(), blank);
-            if (blank && frame->input_has_signal) {
-                blank_count.fetch_add(1);
-                fprintf(stderr, "[warn] frame %u output looks blank despite input carrying signal\n", frame->index);
-                failed = true;
-                retryable = true;
-                abort_pipeline.store(true);
-                free_output_pool.push(frame);
-                break;
+            // The same rule the processing stage applies, for the same reason: "the
+            // input carried signal" is true from the first frame of a fade-in, so
+            // on its own it reports a dark frame as a failed launch. This stage
+            // used to be the last place that still judged that way -- it was missed
+            // when the other gate was fixed, and it could fire on exactly the frame
+            // the other one had learned to leave alone.
+            if (blank && frame->input_max16 > kBlankGateInput16) {
+                if (++blank_streak_here >= kBlankGateStreak) {
+                    blank_count.fetch_add(1);
+                    fprintf(stderr,
+                            "[FAIL] frame %u: 输出空白而输入明亮（输入峰值 %u/65535，编码阶段）"
+                            "——ZLUDA 竞态，交由外层重跑\n",
+                            frame->index, frame->input_max16);
+                    failed = true;
+                    retryable = true;
+                    abort_pipeline.store(true);
+                    free_output_pool.push(frame);
+                    break;
+                }
+                fprintf(stderr,
+                        "[warn] frame %u: 输入明亮（%u/65535）但输出空白，连续第 %d 帧（编码阶段）；"
+                        "再观察 %d 帧\n",
+                        frame->index, frame->input_max16, blank_streak_here,
+                        kBlankGateStreak - blank_streak_here);
+            } else {
+                blank_streak_here = 0;
             }
 
             DWORD written = 0;
@@ -3011,9 +3054,14 @@ static int run_main_once(int argc, char **argv) {
         // failure when the input is bright enough that no correct output could
         // be this dark AND the condition persists (kBlankGateInput16,
         // kBlankGateStreak; see their definition for why the earlier version of
-        // this check condemned fade-in openings). Checked over the first ~2
-        // seconds of frames, relative to this shard.
-        if (in_frame->index < 64 && output_is_blank(out_frame->out)) {
+        // this check condemned fade-in openings).
+        //
+        // Every frame now, not just the first ~2 seconds. The window existed
+        // because the old rule was dangerous and a race blanks every frame, so
+        // the opening was enough to see it; with this rule the check is safe
+        // anywhere, and a race that starts late -- after a long dark opening, or
+        // on a shard whose opening is dark -- is caught like any other.
+        if (output_is_blank(out_frame->out)) {
             if (in_frame->input_max16 > kBlankGateInput16) {
                 const int streak = blank_streak.load() + 1;
                 blank_streak.store(streak);
@@ -3051,6 +3099,7 @@ static int run_main_once(int argc, char **argv) {
         out_frame->ms = ms;
         out_frame->is_eos = false;
         out_frame->input_has_signal = in_frame->input_has_signal;
+        out_frame->input_max16 = in_frame->input_max16;
 
         if (options.comp_opts.is_active()) {
             apply_post_composite(in_frame->in, out_frame->out, options.comp_opts);

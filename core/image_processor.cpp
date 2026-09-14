@@ -147,11 +147,21 @@ void release(IUnknown *&object) {
 
 // A successful DLSS call can occasionally return a near-zero texture when the
 // underlying HIP/ZLUDA launch was a no-op. Treat that as failure only when the
-// input carries visible signal (a black frame should stay black).
+// input is bright enough that no correct output could be this dark.
+//
+// The bar is deliberately high (linear 0.25, sRGB ~138/255) rather than the
+// bare "carries signal" level of sRGB 27/255. This check has no temporal context
+// -- it sees one image -- so it cannot use the consecutive-frame rule the video
+// path applies. Judging at 27/255 meant a dim but perfectly good photograph
+// whose output came back darker than 15/255 was reported as a failed launch and
+// retried; a still has no way to tell that apart from a real no-op. At 0.25 the
+// only stills judged are ones bright enough that black output cannot be right,
+// and a race that hits a genuinely dim image goes unreported instead of being
+// guessed at -- which is the honest side of that trade.
 bool looks_like_blank_result(const Image &in, const Image &out) {
     if (in.empty() || out.empty()) return false;
-    // Input signal threshold: sRGB ~27/255 -> linear ~0.0082 -> ~0x2000 in FP16.
-    constexpr uint16_t signal = 0x2000;
+    // Bright input threshold: linear 0.25 -> 0x3400 in FP16.
+    constexpr uint16_t signal = 0x3400;
     // Blank output threshold: 0.005 in linear FP16 is 0x191e.
     constexpr uint16_t blank = 0x191e;
     bool input_has_signal = false;
@@ -178,15 +188,20 @@ bool looks_like_blank_result(const Image &in, const Image &out) {
     return output_max <= blank;
 }
 
+// The video path's own gate (tools/video_filter.cpp) judges near-zero output, and
+// it can: it sees the frame's decoded input brightness and a run of consecutive
+// frames. This function sees neither, so it must not pretend to. It reports only
+// the one signature that cannot be anything but a failed launch -- every channel
+// of every pixel exactly zero -- and leaves the near-zero-but-not-zero case to
+// the gate that has the context.
 bool looks_like_blank_output(const Image &out) {
     if (out.empty()) return false;
-    constexpr uint16_t blank = 0x191e;  // approximately 0.005 in binary16
     const size_t out_pixels = out.pixels.size() / 4;
     for (size_t p = 0; p < out_pixels; ++p) {
-        const uint16_t r = out.pixels[p * 4 + 0] & 0x7fff;
-        const uint16_t g = out.pixels[p * 4 + 1] & 0x7fff;
-        const uint16_t b = out.pixels[p * 4 + 2] & 0x7fff;
-        if (r > blank || g > blank || b > blank) return false;
+        if ((out.pixels[p * 4 + 0] & 0x7fff) != 0 ||
+            (out.pixels[p * 4 + 1] & 0x7fff) != 0 ||
+            (out.pixels[p * 4 + 2] & 0x7fff) != 0)
+            return false;
     }
     return true;
 }
