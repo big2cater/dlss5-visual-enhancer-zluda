@@ -60,6 +60,25 @@ file that ships, not merely for a build of the same commit. The package
 recorded here so that a later claim about "the shipped driver" can be checked
 instead of inferred.
 
+**The same check at 1080p, later the same evening.** The win does not scale with
+the frame: 265 → 241/242 ms (median of the last 20 frames, two rounds with the
+order alternated) against 87 → 67 ms at 640×360. What is stable is the
+**absolute** saving — 20–24 ms per frame in both cases — which is what you would
+expect if it comes off a fixed per-kernel cost rather than off the pixel work.
+This is worth stating plainly because the percentage is the number people quote
+and it is resolution-specific: the release note carries both, and so does this
+record.
+
+Two limits on how far this generalises, both measured rather than assumed:
+
+- **Resolution**: 1080p confirmed independently, as above.
+- **Other networks**: *not* verified, and not verifiable here. The change is
+  global — every kernel gets inlineable wrappers — and the record already notes
+  that kernels which do not pair "pay the inlining for nothing". This machine
+  has exactly one snippet (`nvngx_dlssnr` 310.8.0, CG2R); no second model version
+  exists on disk, so a workload whose kernels refuse to pair remains an untested
+  risk of this release rather than a checked non-issue.
+
 What produced it is *not* the helper that was built to produce it (that one never
 fires — see below). It is the pair of attribute decisions around the inliner:
 
@@ -190,6 +209,13 @@ symptoms.
   A and keeps the widening out of line — has a measured ceiling of about
   **76 ms**, below the 78.4 ms this section started from. Route B is its natural
   home.
+
+  *(2026-09-14: that 76 ms projection is not where the win came from. The
+  shipped change reaches **67 ms**, beating the projection, and it gets there
+  through the two attribute decisions above rather than through this helper —
+  the AST pair helper is in the tree and does not fire at all (0 of 3 608
+  `mma.sync`). Read the superseded note in Current conclusions before quoting
+  this ceiling.)*
 
   Instrumentation this measurement needed, worth keeping: `CombineMMAPass`
   reports how many MMAs it combined and why the rest were not, when
@@ -889,6 +915,18 @@ unchanged and still accurate.)*
    pre-existing value-naming difference unrelated to the change), verifying
    that F32 accumulation produces identical output to NVIDIA references
    across subnormals, NaNs (`0x7F`), and saturated values (`0x7E`).
+   *(2026-09-14: the debug suite ran red at 399 passed / 189 failed, and the
+   cause was neither the mode nor value naming — the committed `.ll` fixtures
+   carry CRLF while the printed IR uses LF. Dumping the actual IR via
+   `TEST_PTX_LLVM_FAIL_DIR` and diffing it against the fixture gives **zero**
+   differing lines and only that CR difference. `compare_llvm` now normalises
+   line endings as `compare_ptx` already did, and the suite is **588 passed /
+   0 failed** (`db31366`, "normalise CRLF in compare_llvm"). Note what that does
+   and does not establish: the IR comparisons being green says the translation
+   is unchanged — the `_cuda` half, the one that would compare against NVIDIA's
+   own output, **skips on this machine** ("NVIDIA CUDA driver not usable …
+   skipping the `_cuda` half"; `ZLUDA_REQUIRE_CUDA=1` turns that into a
+   failure), so absolute numerical agreement still needs an NVIDIA host.)*
 4. **RDNA4 branch**: *(corrected 2026-09-13 against the fork's own source.)* The gate in `zluda_ptx_impl.cpp:1424` is `__oclc_ISA_version >= 11000 && __oclc_ISA_version < 13000`, which **already swallows gfx12** — so this is not "add a `>= 12000` branch ahead of it", it is "carve gfx12 out of it". More importantly, the blocker is not a branch: the comment at `zluda_ptx_impl.cpp:1312-1325` records that there is **deliberately no native fp8 path yet**, because (a) the PTX→AMD fragment mapping differs (PTX `m16n8k32` carries sixteen A bytes per lane over eight columns, the AMD instruction eight bytes over sixteen), so **pairs of PTX operations must be fused**, and (b) **`CombineMMAPass` has no case for a native fp8 instruction** — it recognises only `zluda_mma_m16n8k16_f32_f16_f16_f32`, its bf16 twin and `zluda_mma_m16n8k32_s32_s8_s8_s32` (`CombineMMA.cpp:66-91`). Read that narrowly: today's fp8 MMAs already lower through `fp8_mma_half` into the **f16** intrinsic, so they *are* pairable by Route A as things stand. What has no case is routing fp8 to gfx12's native fp8 WMMA. An unverified mapping "would compile and silently produce wrong pixels", which is why it was left out rather than guessed. Prerequisite ordering therefore is: fp8 pairing case in the pass + a hardware-verified fragment mapping, *then* the gfx12 gate. A gfx12 machine is the only instrument that can verify the mapping — which is the second reason the RDNA4 retest comes first.
 
 ### What was changed (2026-09-13)
