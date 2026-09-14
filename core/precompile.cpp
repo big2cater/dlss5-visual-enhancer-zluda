@@ -365,8 +365,32 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
     std::vector<HANDLE> running;
     std::vector<ULONGLONG> cpu;     // last observed CPU time per child
     std::vector<int> stalled;       // consecutive 60s slices without CPU progress
+    std::vector<size_t> slots;      // which module each running child is translating
     size_t next = 0;
     int failures = 0;
+
+    // Two guards, because they catch different children.
+    //
+    // `stalled` above catches a child that is parked: no CPU progress at all. It
+    // cannot catch one that keeps burning CPU while making no visible progress, and
+    // that is not hypothetical -- with the precompile stamp removed, a run finished
+    // fourteen modules in seconds and was still waiting on the fifteenth after three
+    // minutes, and the parent would have waited indefinitely, GUI included.
+    //
+    // So there is also a deadline on "nothing has finished at all". It has to be
+    // generous: a slow machine finishes modules one at a time and never reaches it,
+    // while a stuck tail does. Overridable for a machine that needs longer.
+    // Kept separate from `error` because the tail of this function overwrites
+    // `error` with a count, and a count is exactly what is not useful here.
+    std::string straggler_detail;
+    int no_progress_minutes = 10;
+    {
+        char forced[16] = {};
+        if (GetEnvironmentVariableA("DLSSNR_PRECOMPILE_NO_PROGRESS_MINUTES", forced, sizeof forced) > 0 &&
+            atoi(forced) > 0)
+            no_progress_minutes = atoi(forced);
+    }
+    ULONGLONG last_completion = GetTickCount64();
 
     while (next < files.size() || !running.empty()) {
         while (next < files.size() && running.size() < ceiling &&
@@ -382,6 +406,7 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
                 running.push_back(process.hProcess);
                 cpu.push_back(0);
                 stalled.push_back(0);
+                slots.push_back(next);
             } else {
                 ++failures;
                 ++progress.done;
@@ -401,6 +426,9 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
             for (HANDLE h : running) terminate_and_reap(h);
             failures += (unsigned)running.size() + (unsigned)(files.size() - next);
             running.clear();
+            cpu.clear();
+            stalled.clear();
+            slots.clear();
             break;
         }
         if (which == WAIT_TIMEOUT) {
@@ -416,6 +444,7 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
                     running.erase(running.begin() + j);
                     cpu.erase(cpu.begin() + j);
                     stalled.erase(stalled.begin() + j);
+                    slots.erase(slots.begin() + j);
                     --j;
                     continue;
                 }
@@ -435,6 +464,7 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
                             running.erase(running.begin() + j);
                             cpu.erase(cpu.begin() + j);
                             stalled.erase(stalled.begin() + j);
+                            slots.erase(slots.begin() + j);
                             --j; // vector shrank under us
                         }
                     } else {
@@ -442,6 +472,34 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
                         stalled[j] = 0;
                     }
                 }
+            }
+            // Nothing has finished for the whole budget while children are still
+            // running: the tail is not making visible progress. Name what is
+            // outstanding before killing it -- the progress line counts finished
+            // modules and never says which one is missing, which is what turned
+            // localising the straggler into a log archaeology pass.
+            if (!running.empty() &&
+                GetTickCount64() - last_completion > (ULONGLONG)no_progress_minutes * 60000ull) {
+                std::string names;
+                for (size_t j = 0; j < slots.size() && j < running.size(); ++j) {
+                    if (slots[j] >= files.size()) continue;
+                    std::wstring leaf = files[slots[j]];
+                    const size_t slash = leaf.find_last_of(L"\\/");
+                    if (slash != std::wstring::npos) leaf = leaf.substr(slash + 1);
+                    if (!names.empty()) names += ", ";
+                    names += to_utf8(leaf);
+                }
+                straggler_detail = "no module finished for " + std::to_string(no_progress_minutes) +
+                                   " minutes; killed " + std::to_string(running.size()) +
+                                   " child(ren) still working on " + names;
+                error = straggler_detail;
+                for (HANDLE h : running) terminate_and_reap(h);
+                failures += (unsigned)running.size() + (unsigned)(files.size() - next);
+                running.clear();
+                cpu.clear();
+                stalled.clear();
+                slots.clear();
+                break;
             }
             continue; // keep waiting on the survivors
         }
@@ -454,6 +512,8 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
         running.erase(running.begin() + index);
         cpu.erase(cpu.begin() + index);
         stalled.erase(stalled.begin() + index);
+        if (index < slots.size()) slots.erase(slots.begin() + index);
+        last_completion = GetTickCount64();
 
         ++progress.done;
         {
@@ -481,6 +541,9 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
     if (failures) {
         error = std::to_string(failures) + " of " + std::to_string(progress.total) +
                 " modules could not be translated";
+        // The count alone leaves the reader with no idea which module to look at,
+        // and finding out meant going through the run logs by hand.
+        if (!straggler_detail.empty()) error += "; " + straggler_detail;
         return false;
     }
     write_precompile_stamp(library, driver);
