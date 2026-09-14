@@ -34,11 +34,42 @@ inline bool is_virtual_adapter(const std::wstring &name) {
     return false;
 }
 
+// Where the auto-configuration messages go.
+//
+// They used to go to OutputDebugStringA and stderr, neither of which a GUI user
+// can see. The line saying what was detected and what was injected is the first
+// thing anyone needs when an RDNA 4 machine misbehaves, and it was invisible in
+// exactly the case where it matters -- dlssnr_gui.exe. It is appended to a file in
+// %TEMP% as well now, and diagnose_gpu.ps1 prints the tail of that file.
+//
+// Appended rather than rewritten: the same machine will have several runs, and
+// the interesting question is usually whether the behaviour changed between them.
+//
+// Defined above its first caller rather than next to the function that fills in
+// the message, because enumerate_gpus() below reports a warning of its own.
+inline void report_auto_config(const char *msg) {
+    if (!msg || !*msg) return;
+    OutputDebugStringA(msg);
+    fprintf(stderr, "%s", msg);
+    char temp[MAX_PATH] = {};
+    DWORD len = GetEnvironmentVariableA("TEMP", temp, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return;
+    std::string file = std::string(temp) + "\\dlssnr_gpu_autoconfig.log";
+    FILE *f = nullptr;
+    if (fopen_s(&f, file.c_str(), "a") != 0 || !f) return;
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    fprintf(f, "[%04u-%02u-%02u %02u:%02u:%02u pid %lu] %s",
+            now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
+            (unsigned long)GetCurrentProcessId(), msg);
+    fclose(f);
+}
+
 inline std::vector<DetectedGpu> enumerate_gpus() {
     std::vector<DetectedGpu> gpus;
     IDXGIFactory1 *factory = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory)) || !factory) {
-        OutputDebugStringA("[GPU-AutoConfig] Warning: CreateDXGIFactory1 failed\n");
+        report_auto_config("[GPU-AutoConfig] Warning: CreateDXGIFactory1 failed\n");
         return gpus;
     }
 
@@ -139,7 +170,7 @@ inline void auto_configure_gpu_environment() {
     // 1. Enumerate GPUs via DXGI
     auto gpus = enumerate_gpus();
     if (gpus.empty()) {
-        OutputDebugStringA("[GPU-AutoConfig] Warning: CreateDXGIFactory1 failed\n");
+        report_auto_config("[GPU-AutoConfig] Warning: CreateDXGIFactory1 failed\n");
         return;
     }
 
@@ -219,8 +250,7 @@ inline void auto_configure_gpu_environment() {
                          "[GPU-AutoConfig] Detected %ls (RDNA 4). Using existing HSA_OVERRIDE_GFX_VERSION=%s\n",
                          best_gpu->name.c_str(), env_hsa);
             }
-            OutputDebugStringA(msg);
-            fprintf(stderr, "%s", msg);
+            report_auto_config(msg);
 
             char env_disp[64] = {};
             DWORD dlen = GetEnvironmentVariableA("AMD_DIRECT_DISPATCH", env_disp, sizeof(env_disp));
@@ -232,8 +262,7 @@ inline void auto_configure_gpu_environment() {
             snprintf(msg, sizeof(msg),
                      "[GPU-AutoConfig] Detected %ls (AMD Radeon, %zu MB Dedicated VRAM).\n",
                      best_gpu->name.c_str(), best_gpu->dedicated_vram_mb);
-            OutputDebugStringA(msg);
-            fprintf(stderr, "%s", msg);
+            report_auto_config(msg);
         }
 
         // Ensure NVAPI reports sm_120 Blackwell arch for DLSS neural network
@@ -247,8 +276,7 @@ inline void auto_configure_gpu_environment() {
         char msg[512] = {};
         snprintf(msg, sizeof(msg), "[GPU-AutoConfig] Detected %ls (%zu MB Dedicated VRAM).\n",
                  best_gpu->name.c_str(), best_gpu->dedicated_vram_mb);
-        OutputDebugStringA(msg);
-        fprintf(stderr, "%s", msg);
+        report_auto_config(msg);
     }
 }
 

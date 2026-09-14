@@ -253,6 +253,15 @@ if ($picked) {
 # 5. ZLUDA
 $zludaDll = Join-Path $currentDir "run\nvcuda.dll"
 if (-not (Test-Path $zludaDll)) { $zludaDll = Join-Path $currentDir "nvcuda.dll" }
+Write-Host "`n[4c] Last GPU auto-configuration lines the program wrote (this is what to send in a report):" -ForegroundColor Yellow
+$autoLog = Join-Path $env:TEMP "dlssnr_gpu_autoconfig.log"
+if (Test-Path $autoLog) {
+    Write-Host ("    {0}" -f $autoLog) -ForegroundColor Gray
+    Get-Content $autoLog -ErrorAction SilentlyContinue | Select-Object -Last 12 | ForEach-Object { Write-Host ("    " + $_) -ForegroundColor White }
+} else {
+    Write-Host ("    (no {0} yet -- the program writes it when it starts; run it once)" -f $autoLog) -ForegroundColor Gray
+}
+
 Write-Host "`n[5] Local ZLUDA nvcuda.dll (its own process):" -ForegroundColor Yellow
 if (Test-Path $zludaDll) {
     Write-Host ("    Testing: {0}" -f $zludaDll) -ForegroundColor White
