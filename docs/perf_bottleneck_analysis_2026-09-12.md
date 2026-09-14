@@ -54,6 +54,29 @@ fires — see below). It is the pair of attribute decisions around the inliner:
   inlines the fp8 pad/split scaffolding into every call site, and that is the
   81 %. Holding that one helper out of line is what keeps the win.
 
+**Which of those two decisions is worth the 22 % — measured, with one extra
+build.** Same clip, same 30 frames, only the driver swapped:
+
+| build | configuration | 640×360 |
+|---|---|---|
+| B0 | plain `5ac9102` | 86 ms |
+| B1 | B0 + the wrappers inlinable, so the pass can see and pair the intrinsics — with the fp8 helper inlinable too | **130 ms** |
+| B2 | B1 + the fp8 helper marked `noinline` | **67 ms** |
+
+Making the intrinsics visible is **+51 %** on its own: inlining every helper
+costs far more than the pairing it enables. Holding the fp8 helper out of line is
+**−48 %** from there.
+
+The fusion is the smaller term, and it is the term this document argued about
+longest. The previous experiment's pair of builds — the same all-inlined shape,
+fusion on and off — measures 137 ms here against the 138 ms and 156 ms it
+reported, so the pairing is worth about **18 ms**, while duplicating the fp8
+scaffolding at every call site costs about **63 ms**.
+
+**So the lever is the fp8 helper's body, not more pairing.** A working e4m3 pair
+fusion attacks exactly that body — which is what the AST-level helper below was
+for — and it is worth up to half of 63 ms, not half of the frame.
+
 Not every kernel pairs: on another module the same pass refuses all of them
 (`saw 528, combined 0, refused 444 (an operand of the second MMA touches
 memory)`) and pays the inlining for nothing. Across the clip the net is still
