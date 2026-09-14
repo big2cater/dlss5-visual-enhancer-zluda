@@ -1,4 +1,10 @@
-# DLSS 5 Image Enhancer.
+# DLSS 5 Visual Enhancer.
+#
+# The project name follows the repository (dlss5-visual-enhancer-zluda) rather
+# than the old dlss5-image-enhancer, which named a target that no longer exists.
+# Nothing in the build reads ${PROJECT_NAME}, so this is a label only: targets,
+# output paths and artifacts are unaffected. The release artifact keeps its own
+# name, DLSSNRFilter-<version>, from tools/package_release.py.
 #
 #   cmake -B build -DCMAKE_PREFIX_PATH=<Qt>/msvc2022_64
 #   cmake --build build --config Release
@@ -7,7 +13,7 @@
 # console tools (video_filter) still build.
 
 cmake_minimum_required(VERSION 3.19)
-project(dlss5-image-enhancer LANGUAGES CXX)
+project(dlss5-visual-enhancer LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR
