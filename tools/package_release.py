@@ -63,10 +63,12 @@ def sync_readme(tag):
     print(f"README.md: release badge updated ({n_badge}), download example updated ({n_example})")
     if n_badge == 0 or n_example == 0:
         print("README.md: [!] one of the two slots was not found -- check the patterns in tools/package_release.py")
-    # Anything containing the tag is one of the two slots just written, or the
-    # URL form of the badge; only genuinely other versions deserve a human's
-    # attention, and a warning that always fires is a warning nobody reads.
-    others = sorted({m for m in re.findall(r"v20\d\d\.\d\d\.\d\d[\w.\-]*", text) if tag not in m})
+    # Anything containing the tag is one of the two slots just written, or the URL
+    # form of the badge -- which doubles the dash, so both spellings have to be
+    # excluded. Only genuinely other versions deserve a human's attention: a
+    # warning that always fires is a warning nobody reads.
+    others = sorted({m for m in re.findall(r"v20\d\d\.\d\d\.\d\d[\w.\-]*", text)
+                     if tag not in m and tag.replace("-", "--") not in m})
     if others:
         print("README.md: prose still names other versions -- confirm each is historical on purpose: "
               + ", ".join(others))
