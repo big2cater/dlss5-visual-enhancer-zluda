@@ -22,8 +22,9 @@ derivation is SSA-exact. The *size* of the win is not, and Route A is the
 measurement that decides it — 9–20 % of instructions by whole-cache static
 scaling is the defensible floor, but the scaffolding is concentrated in the hot
 chained kernels, which sit well above that ratio (see the sizing note below).
-**This lever has since been built and measured, and it does not work: read the
-⚠️ note on Step 0 / Route A below before planning around this paragraph.**
+**This lever has since been built and measured: the pairing itself works and is
+worth 12 %, but the inlining it depends on costs 81 % — read the ⚠️ note on
+Step 0 / Route A below before planning around this paragraph.**
 
 **Ordered plan (supersedes the "Phased plan" ordering further down).**
 
@@ -42,36 +43,58 @@ symptoms.
   CSE/GVN ahead of the relocated pass.
 - **Route B — PTX AST peephole fusion**, if Route A's phase interactions bite.
 
-  ⚠️ **Measured 2026-09-13: Step 0 + Route A are a 1.6× regression. Do not ship
-  them as they stand.** Both were implemented, built and run. Frame time at
-  640×360 went **88–89 ms → 142–144 ms** (avg GPU ~129 → ~189 ms, throughput
-  7.40 → 4.95 fps) on the same input, the same command line, the same snippet —
-  only the driver DLL swapped, and with the order alternated across rounds so
-  that drift cannot line up with one binary. Step 0 does exactly what it claimed: the mma-helper
-  call sites drop to zero, so the helpers really are inlined into the kernel. But
-  Route A does **not** pair them, and inlining without pairing is pure cost,
-  because the pad/split scaffolding is then duplicated at every call site. On the
-  two MMA-bearing modules measured (paired by PTX hash, so only the compiler
-  differs):
+  ⚠️ **Measured 2026-09-13/14: Step 0 + Route A are a 1.6× regression *as a
+  combination*, and not for the reason this section first gave. Do not ship them
+  together — but the fusion inside them is worth keeping.** Three builds separate
+  the two variables, all on the same bitcode and pass placement, measured on the
+  same clip with the order alternated so drift cannot line up with one binary:
 
-  | module | `s_swappc` | `v_wmma` | `ds_bpermute` | `scratch_load` | size |
-  |---|---|---|---|---|---|
-  | 405 KB | 256 → **0** | 65 → 192 (**2.9×**) | 5 816 → 12 160 (**2.1×**) | 908 → 1 090 | +37% |
-  | 4.85 MB | 4 352 → **0** | 1 441 → 3 616 (**2.5×**) | 104 952 → 193 472 (**1.8×**) | 11 973 → 20 676 (**+73%**) | +47% |
+  | build | configuration | 640×360 frame | vs baseline |
+  |---|---|---|---|
+  | A | `5ac9102`, helpers out of line (fusion not reachable) | 86–87 ms | — |
+  | C | helpers inlined, fusion **disabled** (384 WMMA) | 156 ms | **+81 %** |
+  | B | helpers inlined, fusion **enabled** (192 WMMA) | 137–138 ms | +59 % |
 
-  The `v_wmma` column is the tell: 192 is 96 × 2 and 3 616 ≈ 1 808 × 2, i.e.
-  exactly the *unpaired* ratio. Pairing would have halved them.
+  Inlining: 86 → 156 ms. Fusion: 156 → 138 ms. **The whole regression is the
+  inlining**; the fusion is a genuine **−12 %**, which is exactly the pairing this
+  section argued for, working as designed.
 
-  **Why it does not pair — and this is the corrected lever.** `combineMMA` is
-  gated on `FirstA == SecondA` (`CombineMMA.cpp:179`), and
-  `tryToReorderOperands` gives up the moment a dependency between the two MMAs
-  `mayReadOrWriteMemory` (`CombineMMA.cpp:43-47`). After inlining, the second
-  MMA's `A` chain runs through the first one's `ds_bpermute`/LDS scaffolding. The
-  CSE/GVN placed ahead of the relocated pass does not help: the operands are not
-  duplicated expressions that CSE could unify, they are *ordered against each
-  other* by memory-visible operations. So the lever is not "run the combiner
-  later" but "make the operand chains reorderable, or fuse before the scaffolding
-  is emitted".
+  **What this section got wrong, and why it is written down rather than deleted.**
+  An earlier revision read the static `v_wmma` counts — 65 → 192 on one module —
+  as "more matrix work", and concluded that pairing was not happening. That is a
+  static/runtime confusion: a static count counts *code instances*, not
+  executions. In build A those 65 WMMA instructions sit inside shared helper
+  bodies that the kernel calls 256 times; in build B the 192 are the fused
+  results, inlined and therefore executed once each. The pass' own report settles
+  it: **384 intrinsics seen, 192 pairs combined, 0 refused, 0 lowered alone** —
+  everything that could pair did pair, and what had been 384 unfused executions
+  became 192 fused ones. The `v_wmma` column once called "the tell" was in fact
+  the fusion's own output.
+
+  Withdrawn with it: the claim that `combineMMA`'s `FirstA == SecondA` gate
+  (`CombineMMA.cpp:179`) or `tryToReorderOperands`' memory-visibility bail-out
+  (`:43-47`) stops the inlined fp8 pairs. Both are real gates, but nothing was
+  ever measured about which pairs they reject here, and the fusion rate says they
+  did not. What the numbers do say is that inlining the ptx_impl helpers into the
+  kernels is what costs — static `scratch_load/store` up 20–87 %, `ds_bpermute`
+  66–109 %, module size 34–61 % — and that on this hardware that outweighs the
+  WMMAs the fusion removes.
+
+  **The corrected target is therefore not "make pairing work" (it works) but "get
+  the fusion without the inlining."** The fusion alone is worth 12 %, so emitting
+  a *pair helper* at translation time — one call that does both MMAs with a shared
+  A and keeps the widening out of line — has a measured ceiling of about
+  **76 ms**, below the 78.4 ms this section started from. Route B is its natural
+  home.
+
+  Instrumentation this measurement needed, worth keeping: `CombineMMAPass`
+  reports how many MMAs it combined and why the rest were not, when
+  `ZLUDA_MMA_STATS` is set in the environment; off otherwise, and free. Reaching
+  it took a detour worth recording: adding an option to ZLUDA's LLVM argument
+  list (`llvm_zluda/src/compile.rs`) makes `LLVMZludaParseCommandLineOptions`
+  fail, after which every `cuModuleLoadData` errors out with no diagnostic at all
+  — which is why `-mllvm -print-after=…` does not work here, and why the switch
+  had to live in the pass.
 
   **Isolated on one revision.** Two more builds pin the cause down. Plain
   `5ac9102` (the fp8-inline commit alone, no experiment) was built and measured
@@ -102,18 +125,31 @@ symptoms.
   | `scratch_store` | 25 382 | 25 382 | 47 398 (+86.7 %) |
 
   State left behind: deployment is the pre-change DLL; the three builds are kept
-  as `nvcuda-before-mma.dll`, `nvcuda-clean-5ac9102.dll` and
-  `nvcuda-mine-mma.dll` under `%TEMP%`; and the cache holds 15 modules × 3
-  generations, which is what makes the table above possible.
-  `tools/zluda_module_ab.py` is the tool for this: it extracts the module inputs
-  out of the snippet, compiles them one at a time with each driver, and prints the
-  table above from the cache, so the next attempt at pairing can be judged in
-  seconds instead of another twenty-minute prewarm. The fork changes stay
-  uncommitted in the working tree.
+  as `nvcuda-before-mma.dll` (A), `nvcuda-mine-mma.dll` (B) and
+  `nvcuda-no-fuse.dll` (C) under `%TEMP%`; and the cache holds 15 modules × 4
+  generations, which is what makes the tables above possible.
+  `tools/zluda_module_ab.py` extracts the module inputs out of the snippet,
+  compiles them one at a time with each driver, and prints the per-generation
+  table straight from the cache, so a codegen question is answered in seconds
+  instead of another twenty-minute prewarm. The fork changes stay uncommitted in
+  the working tree.
 
-The two tests that decide whether either worked are both gfx11 and both cheap:
-the mma-helper `s_swappc` count going to zero, and `v_wmma` halving on module 14
-under `-mllvm -print-after=zluda-combine-mma` — plus the two gates listed below.
+  A warning for whoever measures this next: `video_filter` re-runs the entire
+  prewarm when it starts if its warm stamp — which covers the cache database size
+  — is stale, and building the comparison above keeps changing that size. A
+  benchmark loop over several drivers therefore pays fifteen minutes per driver
+  unless `DLSSNR_PRECOMPILE_SKIP=1` is set; with it, a 30-frame run takes about
+  five seconds and there is no prewarm in the log at all.
+
+The two tests this section proposed are both gfx11 and both cheap, but only one of
+them survives being used: the mma-helper `s_swappc` count going to zero does say
+whether the helpers were inlined, which — as measured above — is the thing that
+actually costs. A `v_wmma` count on its own says nothing about work done, because
+a fused pair and an unfused single each come out as one AMD 16x16 WMMA; it has to
+be read next to the pass' own combined/lowered numbers (`ZLUDA_MMA_STATS`). The
+proposed `-mllvm -print-after=zluda-combine-mma` does not work at all here: an
+extra option in ZLUDA's LLVM argument list fails the parse, and every module load
+then fails without a word.
 
 **Blocked, not deprioritised.** These were ranked first in an earlier draft of
 this section, on the reasoning that RDNA4 users may be broken while gfx11 users
