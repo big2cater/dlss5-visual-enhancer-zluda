@@ -38,6 +38,28 @@ All 30 output frames came out **byte-identical** (`--dump-frames`, PNG SHA-256).
 That is what pairing two MMAs over one shared A should give: the products and
 their accumulation order are unchanged, only the padding goes away.
 
+**Which build ships, re-checked 2026-09-14 19:14–19:32.** The package takes its
+driver from `dist\` — `tools/package_release.py` searches `dist`, then `build`,
+then `run` — and that file is **not** `ZLUDA\target\release\nvcuda.dll`: they
+differ (`B7E514669F9FC16B` against `5B124A0E1F5836C3`) while carrying the same
+markers (the pair helper's name and struct, `noinline`, and `optnone` appearing
+only inside symbol names), so both are builds of `02ff6c5` and the difference is
+build nondeterminism rather than a different attribute shape. Markers are not
+emitted code, so the shipping file was measured itself, against the pre-change
+driver, two rounds with the order alternated:
+
+| driver | 640×360 frame (median of last 20) | avg GPU | throughput |
+|---|---|---|---|
+| pre-change `8B6C9E8E40E7198A` | **87 / 87 ms** | 127.4 / 127.1 ms | 7.33 / 7.37 fps |
+| shipping `B7E514669F9FC16B` | **67 / 67 ms** | 106.4 / 106.4 ms | 8.48 / 8.48 fps |
+
+`--dump-frames` then wrote all 30 output frames for each driver, and the two sets
+of PNG SHA-256 are identical — so the byte-identity claim above holds for the
+file that ships, not merely for a build of the same commit. The package
+`DLSSNRFilter-v2026.09.14-v1-nodlssnr.zip` carries that DLL, and its sha16 is
+recorded here so that a later claim about "the shipped driver" can be checked
+instead of inferred.
+
 What produced it is *not* the helper that was built to produce it (that one never
 fires — see below). It is the pair of attribute decisions around the inliner:
 
