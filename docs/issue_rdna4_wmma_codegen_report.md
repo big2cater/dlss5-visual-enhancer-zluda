@@ -117,3 +117,45 @@ a card. Two concrete options, in the order they look worth trying:
 Both need `CombineMMAPass` (which pairs MMAs sharing an A operand) to understand
 the new shape, and both need a gfx12 card to confirm the mapping does not silently
 produce wrong pixels.
+
+## The second one, found while re-checking the first: the GPU was mis-identified
+
+Not part of the codegen failure, but it sat on the same path and would have broken
+cards that work today, so it is recorded here.
+
+`core/gpu_detection.h` decides whether a card is RDNA 4 by name and by PCI device
+id, and a "yes" makes it set `HSA_OVERRIDE_GFX_VERSION=12.0.1`. The id test
+accepted `0x7480..0x74DF` -- which is **Navi 33**, the RX 7600 and its siblings
+(0x7480 is the RX 7600 itself; the block also covers the 7600 XT, 7650 GRE, 7400
+OEM part, 7600M XT, 7600S, 7700S and PRO W7600). RDNA 4 reports **0x7550**
+(Navi 48) and **0x7590** (Navi 44), so the id half matched RDNA 3 and no RDNA 4
+card at all, while the name half listed two models that do not exist (RX 9080 and
+RX 9090 -- RDNA 4 has no flagship) and missed the workstation Radeon AI PRO R9700.
+Because of that override, the cards it did match were handed the architecture of a
+chip they are not, and per the header's own note the runtime then builds gfx12 ELF
+the driver refuses to load: every module fails before the first frame.
+
+Introduced by `9154fa0` (2026-09-11) as `0x7480..0x749F` and widened to `..0x74DF`
+by `7b38195` (2026-09-12). `BUG_REVIEW_2026-09-11_FRESH.md` discusses this same
+function (C8) and reaches the right conclusion -- use the PCI id table rather than
+model strings -- but records the ids backwards, describing `0x7480..0x749F` as
+"Navi 48, missing Navi 44". Following that literally would have kept the RDNA 3
+range in place and added 0x7590 beside it, leaving the RX 7600 broken; the fix has
+to remove the RDNA 3 block rather than extend it.
+
+Fixed in `dcf7873`: the predicate is now `is_rdna4_gpu()` at the top of
+`core/gpu_detection.h`, keyed on 0x7550/0x7590 plus the real model names, and
+`tools/test_rdna4_detect.cpp` drives it with 28 real name-and-id pairs so that the
+next change to it is checked against cards rather than against a comment.
+
+Two things in that area remain open and are not fixed by any of the above:
+
+- **Navi 44 gets gfx1201's override.** The injection value is a constant
+  `12.0.1`, which names gfx1201 / Navi 48; a 9060 XT is gfx1200 and would want
+  `12.0.0`. The reported 9060 XT did reach translation with the mismatched value,
+  so it is evidently not fatal there -- but whether code compiled for gfx1201 is
+  fully correct on gfx1200 is not something this machine can establish.
+- **The auto-configuration cannot be seen.** Its messages go to
+  `OutputDebugStringA` and `stderr`, and `dlssnr_gui.exe` is a GUI: the line
+  saying what was detected and what was injected is invisible to the user, which is
+  precisely the line needed to debug an RDNA 4 report.
