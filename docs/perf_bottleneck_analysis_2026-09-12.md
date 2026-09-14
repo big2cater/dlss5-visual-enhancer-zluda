@@ -59,8 +59,14 @@ Not every kernel pairs: on another module the same pass refuses all of them
 memory)`) and pays the inlining for nothing. Across the clip the net is still
 −23 %.
 
-**The AST-level pair helper is in the tree and does not fire.** It was built to
-buy pairing with no inlining at all:
+**Pending (待定): the AST-level pair helper is in the tree and does not fire.**
+It is kept deliberately rather than reverted — the shape it recognises is a real
+one for other snippets, and its body is already verified in the shipped `.bc` —
+but it is **not** part of the measured gain above and must not be counted in it.
+The code and the pass carry the same `STATUS (2026-09-14): pending` note, so a
+future reader meets the caveat where the decision would be made.
+
+It was built to buy pairing with no inlining at all:
 `replace_instructions_with_functions.rs` emits one call to
 `mma_sync_aligned_m16n8k32_row_col_f16_e4m3_e4m3_f16_pair` for two adjacent
 `mma.sync` sharing an A operand, and that helper's body holds the four intrinsics
