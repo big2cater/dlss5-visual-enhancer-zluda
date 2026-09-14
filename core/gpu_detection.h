@@ -95,6 +95,46 @@ inline std::wstring detected_gpu_identity() {
     return best->name + ids;
 }
 
+// Which AMD cards are RDNA 4 (gfx12) -- the ones that need the HSA override
+// because ROCm's device list does not know them yet. Split out of the caller so
+// that tools/test_rdna4_detect.cpp can drive it with real cards instead of
+// relying on whatever machine happens to be plugged in.
+//
+// Names: the consumer line-up is RX 9070 XT / 9070 / 9070 GRE and RX 9060 XT /
+// 9060, plus the workstation Radeon AI PRO R9700. There is no 9080 or 9090 --
+// RDNA 4 ships no flagship, the 9070 XT is the top part -- and those two names
+// sat in this test for a while as though the line-up had them.
+//
+// IDs are the part that has to be right, because a wrong "yes" here sets
+// HSA_OVERRIDE_GFX_VERSION=12.0.1 on a card that is not gfx12, and the note under
+// Self-Healing below records the result: the runtime builds gfx12 ELF that the
+// driver refuses to load, so every module fails before the first frame.
+//
+//   Navi 48   RX 9070 XT / 9070 / 9070 GRE, Radeon AI PRO R9700   0x7550
+//   Navi 44   RX 9060 XT (16 / 8 GB), RX 9060                     0x7590
+//
+// This used to accept 0x7480..0x74DF, which is RDNA 3 territory: 0x7480 is the
+// RX 7600 and its mobile variants (Navi 33), 0x747E is Navi 32 and 0x744C is
+// Navi 31. So the id test matched RDNA 3 and no RDNA 4 card at all. RDNA 2 is
+// lower still -- Navi 21/22/23/24 are 0x73BF, 0x73DF, 0x73FF, 0x743F -- and must
+// not match either: gfx1030 has no matrix units, so nothing there is helped by
+// 12.0.1.
+//
+// The neighbourhood above each id is an assumption, not a lookup; only 0x7550 and
+// 0x7590 are the ids themselves (DeviceHunt, PCI 1002). It fails in the safe
+// direction: 0x755x and 0x759x are a whole 0x100 away from the nearest RDNA 3 id,
+// so a wrong guess can only fail to inject -- which shows up as the cuInit failure
+// the override exists to prevent -- and cannot hand a working card the wrong
+// architecture.
+inline bool is_rdna4_gpu(const std::wstring &name_lower, UINT device_id) {
+    return (name_lower.find(L"9070") != std::wstring::npos ||
+            name_lower.find(L"9060") != std::wstring::npos ||
+            name_lower.find(L"r9700") != std::wstring::npos ||
+            name_lower.find(L"rx 9") != std::wstring::npos ||
+            (device_id >= 0x7550 && device_id <= 0x755F) ||
+            (device_id >= 0x7590 && device_id <= 0x759F));
+}
+
 inline void auto_configure_gpu_environment() {
     // 1. Enumerate GPUs via DXGI
     auto gpus = enumerate_gpus();
@@ -137,14 +177,8 @@ inline void auto_configure_gpu_environment() {
         std::wstring name_lower = best_gpu->name;
         std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::towlower);
 
-        // Check for RDNA 4 (RX 9000 series, 9070/9060/9080/9090, Navi 48/44, or device IDs 0x7480..0x74DF)
-        bool is_rdna4 = (name_lower.find(L"9070") != std::wstring::npos ||
-                         name_lower.find(L"9060") != std::wstring::npos ||
-                         name_lower.find(L"9080") != std::wstring::npos ||
-                         name_lower.find(L"9090") != std::wstring::npos ||
-                         name_lower.find(L"rx 9") != std::wstring::npos ||
-                         name_lower.find(L"radeon 9") != std::wstring::npos ||
-                         (best_gpu->device_id >= 0x7480 && best_gpu->device_id <= 0x74DF));
+        // RDNA 4, per is_rdna4_gpu above -- which is where the reasoning lives.
+        bool is_rdna4 = is_rdna4_gpu(name_lower, best_gpu->device_id);
 
         char msg[768] = {};
         if (is_rdna4) {
