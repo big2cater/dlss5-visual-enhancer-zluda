@@ -233,3 +233,40 @@ roughly twenty-five fresh processes, and the one mechanism that could be induced
 demand does not produce it. The next step is either a machine where it reproduces, or
 the launch path itself -- the enhancer's CUDA layer, where a dropped false return and
 once-only warning flags are the loudest silent-failure sites in the code.
+
+
+## Closed 2026-09-15: an upstream matter, and the silent path here is loud now
+
+The conclusion from the user's own runs on the current build: the blank output was a
+problem of the first releases, upstream reports it fixed, and it has not been seen
+since. That agrees with what this machine showed -- roughly twenty-five fresh
+processes of the current build, none blank, and the one mechanism that could be
+induced on demand (a module translated inside the run) does not produce it. So the
+race is closed as an upstream matter rather than solved here, and this repository's
+own work stays as the safety net: the video and still gates, the retries, and the
+precompile guard that bounds a stalled tail.
+
+What was still worth fixing on our side is the reporting path, and the two candidates
+the review named did not hold. Every `flush_and_wait()` call site already checks its
+return -- `if (!flush_and_wait()) return false;` twice and `return flush_and_wait();`
+three times. And the `static bool reported` that reads like a warning suppressor is a
+deliberate read-the-output-once cost gate, with its reason written beside it.
+
+The real silent failure was two lines away in the same function. `finish_evaluation`
+read the whole output back, recognised "every byte zero (fully blank)", **logged it,
+and then returned success**. Its caller could not tell that apart from a good frame,
+so an empty result left as the result.
+
+It now asks the input too (`sample_nonzero_bytes`, up to 24 rows spread across the
+image). An empty output with a non-empty input goes through `set_error` and returns
+false, so the caller sees the failure; an empty output with an empty input is a dark
+frame and still succeeds -- the distinction the earlier over-eager gate got wrong.
+The latch that retires the read back is set only after a successful read, not before:
+one failed read used to disable the check for the life of the process.
+
+Verified: a bright still is unchanged (exit 0, mean luma 164, 1410 ms, read back
+reporting 1 490 689 of 1 843 200 bytes non-zero); an all-black still still succeeds
+(exit 0, luma 0) and its network output is not empty (1 553 704 non-zero bytes), so a
+dark frame cannot be mistaken for the fault. The new failure branch cannot be exercised
+here -- it fires only when the network produces nothing, which is the fault that does
+not reproduce -- so its non-firing is verified and its firing is review only.

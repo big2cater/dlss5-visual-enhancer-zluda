@@ -1182,6 +1182,43 @@ bool create_feature(const FeatureDesc &desc) {
     return true;
 }
 
+// Non-zero bytes in a sparse sample of an array's rows. This asks the one question
+// that decides whether an empty output is a fault or just a dark frame: did the
+// image handed to the network have any content? Sampling rows instead of reading the
+// whole image keeps it cheap enough to run on a frame.
+static size_t sample_nonzero_bytes(CUarray array) {
+    if (!array || !g.cu.cuArrayGetDescriptor || !g.cu.cuMemcpy2D) return 0;
+    CUDA_ARRAY_DESCRIPTOR ad{};
+    if (g.cu.cuArrayGetDescriptor(&ad, array) != CUDA_SUCCESS) return 0;
+    const size_t bytes_per_texel =
+        (ad.Format == CU_AD_FORMAT_FLOAT ? 4u : ad.Format == CU_AD_FORMAT_HALF ? 2u : 1u) *
+        ad.NumChannels;
+    const size_t row_bytes = ad.Width * bytes_per_texel;
+    const size_t rows = ad.Height;
+    if (rows == 0 || row_bytes == 0) return 0;
+    // Up to 24 rows spread over the image, so content confined to a band or to the
+    // middle of a mostly dark frame is still seen.
+    const size_t samples = rows < 24 ? rows : 24;
+    std::vector<unsigned char> host(row_bytes, 0);
+    size_t total = 0;
+    for (size_t i = 0; i < samples; ++i) {
+        const size_t row = samples == 1 ? 0 : (i * (rows - 1)) / (samples - 1);
+        CUDA_MEMCPY2D copy{};
+        copy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+        copy.srcArray = array;
+        copy.srcY = row;
+        copy.dstMemoryType = CU_MEMORYTYPE_HOST;
+        copy.dstHost = host.data();
+        copy.dstPitch = row_bytes;
+        copy.WidthInBytes = row_bytes;
+        copy.Height = 1;
+        if (g.cu.cuMemcpy2D(&copy) != CUDA_SUCCESS) continue;
+        for (size_t b = 0; b < row_bytes; ++b)
+            if (host[b]) ++total;
+    }
+    return total;
+}
+
 // Waits for the work the evaluation queued and reports what came of it. Both
 // evaluation paths end here, so what one of them proves the other does too.
 static bool finish_evaluation() {
@@ -1204,7 +1241,6 @@ static bool finish_evaluation() {
     // screen.
     static bool reported = false;
     if (!reported && g.cu.cuMemcpy2D && g.output.level0) {
-        reported = true;
         CUDA_ARRAY_DESCRIPTOR ad{};
         if (g.cu.cuArrayGetDescriptor(&ad, g.output.level0) == CUDA_SUCCESS) {
             const size_t bytes_per_texel =
@@ -1226,8 +1262,13 @@ static bool finish_evaluation() {
             copy.Height = rows;
             const CUresult cr = g.cu.cuMemcpy2D(&copy);
             if (cr != CUDA_SUCCESS) {
+                // Deliberately not latched: the check has not run yet, and a read
+                // back that failed once is no reason to stop asking. It used to
+                // latch before the read, so one failure retired the check for the
+                // life of the process.
                 fprintf(stderr, "  [output] read back failed: %d\n", cr);
             } else {
+                reported = true;
                 size_t nonzero = 0;
                 size_t first_nz_row = rows, last_nz_row = rows;
                 for (size_t r = 0; r < rows; ++r) {
@@ -1240,11 +1281,38 @@ static bool finish_evaluation() {
                         last_nz_row = r;
                     }
                 }
-                char line[280];
+                char line[384];
                 if (first_nz_row == rows) {
+                    // An empty output on its own proves nothing: a frame that is
+                    // genuinely black comes out black. So ask the input -- and if
+                    // the image that was handed to the network had content while
+                    // the result has none, the evaluation was accepted and did
+                    // nothing, which is the failure this read back exists to catch.
+                    //
+                    // This used to be one line in a log followed by a return of
+                    // success, so the caller could not tell it apart from a good
+                    // frame and the empty one went out as the result.
+                    const size_t input_nonzero = sample_nonzero_bytes(g.color.level0);
+                    if (input_nonzero > 0) {
+                        snprintf(line, sizeof line,
+                                 "[dlss-cuda] network output: %zux%zu, all %zu rows read back, "
+                                 "every byte zero (fully blank), while the input sample has %zu "
+                                 "non-zero bytes: the evaluation did nothing\n",
+                                 ad.Width, ad.Height, rows, input_nonzero);
+                        fputs(line, stderr);
+                        if (g_reshade_log) g_reshade_log(line);
+                        set_error("the network produced an empty output: %zux%zu, every byte zero, "
+                                  "while the input sample holds %zu non-zero bytes -- the "
+                                  "evaluation was accepted but did nothing",
+                                  ad.Width, ad.Height, input_nonzero);
+                        fflush(stderr);
+                        return false;
+                    }
                     snprintf(line, sizeof line,
                              "[dlss-cuda] network output: %zux%zu, all %zu rows read back, "
-                             "every byte zero (fully blank)\n", ad.Width, ad.Height, rows);
+                             "every byte zero (fully blank); the input sample is empty too, so "
+                             "this is a dark frame rather than a fault\n",
+                             ad.Width, ad.Height, rows);
                 } else {
                     snprintf(line, sizeof line,
                              "[dlss-cuda] network output: %zux%zu, %zu of %zu bytes non-zero, "
