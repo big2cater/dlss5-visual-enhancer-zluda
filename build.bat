@@ -50,9 +50,23 @@ REM
 REM /MIR mirrors, so a file windeployqt drops on one run (say, before a flag
 REM above was added) does not linger in dist\ after a later run stops
 REM producing it.
+REM
+REM The mirror is also the reason dist\ had accumulated development material:
+REM build\ holds rebuild logs, ELF and module dumps, profiler output and the
+REM smoke test binary from working in this tree, and /MIR carried all of it into
+REM what both this script and tools/package_release.py treat as the shipped
+REM folder. It is excluded by category -- the dump directories and the dev-only
+REM extensions -- rather than by filename, so a new rebuild_log17.txt or a new
+REM isa\ dump does not have to be added here by hand.
+REM
+REM One consequence worth knowing: /XD and /XF exclude on both sides, so an item
+REM already sitting in dist\ is neither copied nor deleted. Changing this list
+REM means cleaning dist\ once by hand; from then on the mirror holds it clean.
 robocopy build dist /MIR /NFL /NDL /NJH /NJS ^
     /XD CMakeFiles nvngx_autogen dlssnr_gui_autogen video_filter_autogen processor_smoke_autogen .qt zluda ^
-    /XF CMakeCache.txt build.ninja cmake_install.cmake *.pdb *.lib *.exp .ninja_log .ninja_deps
+        isa trace zluda-modules cache-override-test bin ^
+    /XF CMakeCache.txt build.ninja cmake_install.cmake *.pdb *.lib *.exp .ninja_log .ninja_deps ^
+        *.txt *.png Makefile *.bat processor_smoke.exe
 REM robocopy's own exit codes are a bitmask where 0-7 all mean success (0 =
 REM nothing needed copying); only 8 and above is a real failure.
 if errorlevel 8 exit /b 1
