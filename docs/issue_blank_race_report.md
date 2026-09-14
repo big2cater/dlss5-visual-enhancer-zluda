@@ -195,3 +195,41 @@ Next, in this order:
    the run logs.
 2. Then re-run the cold arm. With the straggler bounded, "blank against freshly
    translated" becomes measurable.
+
+
+## Experiment 2026-09-15: in-run translation, five runs, no blank
+
+Hypothesis under test: the blank frame comes from a module translated inside the run
+rather than during precompile -- the cold path leaves exactly one module behind, as the
+audit above found, and the guard makes that state reproducible on demand.
+
+Method: delete the precompile stamp and give precompile a one-minute no-progress
+budget, so the run proceeds with one module missing from the cache and translates it
+inside itself. Five fresh processes, blankness measured from the output image (mean
+luma via ffmpeg), pass time taken from the tool's own done line.
+
+| run | outcome | precompile | straggler | two passes |
+|---|---|---|---|---|
+| 1 | exit 0, luma 164 | partial | module_002 | 1412 ms |
+| 2 | exit 0, luma 164 | partial | module_005 | 1389 ms |
+| 3 | exit 0, luma 164 | warm | — | 1434 ms |
+| 4 | exit 0, luma 164 | partial | module_003 | 1383 ms |
+| 5 | exit 0, luma 164 | partial | module_003 | 1383 ms |
+
+No blank output, and the output is not merely non-black: it is identical to the warm
+run's, same mean luma and same pass time within noise, whether the module was
+translated during precompile or inside the run. That is a useful negative -- code
+generation does not depend on which of the two paths produced it -- but it does not
+support the hypothesis either.
+
+Two side observations. The module that stalls varies between runs (module_002, 005,
+003, 003), so it is the translation that races rather than one bad input. And run 3
+came out warm although the experiment deletes the stamp before every run; that was not
+chased, because it does not affect the result, but it means the stamp can reappear
+without a successful precompile in the same process.
+
+What is left: on this machine and this build the blank frame has not been observed in
+roughly twenty-five fresh processes, and the one mechanism that could be induced on
+demand does not produce it. The next step is either a machine where it reproduces, or
+the launch path itself -- the enhancer's CUDA layer, where a dropped false return and
+once-only warning flags are the loudest silent-failure sites in the code.
