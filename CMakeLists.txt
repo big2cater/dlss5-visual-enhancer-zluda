@@ -17,7 +17,10 @@ project(dlss5-visual-enhancer LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR
-        "This program can only be built for Windows: the DLSS network is a Windows ")
+        "This program can only be built for Windows: the DLSS network is a Windows DLL, "
+        "the interop with it is D3D12, and the CUDA driver it is pointed at is the "
+        "WIndows build of ZLUDA. None of those have a Linux equivalent here, so the "
+        "build stops instead of producing something that cannot run.")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)

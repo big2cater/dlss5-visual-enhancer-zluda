@@ -152,8 +152,12 @@ function Show-Probe([string]$path, [string]$kind, [string]$label, [string]$overr
 if ($IsolatedOnly) {
     # One fresh process that loads the system HIP runtime and the local ZLUDA
     # library, with whatever override was passed in already in place.
-    $p = "C:\Windows\System32\amdhip64_7.dll"
-    if (-not (Test-Path $p)) { $p = "C:\Windows\System32\amdhip64_6.dll" }
+    # $env:SystemRoot rather than C:\Windows: the system directory is not always on C:,
+    # and a probe against a path that does not exist reports "not found" for a DLL that
+    # is right there.
+    $sysDir = Join-Path $env:SystemRoot "System32"
+    $p = Join-Path $sysDir "amdhip64_7.dll"
+    if (-not (Test-Path $p)) { $p = Join-Path $sysDir "amdhip64_6.dll" }
     $hipRes = if (Test-Path $p) { [HipDiag]::TestHip($p) } else { "HIP DLL not found" }
     $zludaDll = Join-Path $currentDir "run\nvcuda.dll"
     if (-not (Test-Path $zludaDll)) { $zludaDll = Join-Path $currentDir "nvcuda.dll" }
@@ -197,8 +201,9 @@ Write-Host "    Note: the program sets HSA_OVERRIDE_GFX_VERSION itself on RDNA 4
 Write-Host "          what it did through OutputDebugString, which a GUI does not show." -ForegroundColor Gray
 
 # 3. HIP DLLs that could be picked up, each in its own process
-Write-Host "`n[3] HIP runtime DLLs in C:\Windows\System32 (each probed in its own process):" -ForegroundColor Yellow
-$systemHip = @(Get-ChildItem "C:\Windows\System32" -Filter "amdhip64*.dll" -ErrorAction SilentlyContinue)
+Write-Host "`n[3] HIP runtime DLLs in the system directory (each probed in its own process):" -ForegroundColor Yellow
+$sysDir = Join-Path $env:SystemRoot "System32"
+$systemHip = @(Get-ChildItem $sysDir -Filter "amdhip64*.dll" -ErrorAction SilentlyContinue)
 if ($systemHip) {
     foreach ($f in $systemHip) {
         Write-Host ("    [Found] {0}  ({1:n0} B, {2:yyyy-MM-dd HH:mm})" -f $f.FullName, $f.Length, $f.LastWriteTime) -ForegroundColor Green
@@ -245,7 +250,16 @@ Write-Host "`n[4b] Which HIP runtime the program would load (search order):" -Fo
 $picked = $null
 if ($localHip) { $picked = $localHip[0] }
 elseif ($systemHip) { $picked = $systemHip[0] }
-else { $picked = Get-Command amdhip64_7.dll -ErrorAction SilentlyContinue }
+else {
+    # Get-Command cannot find a .dll: the extension is not in PATHEXT, so this branch
+    # used to report "none found" without looking. Walk PATH directly instead.
+    foreach ($dir in ($env:PATH -split ';')) {
+        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+        $hit = @(Get-ChildItem $dir -Filter "amdhip64*.dll" -ErrorAction SilentlyContinue |
+                 Select-Object -First 1)
+        if ($hit) { $picked = $hit[0]; break }
+    }
+}
 if ($picked) {
     $pickedPath = if ($picked.FullName) { $picked.FullName } else { $picked.Source }
     Write-Host ("    {0}" -f $pickedPath) -ForegroundColor White

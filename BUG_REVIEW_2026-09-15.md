@@ -35,6 +35,12 @@
 
 **同日第六轮修复**（门禁、构建脚本与 GUI 低档项，同一 v6 内）：S10（`test_rdna4_detect` 接入 CMake/CTest，并由 `build.bat` 在构建后运行 —— 实测 `1/1 Passed`、`100% tests passed`）、S11（vcvars/cmake/ninja 缺失时给出明确报错；`/XF *.txt` 经清点后维持，因 build\ 下 .txt 全是开发日志）、L39（设置改到 `%APPDATA%\<org>\<app>` 并一次性迁移旧 ini）、L37（单帧对比临时文件按 PID 命名并清扫陈旧残留）、L11（删零调用的 `resize_rgb48`、只写不读的 `input_has_signal`×2、GpuFlow 从未绑定的 256 字节 cb；报告所列 `image_has_signal`/`full_copy_ready`/`eval_index` 在本仓并不存在，全仓 0 命中）、L10（`swprintf` 截断改为报错提示）。
 
+**同日第七轮修复**（报告收尾，同一 v6 内）：L36（`imagePasses` 的 ini 缺省值 1 → 3，与构造函数/恢复默认一致）、L38（运行日志与预热日志的切行同时接受 `\r` 与 `\n`；ffmpeg 用裸 `\r` 原地重写统计行，原先只认 `\n` 会把这些行压到结束才显示）、L40（`dropEvent` 与 `dragEnterEvent` 只接受本地文件，拖入链接不再以空串清空输入并给出提示）、S12（CMake 截断的 FATAL_ERROR 补全；`diagnose_gpu.ps1` 改用 `%SystemRoot%`，并把永不命中的 `Get-Command amdhip64_7.dll` 换成逐目录扫描 PATH）。
+
+> **复核者对 S12 一处的更正**：报告称 `diagnose_gpu.ps1` 里的 `Get-Command *.dll` "永远找不到（不在 PATHEXT）"。实测**不成立**：本机 `Get-Command amdhip64_7.dll` 返回**找到**，PATH 上确有 2 个 `amdhip64*.dll`。该处改动（改为逐目录扫描 PATH）因此是"更明确、不依赖 Get-Command 解析规则"，**不是**"修掉了一个死分支"。
+
+> **复核者的验证边界（第七轮）**：L36/L38/L40 都是 GUI 行为，无法在无头环境自动验证，仅经编译与代码核对；`diagnose_gpu.ps1` 的改动只做了语法解析校验（PARSE-OK）——本机没有 HIP 真机验证条件。另有闸门自身的两处缺陷在本轮被发现并修正（见上）。
+
 > **复核者如实记录一处未修**：L10 后半（分片接缝 warmup 丢弃帧数由"时长 × 帧率"得出，解码器首帧未必正落在该时刻 ⇒ 接缝可能多/少**恰好一帧**）**未修**。根除需要把 PTS 穿过裸帧管道，本路径没有；已在 `video_filter.cpp` 两处写明成因与边界，不做"看起来修好了"的处理。
 
 > **复核者对 L32 的否决**：报告建议给 `NVSDK_NGX_Parameter` 补虚析构。**不采纳** —— 该结构体镜像 NVIDIA 的 vtable 顺序（文件顶部 [LAYOUT] 注释已写明"nothing here may be reordered"），加虚析构会插入一个槽位并使其后每个入口错位。已改为在类上方写明**为什么不能加**，这才是该条的正确处置。

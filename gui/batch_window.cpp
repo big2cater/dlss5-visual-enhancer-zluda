@@ -669,7 +669,10 @@ void BatchWindow::load_settings() {
     style_->setCurrentIndex(settings.value(QStringLiteral("style"), 2).toInt());
     preset_->setCurrentIndex(settings.value(QStringLiteral("preset"), 0).toInt());
     if (model_) model_->setCurrentIndex(settings.value(QStringLiteral("model"), 0).toInt());
-    if (image_passes_) image_passes_->setValue(settings.value(QStringLiteral("imagePasses"), 1).toInt());
+    // 3, not 1: the constructor and the reset button both start this at 3, so a default
+    // of 1 here meant a fresh install quietly ran one pass while the button labelled
+    // "restore defaults" would have set three. All three now say the same thing.
+    if (image_passes_) image_passes_->setValue(settings.value(QStringLiteral("imagePasses"), 3).toInt());
     double loaded_gamma = settings.value(QStringLiteral("gamma"), 1.0).toDouble();
     if (std::abs(loaded_gamma - 1.4) < 0.05) {
         loaded_gamma = 1.0; // 升级旧版临时 1.4 补偿值回正至物理正确的 1.0
@@ -1280,10 +1283,16 @@ void BatchWindow::on_prewarm_output() {
     prewarm_buffer_.append(prewarm_process_.readAllStandardError());
     prewarm_buffer_.append(prewarm_process_.readAllStandardOutput());
     while (true) {
-        const int idx = prewarm_buffer_.indexOf('\n');
+        // Same rule as the run log: a bare '\r' ends a line too, or the precompile
+        // progress stays invisible until the very end (see read_error).
+        int idx = prewarm_buffer_.indexOf('\n');
+        const int cr = prewarm_buffer_.indexOf('\r');
+        if (idx < 0 || (cr >= 0 && cr < idx)) idx = cr;
         if (idx < 0) break;
+        const int skip = (prewarm_buffer_.at(idx) == '\r' && idx + 1 < prewarm_buffer_.size() &&
+                          prewarm_buffer_.at(idx + 1) == '\n') ? 2 : 1;
         const QString line = QString::fromUtf8(prewarm_buffer_.left(idx)).trimmed();
-        prewarm_buffer_.remove(0, idx + 1);
+        prewarm_buffer_.remove(0, idx + skip);
         if (line.isEmpty()) continue;
 
         static const QRegularExpression pre(
@@ -1429,10 +1438,18 @@ void BatchWindow::read_error() {
     // which they inherit -- to standard error, and it writes UTF-8.
     error_buffer_.append(process_.readAllStandardError());
     while (true) {
-        const int newline = error_buffer_.indexOf('\n');
-        if (newline < 0) break;
-        const QByteArray raw = error_buffer_.left(newline);
-        error_buffer_.remove(0, newline + 1);
+        // Either terminator ends a line. ffmpeg rewrites its statistics line in place
+        // with a bare '\r' and only closes it with '\n' at the end, so splitting on '\n'
+        // alone held every one of those lines back until the run finished -- the live
+        // numbers arrived in one lump at the end, which is the opposite of live.
+        int cut = error_buffer_.indexOf('\n');
+        const int cr = error_buffer_.indexOf('\r');
+        if (cut < 0 || (cr >= 0 && cr < cut)) cut = cr;
+        if (cut < 0) break;
+        const int skip = (error_buffer_.at(cut) == '\r' && cut + 1 < error_buffer_.size() &&
+                          error_buffer_.at(cut + 1) == '\n') ? 2 : 1;
+        const QByteArray raw = error_buffer_.left(cut);
+        error_buffer_.remove(0, cut + skip);
         const QString line = QString::fromUtf8(raw).trimmed();
         if (line.isEmpty()) continue;
 
@@ -1587,13 +1604,26 @@ void BatchWindow::open_compare() {
 // ---------------------------------------------------------------------------
 
 void BatchWindow::dragEnterEvent(QDragEnterEvent *event) {
-    if (event->mimeData()->hasUrls()) event->acceptProposedAction();
+    // Only a real file is of any use here. Accepting any URL let a dragged link reach
+    // the drop handler, which then had nothing to put in the input (see dropEvent).
+    if (event->mimeData()->hasUrls() && event->mimeData()->urls().first().isLocalFile()) {
+        event->acceptProposedAction();
+    }
 }
 
 void BatchWindow::dropEvent(QDropEvent *event) {
     const QList<QUrl> urls = event->mimeData()->urls();
     if (urls.isEmpty()) return;
-    input_->setText(urls.first().toLocalFile());
+    const QString path = urls.first().toLocalFile();
+    // A dragged link -- or anything else with no local path -- reached
+    // setText(toLocalFile()), and toLocalFile() is the empty string for those. The
+    // drop therefore wiped whatever was already typed in, with no message. Say so and
+    // leave the input alone.
+    if (path.isEmpty()) {
+        log_line(tr("拖入的不是本地文件，已忽略（需要本地路径）。"), QColor(255, 170, 60));
+        return;
+    }
+    input_->setText(path);
 }
 
 void BatchWindow::closeEvent(QCloseEvent *event) {
