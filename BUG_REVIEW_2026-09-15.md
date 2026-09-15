@@ -29,6 +29,10 @@
 
 **同日第二轮修复**（在 v6 内，未发布过故同名重打）：除上述 M19/H1 两处残留（M19 增加"连续 3 次死线仍无模块完成则强杀幸存者"；H1 旁的空编码分支不再丢音轨）外，还修了 S4、S5、S6、M16、M17、M18、L33、L35，见各条目行内注。
 
+**同日第四轮修复**（中低档精选，同一 v6 内）：M7（`--flow-only` 改为解析层字段，实测四位置参数下诊断路径生效、完整管线输出为 0 行）、M8（探测同时取 `avg_frame_rate`，优先使用；CFR 回归无变化）、L3（删掉主流程中未使用也未释放的 WIC 工厂与其 COM 初始化；`--dump-frames 30` 实测仍产出 30 张）、L29（复用守卫改为比较全部建期参数：style / render_preset / use_auto_mask / intensity / 各 tone 与 structure 强度）、M15（`upload_shared_colour_raw_rgb48` 补"上传范围须等于色彩纹理尺寸"的校验）。
+
+> **复核者补充勘误（第四轮）**：M15 的原表述"RAW SRV 要求源 buffer 带 `ALLOW_UNORDERED_ACCESS`"**不成立** —— 该要求针对 raw **UAV**；照此实现的检查让视频路径在第一帧整体失败（`upload_shared_colour_raw_rgb48: the source buffer needs ALLOW_UNORDERED_ACCESS…`），已撤回，仅保留尺寸校验。结论：注释义务那一半成立（该前置条件确实没人写明），但具体要求写错了。
+
 **同日第三轮修复**（"安排修"档，同一 v6 内）：M2（`State::wait()` 超时/Reset 失败后管线置死态快速失败；7 处 `Reset` 检查返回值）、M3（选卡收成 `core/gpu_detection.h` 的 `select_primary_gpu()`，`image_processor::start()` 优先采纳同一张卡并在采纳后不被更大卡顶掉；precompile 的 HIP device 0 经确认与之一致）、M4（`process_raw_rgb48` 补 pitch 下限守卫，0 仍按"未指定"处理）、M5（只有真正上传成功才绑定 motion 纹理，两处绑定都已改）、M6（GpuFlow 新增 `sync()`，仅 `WAIT_OBJECT_0` 算成功，超时落回 CPU 光流路径）、L12（子进程消失也刷新死线基准）、L13（`WaitForMultipleObjects` 失败详情改为同时写入 `straggler_detail`，不再被末尾计数覆盖）、L30（`frame_blit.cpp` 三处失败路径统一 `release_partial()`，不再漏放 vs/ps 与根签名）、L11 的一部分（`eval_index`、`full_copy_ready`、`image_has_signal` 已删；`resize_rgb48`、`Channel::clear`、`OutputFrame::blank`/`input_has_signal`、GpuFlow 的 `cb` 缓冲经核对同样无使用点，留待专门清理）。
 
 ---

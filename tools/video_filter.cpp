@@ -464,13 +464,14 @@ struct VideoParams {
     std::string audio_codec;
 };
 
-// ffprobe -> "width,height,r_frame_rate" csv line ("1920,1080,30000/1001").
+// ffprobe -> "width,height,r_frame_rate,avg_frame_rate" csv line plus the duration
+// ("1920,1080,30000/1001,30000/1001" then "12.34").
 bool probe_video(const std::wstring &input, VideoParams &params, std::string &error) {
     Pipe pipe;
     if (!pipe.make(false, true)) { error = "pipe creation failed"; return false; }
     ChildProcess child;
     std::wstring command = tool_cmd(true) + L" -v error -select_streams v:0 "
-                           L"-show_entries stream=width,height,r_frame_rate:format=duration -of csv=p=0 \"" +
+                           L"-show_entries stream=width,height,r_frame_rate,avg_frame_rate:format=duration -of csv=p=0 \"" +
                            input + L"\"";
     if (!spawn(command, Pipe{}, pipe, child, true)) {
         error = "ffprobe could not be started (is ffmpeg on PATH, or $FFMPEG_PATH set?)";
@@ -519,20 +520,36 @@ bool probe_video(const std::wstring &input, VideoParams &params, std::string &er
 
     unsigned w = 0, h = 0;
     char rate[64] = {};
+    char rate_avg[64] = {};
     double dur = 0.0;
-    if (sscanf(text.c_str(), "%u,%u,%63s\n%lf", &w, &h, rate, &dur) >= 3 && w && h) {
+    // avg_frame_rate is preferred over r_frame_rate: on a variable-frame-rate source
+    // the latter is the nominal rate while the average is what the timeline actually
+    // adds up to, and every frame-to-time conversion in this file (seek offsets, the
+    // encoder's -r, the duration arithmetic) is built from params.fps. Taking the
+    // nominal rate made the stream and the container disagree, which shows up as
+    // drift on VFR sources.
+    auto rate_of = [](const char *value, double &out) {
+        unsigned num = 0, den = 1;
+        if (sscanf(value, "%u/%u", &num, &den) == 2 && num && den) out = (double)num / den;
+        else if (sscanf(value, "%u", &num) == 1 && num) out = (double)num;
+    };
+    if (sscanf(text.c_str(), "%u,%u,%63s,%63s\n%lf", &w, &h, rate, rate_avg, &dur) >= 4 && w && h) {
         params.width = w;
         params.height = h;
         params.duration = dur;
-        unsigned num = 0, den = 1;
-        if (sscanf(rate, "%u/%u", &num, &den) == 2 && num && den) params.fps = (double)num / den;
-        else if (sscanf(rate, "%u", &num) == 1 && num) params.fps = (double)num;
-    } else if (sscanf(text.c_str(), "%u,%u,%63s", &w, &h, rate) == 3 && w && h) {
+        if (rate_avg[0]) rate_of(rate_avg, params.fps);
+        if (params.fps <= 0) rate_of(rate, params.fps);
+    } else if (sscanf(text.c_str(), "%u,%u,%63s,%63s", &w, &h, rate, rate_avg) == 4 && w && h) {
         params.width = w;
         params.height = h;
-        unsigned num = 0, den = 1;
-        if (sscanf(rate, "%u/%u", &num, &den) == 2 && num && den) params.fps = (double)num / den;
-        else if (sscanf(rate, "%u", &num) == 1 && num) params.fps = (double)num;
+        if (rate_avg[0]) rate_of(rate_avg, params.fps);
+        if (params.fps <= 0) rate_of(rate, params.fps);
+    } else if (sscanf(text.c_str(), "%u,%u,%63s\n%lf", &w, &h, rate, &dur) >= 3 && w && h) {
+        // An ffprobe too old to report avg_frame_rate: the nominal rate is all there is.
+        params.width = w;
+        params.height = h;
+        params.duration = dur;
+        rate_of(rate, params.fps);
     } else {
         error = "could not parse ffprobe output: " + text;
         return false;
@@ -1238,6 +1255,11 @@ struct Options {
     int yield_ms = 1; // ms to yield per frame to prevent TDR and keep DWM responsive
     CompositeOptions comp_opts;
     std::string parallel_mode = "auto";
+    // --flow-only has to be a parsed field, not a rescan of argv: the scan started at
+    // a fixed index, so on a command line that omitted [runtime] [nvapi] the flag was
+    // never seen and the run quietly did the full network pass instead of the
+    // diagnostic it was asked for -- the opposite of the flag's purpose.
+    bool flow_only = false;
     bool is_child_chunk = false;
     double chunk_start_sec = 0.0;
     double chunk_duration_sec = 0.0;
@@ -1350,8 +1372,8 @@ bool parse_args(int argc, char **argv, Options &options) {
             const char *v = need("--dlss-model-preset"); if (!v) return false;
             options.dlss_model_preset = v;
         } else if (arg == "--flow-only") {
-            // Diagnostic short-circuit handled later in run_main_once; just
-            // accept the flag here.
+            // Diagnostic short-circuit handled later in run_main_once.
+            options.flow_only = true;
         } else if (arg == "--intensity") {
             const char *v = need("--intensity"); if (!v) return false;
             options.settings.intensity = (float)atof(v);
@@ -2591,9 +2613,7 @@ static int run_main_once(int argc, char **argv) {
     // --flow-only diagnostic: decode and run the motion estimator without the
     // network (blank-race immune), printing per-frame flow statistics.
     {
-        bool flow_only = false;
-        for (int i = 7; i < argc; ++i)
-            if (!strcmp(argv[i], "--flow-only")) flow_only = true;
+        const bool flow_only = options.flow_only;
         if (flow_only) {
             CpuFlow fg;
             const size_t fbytes = (size_t)model_w * model_h * 6;
@@ -2672,16 +2692,14 @@ static int run_main_once(int argc, char **argv) {
         return 1;
     }
 
-    IWICImagingFactory *wic = nullptr;
-    bool dump_ok = options.dump_dir.empty();
+    // The frame dump lives in the encoder thread, which creates its own factory and
+    // pairs its own CoInitialize/CoUninitialize (see the writer thread below). The
+    // copy that used to sit here created a factory and a dump_ok flag for the main
+    // flow, read neither, released neither -- and left this thread's COM apartment
+    // initialised with nothing to uninitialise it. The directory still has to exist
+    // before the writer starts, so that part stays.
     if (!options.dump_dir.empty()) {
         CreateDirectoryW(options.dump_dir.c_str(), nullptr); // may already exist; ignore
-        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                       IID_PPV_ARGS(&wic))))
-            dump_ok = true;
-        else
-            fprintf(stderr, "[warn] WIC unavailable, --dump-frames disabled\n");
     }
 
     // --- the frame loop ---------------------------------------------------

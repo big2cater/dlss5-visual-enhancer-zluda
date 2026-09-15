@@ -1070,7 +1070,21 @@ bool create_feature(const FeatureDesc &desc) {
         desc.render_height == g.current.render_height &&
         desc.output_width == g.current.output_width &&
         desc.output_height == g.current.output_height &&
-        desc.perf_quality == g.current.perf_quality && desc.create_flags == g.current.create_flags) {
+        desc.perf_quality == g.current.perf_quality && desc.create_flags == g.current.create_flags &&
+        // Everything below is create-time state: set_create_params_nr sends it to the
+        // snippet once, when the feature is built, and nothing updates a live feature
+        // when it changes. The old guard compared only the sizes and the quality, so a
+        // changed render preset -- or style, or auto-mask, or any of the strengths --
+        // fell through to this reuse branch, which then recorded the new value as if
+        // it had been applied. The user went on getting the old network, silently.
+        desc.neural.style == g.current.neural.style &&
+        desc.neural.render_preset == g.current.neural.render_preset &&
+        desc.neural.use_auto_mask == g.current.neural.use_auto_mask &&
+        desc.neural.intensity == g.current.neural.intensity &&
+        desc.neural.global_tone_strength == g.current.neural.global_tone_strength &&
+        desc.neural.local_tone_strength == g.current.neural.local_tone_strength &&
+        desc.neural.local_structure_strength == g.current.neural.local_structure_strength &&
+        desc.neural.skin_structure_strength == g.current.neural.skin_structure_strength) {
         g.current.neural = desc.neural;
         g.current.max_passes = desc.max_passes;
         return true;
@@ -1689,6 +1703,25 @@ bool upload_shared_colour_raw_rgb48(ID3D12Resource *src_buffer, unsigned width, 
     if (!src_buffer || !width || !height || !g.color.resource) {
         set_error("upload_shared_colour_raw_rgb48: invalid buffer or colour resource");
         return false;
+    }
+    // The view frame_blit builds over this buffer is a raw SRV, not a raw UAV.
+    // D3D12 requires ALLOW_UNORDERED_ACCESS for the latter; a check for the flag went
+    // in here and took the whole video path down on its first frame, because the
+    // buffers the callers pass are upload heaps with no UAV access at all -- which is
+    // the shape that has always worked. So this states the contract and stops there:
+    // a raw, read-only view of a buffer that holds width*height*6 bytes of rgb48.
+    // (The requirement the note in the review described applies to raw UAVs.)
+    // And the extent has to be the colour texture's own: the pass is dispatched with
+    // these numbers over that texture. upload_shared_colour has always compared the
+    // rows it was given against the array it writes; this path did not.
+    if (g.cu.cuArrayGetDescriptor && g.color.level0) {
+        CUDA_ARRAY_DESCRIPTOR ad{};
+        if (g.cu.cuArrayGetDescriptor(&ad, g.color.level0) == CUDA_SUCCESS &&
+            (ad.Width != width || ad.Height != height)) {
+            set_error("upload_shared_colour_raw_rgb48: extent %ux%u does not match the colour "
+                      "texture %zux%zu", width, height, ad.Width, ad.Height);
+            return false;
+        }
     }
     if (!frame_blit::init(g.device)) {
         set_error("%s", frame_blit::last_error());
