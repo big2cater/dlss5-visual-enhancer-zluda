@@ -301,18 +301,13 @@ struct InputFrame {
     enhancer::Image motion;
     bool reset = false;
     bool is_eos = false;
-    // Does this frame carry visible content? Sampled from the decoded rgb48
-    // bytes in the reader: fade-in openings start from pure black, and a
-    // black output for a black input is the network doing its job -- the
-    // blank verdict only means failure when the input carries signal.
-    bool input_has_signal = false;
-    // The same sample's actual peak, in the sRGB-encoded 16-bit space the decoder
-    // reads. input_has_signal answers "could a black output be legitimate here",
-    // and at a fade-in boundary that answer is yes for frames whose own content is
-    // still almost black -- so it cannot be the only thing standing between a
-    // dark scene and a false race verdict. This is what lets the gate ask the
-    // stricter question: is the input bright enough that no correct output could
-    // be this dark?
+    // Does this frame carry enough light that a black output would be a fault rather
+    // than a dark scene? Sampled from the decoded rgb48 bytes in the reader: a fade-in
+    // opens from pure black, and a black output for a black input is the network doing
+    // its job. The sample's peak is kept in the sRGB-encoded 16-bit space the decoder
+    // reads, and the gate then asks the strict question -- is the input bright enough
+    // that no correct output could be this dark? The bare "did it carry signal" test
+    // is true from the first frame of a fade-in, which is why it is not kept here.
     unsigned input_max16 = 0;
     ID3D12Resource *upload_buf = nullptr;
     void *mapped_ptr = nullptr;
@@ -335,7 +330,6 @@ struct OutputFrame {
     double ms = 0.0;
     bool is_eos = false;
     bool blank = false;
-    bool input_has_signal = false;
     // Carried through so the encoder-stage gate can apply the same brightness
     // rule as the processing-stage one instead of the bare signal test.
     unsigned input_max16 = 0;
@@ -1097,26 +1091,6 @@ void half_rgba_to_rgb48(const enhancer::Image &image, unsigned char *rgb48, bool
     blank = (max_ch < 0.005f) || (mean < 0.002 && variance < 0.0001);
 }
 
-void resize_rgb48(const unsigned char *src, unsigned sw, unsigned sh,
-                  unsigned char *dst, unsigned dw, unsigned dh) {
-    const uint16_t *in = (const uint16_t *)src; uint16_t *out = (uint16_t *)dst;
-    WorkerPool::instance().parallel_for(dh, [&](size_t y_start, size_t y_end, size_t /*tid*/) {
-        for (size_t y = y_start; y < y_end; ++y) {
-            double fy = ((double)y + 0.5) * sh / dh - 0.5; int y0 = (int)floor(fy); double ty = fy - y0;
-            if (y0 < 0) { y0 = 0; ty = 0; } if (y0 >= (int)sh - 1) { y0 = (int)sh - 1; ty = 0; } int y1 = (y0 + 1 < (int)sh) ? y0 + 1 : y0;
-            for (unsigned x = 0; x < dw; ++x) {
-                double fx = ((double)x + 0.5) * sw / dw - 0.5; int x0 = (int)floor(fx); double tx = fx - x0;
-                if (x0 < 0) { x0 = 0; tx = 0; } if (x0 >= (int)sw - 1) { x0 = (int)sw - 1; tx = 0; } int x1 = (x0 + 1 < (int)sw) ? x0 + 1 : x0;
-                for (int c = 0; c < 3; ++c) {
-                    double a = in[((size_t)y0 * sw + x0) * 3 + c] * (1 - tx) + in[((size_t)y0 * sw + x1) * 3 + c] * tx;
-                    double b = in[((size_t)y1 * sw + x0) * 3 + c] * (1 - tx) + in[((size_t)y1 * sw + x1) * 3 + c] * tx;
-                    out[((size_t)y * dw + x) * 3 + c] = (uint16_t)(a * (1 - ty) + b * ty + 0.5);
-                }
-            }
-        }
-    });
-}
-
 // --------------------------------------------------------------------------
 // Scene-cut detection (reset trigger)
 // --------------------------------------------------------------------------
@@ -1741,7 +1715,7 @@ struct GpuFlow {
     ID3D12RootSignature *root = nullptr;
     ID3D12PipelineState *pso = nullptr;
     ID3D12DescriptorHeap *heap = nullptr;
-    ID3D12Resource *prev = nullptr, *cur = nullptr, *out = nullptr, *full_out = nullptr, *history = nullptr, *readback = nullptr, *cb = nullptr;
+    ID3D12Resource *prev = nullptr, *cur = nullptr, *out = nullptr, *full_out = nullptr, *history = nullptr, *readback = nullptr;
     unsigned fw = 0, fh = 0, qw = 0, qh = 0;
     std::vector<unsigned> prev_luma;
     bool ready = false, has_prev = false;
@@ -1756,7 +1730,7 @@ struct GpuFlow {
         if (fence && fence_event && fence->GetCompletedValue() < fence_value) {
             fence->SetEventOnCompletion(fence_value, fence_event); WaitForSingleObject(fence_event, 3000);
         }
-        rel(prev); rel(cur); rel(out); rel(full_out); rel(history); rel(readback); rel(cb); rel(heap); rel(pso); rel(root);
+        rel(prev); rel(cur); rel(out); rel(full_out); rel(history); rel(readback); rel(heap); rel(pso); rel(root);
         rel(cmd); rel(allocator); rel(fence); rel(queue); rel(device);
         if (fence_event) { CloseHandle(fence_event); fence_event = nullptr; }
         ready = false; has_prev = false; prev_luma.clear();
@@ -1828,9 +1802,9 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
         rel(adapter); factory->Release(); ready=true; return resize();
     }
     bool resize() {
-        rel(prev); rel(cur); rel(out); rel(readback); rel(cb);
+        rel(prev); rel(cur); rel(out); rel(readback);
         auto buffer=[&](UINT64 bytes,D3D12_HEAP_TYPE ht,D3D12_RESOURCE_FLAGS flags,D3D12_RESOURCE_STATES st,ID3D12Resource **r){ D3D12_HEAP_PROPERTIES hp{}; hp.Type=ht; D3D12_RESOURCE_DESC d{}; d.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER; d.Width=bytes; d.Height=1; d.DepthOrArraySize=1; d.MipLevels=1; d.SampleDesc.Count=1; d.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR; d.Flags=flags; return device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,st,nullptr,IID_PPV_ARGS(r)); };
-        UINT64 n=(UINT64)qw*qh*4; if(FAILED(buffer(n,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,&prev)) || FAILED(buffer(n,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,&cur)) || FAILED(buffer((UINT64)qw*qh*8,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,&out)) || FAILED(buffer((UINT64)fw*fh*4,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,&full_out)) || FAILED(buffer((UINT64)fw*fh*4,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,&history)) || FAILED(buffer((UINT64)qw*qh*8,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST,&readback)) || FAILED(buffer(256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,&cb))) return false;
+        UINT64 n=(UINT64)qw*qh*4; if(FAILED(buffer(n,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,&prev)) || FAILED(buffer(n,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,&cur)) || FAILED(buffer((UINT64)qw*qh*8,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,&out)) || FAILED(buffer((UINT64)fw*fh*4,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,&full_out)) || FAILED(buffer((UINT64)fw*fh*4,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,&history)) || FAILED(buffer((UINT64)qw*qh*8,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST,&readback))) return false;
         return true;
     }
     // Signal the fence and wait for it. A timeout means the GPU has not drained, and
@@ -2277,6 +2251,12 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
         }
     }
 
+    // The warmup discard below is a frame count derived from a duration, while the shard
+    // boundary the workers are told to seek to is that same duration. If the decoder's
+    // first delivered frame does not land exactly on split_sec, round() is off by one and
+    // the join gains or loses a single frame there. Both values come from split_sec for
+    // that reason; removing the remaining sensitivity needs PTS carried through the raw
+    // frame pipe, which this path does not have.
     std::wstring cmd0 = build_worker_cmd(out_part0, 0.0, split_sec, 0.0, 0, w0_max);
     std::wstring cmd1 = build_worker_cmd(out_part1, split_sec, total_dur - split_sec, warmup_sec,
                                          (unsigned)std::round(split_sec * params.fps), w1_max);
@@ -2606,6 +2586,10 @@ static int run_main_once(int argc, char **argv) {
         SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
         start_s = std::max(0.0, options.chunk_start_sec - options.warmup_sec);
         dur_s = options.chunk_duration_sec + (options.chunk_start_sec - start_s);
+        // A frame count computed from a duration, so it is one frame off whenever the
+        // decoder's first delivered frame does not sit exactly on chunk_start_sec -- and
+        // one frame is exactly what the join at this boundary gains or loses. See the
+        // note in the parallel orchestrator for why it is not fixed by rounding harder.
         options.warmup_discard_frames = (unsigned)std::round((options.chunk_start_sec - start_s) * params.fps);
     }
 
@@ -2890,7 +2874,6 @@ static int run_main_once(int argc, char **argv) {
                 const unsigned b = dst_raw[p + 4] | (unsigned)(dst_raw[p + 5] << 8);
                 max16 = std::max({max16, r, g, b});
             }
-            frame->input_has_signal = max16 > 7000; // sRGB ~27/255: below this a correct output is itself under the blank bar, and the two are indistinguishable
             frame->input_max16 = max16;
 
             // Reset determination
@@ -2996,9 +2979,17 @@ static int run_main_once(int argc, char **argv) {
 
             if (!options.dump_dir.empty() && dump_ok) {
                 wchar_t name[512];
-                swprintf(name, 512, L"%s\\frame_%05u.png", options.dump_dir.c_str(), display_idx);
-                if (!dump_png(wic, name, frame->out))
+                const int written =
+                    swprintf(name, 512, L"%s\\frame_%05u.png", options.dump_dir.c_str(), display_idx);
+                // swprintf returns -1 when the result does not fit. The old code passed
+                // the truncated name straight on, so a long dump directory wrote every
+                // frame to the same mangled path instead of saying anything.
+                if (written < 0) {
+                    fprintf(stderr, "[warn] dump directory too long for frame %u; not dumped\n",
+                            display_idx);
+                } else if (!dump_png(wic, name, frame->out)) {
                     fprintf(stderr, "[warn] could not dump frame %u\n", display_idx);
+                }
             }
 
             frames_written_count.fetch_add(1);
@@ -3164,7 +3155,6 @@ static int run_main_once(int argc, char **argv) {
         out_frame->index = in_frame->index;
         out_frame->ms = ms;
         out_frame->is_eos = false;
-        out_frame->input_has_signal = in_frame->input_has_signal;
         out_frame->input_max16 = in_frame->input_max16;
 
         if (options.comp_opts.is_active()) {

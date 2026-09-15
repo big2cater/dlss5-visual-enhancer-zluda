@@ -112,3 +112,13 @@ target_link_libraries(processor_smoke PRIVATE d3d12 dxgi d3dcompiler windowscode
 target_compile_definitions(processor_smoke PRIVATE UNICODE _UNICODE NOMINMAX)
 target_compile_options(processor_smoke PRIVATE /utf-8)
 set_target_properties(processor_smoke PROPERTIES AUTOMOC OFF)
+
+# The RDNA 4 predicate decides which cards get HSA_OVERRIDE_GFX_VERSION=12.0.1. Getting
+# it wrong bricked precompilation on the RX 7600, and that shipped, because nothing ran
+# this test -- tools/test_rdna4_detect.cpp says as much in its own header. It is a
+# header-only check with no libraries to link, so there is no reason for it not to be
+# part of the build: build.bat runs ctest, and it is the gate from then on.
+enable_testing()
+add_executable(test_rdna4_detect tools/test_rdna4_detect.cpp)
+target_compile_options(test_rdna4_detect PRIVATE /utf-8)
+add_test(NAME rdna4_detect COMMAND test_rdna4_detect)

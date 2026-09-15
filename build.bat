@@ -31,11 +31,37 @@ if not exist "%QT_DIR%\lib\cmake\Qt6" (
     exit /b 1
 )
 call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul
+REM vcvars failing used to surface much later as a compiler that "is not recognized",
+REM which reads like a broken toolchain rather than a wrong VS path.
+if errorlevel 1 (
+    echo The Visual Studio environment script is not at "%VS%\VC\Auxiliary\Build\vcvars64.bat".
+    echo Set VS to the Visual Studio installation folder and run this again.
+    exit /b 1
+)
+where cmake >nul 2>nul
+if errorlevel 1 (
+    echo cmake was not found on PATH. Install CMake, put it on PATH, and run this again.
+    exit /b 1
+)
+where ninja >nul 2>nul
+if errorlevel 1 (
+    echo ninja was not found on PATH. Install Ninja, put it on PATH, and run this again.
+    exit /b 1
+)
 cd /d %~dp0
 cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%QT_DIR%"
 if errorlevel 1 exit /b 1
 cmake --build build
 if errorlevel 1 exit /b 1
+
+REM The RDNA 4 predicate test runs here. It is the only automated check that would
+REM have caught the 0x7480..0x74DF mistake that shipped once (see the header of
+REM tools/test_rdna4_detect.cpp): the predicate chooses which cards get the gfx12
+REM override, and getting it wrong breaks precompilation on the card it names.
+pushd build
+ctest -C Release --output-on-failure
+if errorlevel 1 (popd & exit /b 1)
+popd
 "%QT_DIR%\bin\windeployqt.exe" --release --compiler-runtime --no-translations --no-opengl-sw --no-system-dxc-compiler --no-network --exclude-plugins qsvg build\dlssnr_gui.exe
 if errorlevel 1 exit /b 1
 

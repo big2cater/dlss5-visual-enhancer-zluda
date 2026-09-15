@@ -33,6 +33,10 @@
 
 **同日第五轮修复**（低档收尾，同一 v6 内）：L1（`upscale4` 的 `qh-2`/`qw-2` 无符号回绕，加提前返回；该分支会被编译器消除，价值在于参数变为变量时仍安全）、L2（补 `Pipe&&` 重载，不再依赖 MSVC 把临时量绑给非 const 左值引用的扩展）、L31（描述符堆环回的"每帧必 flush"契约写进注释，越界请求返回失败）、S7（`Budget ≤ CurrentUsage` 时 avail 如实置 0，不再用 `vram_mb/2` 放行 4K 双进程）、S8（framebench 改 `wmain`、拒绝 `frames<=0`；`tests/processor_smoke.cpp` 同款转换）、S9（launchbench 检查 PTX 打开与每次 `cuLaunchKernel` 返回值）。实测：`frames=0` ⇒ exit 2；中文路径越过读取阶段；缺失 `.ptx` ⇒ "cannot open"、exit 1。
 
+**同日第六轮修复**（门禁、构建脚本与 GUI 低档项，同一 v6 内）：S10（`test_rdna4_detect` 接入 CMake/CTest，并由 `build.bat` 在构建后运行 —— 实测 `1/1 Passed`、`100% tests passed`）、S11（vcvars/cmake/ninja 缺失时给出明确报错；`/XF *.txt` 经清点后维持，因 build\ 下 .txt 全是开发日志）、L39（设置改到 `%APPDATA%\<org>\<app>` 并一次性迁移旧 ini）、L37（单帧对比临时文件按 PID 命名并清扫陈旧残留）、L11（删零调用的 `resize_rgb48`、只写不读的 `input_has_signal`×2、GpuFlow 从未绑定的 256 字节 cb；报告所列 `image_has_signal`/`full_copy_ready`/`eval_index` 在本仓并不存在，全仓 0 命中）、L10（`swprintf` 截断改为报错提示）。
+
+> **复核者如实记录一处未修**：L10 后半（分片接缝 warmup 丢弃帧数由"时长 × 帧率"得出，解码器首帧未必正落在该时刻 ⇒ 接缝可能多/少**恰好一帧**）**未修**。根除需要把 PTS 穿过裸帧管道，本路径没有；已在 `video_filter.cpp` 两处写明成因与边界，不做"看起来修好了"的处理。
+
 > **复核者对 L32 的否决**：报告建议给 `NVSDK_NGX_Parameter` 补虚析构。**不采纳** —— 该结构体镜像 NVIDIA 的 vtable 顺序（文件顶部 [LAYOUT] 注释已写明"nothing here may be reordered"），加虚析构会插入一个槽位并使其后每个入口错位。已改为在类上方写明**为什么不能加**，这才是该条的正确处置。
 
 > **复核者更正自己的一处误判**：我曾称 S8/S9 引用的 `rv_framebench.cpp` / `rv_launchbench.cpp` "在本仓不存在、路径漂移" —— **错在我**：报告的路径是 `tools/framebench.cpp` / `tools/launchbench.cpp`，两个文件都在，是我的检索模式串错了前缀。报告该处无误。

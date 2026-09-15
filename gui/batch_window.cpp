@@ -10,12 +10,14 @@
 #include <QColor>
 #include <QComboBox>
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
 #include <QDoubleSpinBox>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QUrl>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFontMetrics>
@@ -95,7 +97,22 @@ QWidget *slider_percent_row(int maximum, int value, QSlider *&slider, QLabel *&r
 }
 
 QString settings_path() {
-    return QCoreApplication::applicationDirPath() + QStringLiteral("/dlssnr_gui.ini");
+    // These settings used to live next to the exe. That works in a portable folder and
+    // fails silently everywhere else: under Program Files the write is denied, the
+    // setting is gone, and nothing reports it -- from the user's side the GUI simply
+    // forgets everything between runs. AppConfigLocation (%APPDATA%\<org>\<app>) is
+    // writable wherever the program sits. QSettings does not create the directory.
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    if (dir.isEmpty()) {
+        return QCoreApplication::applicationDirPath() + QStringLiteral("/dlssnr_gui.ini");
+    }
+    QDir().mkpath(dir);
+    const QString target = dir + QStringLiteral("/dlssnr_gui.ini");
+    // One-time carry-over: an ini beside the exe is where every earlier version kept
+    // its settings, and starting from defaults would read as a regression.
+    const QString legacy = QCoreApplication::applicationDirPath() + QStringLiteral("/dlssnr_gui.ini");
+    if (!QFileInfo::exists(target) && QFileInfo::exists(legacy)) QFile::copy(legacy, target);
+    return target;
 }
 
 } // namespace
@@ -1101,12 +1118,29 @@ void BatchWindow::start_frame_hold_compare() {
 
     const QString source = input_->text().trimmed();
     const QString temp_dir = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
-    frame_hold_out_ = temp_dir + QStringLiteral("/dlssnr_frame_hold_out.png");
+    // These two files used to have fixed names, which meant two running copies of the
+    // GUI overwrote each other's frames -- the comparison then showed one instance's
+    // input against the other's output -- and nothing ever deleted them, so they
+    // accumulated one pair per run for as long as the folder survived. Naming them
+    // after this process fixes the collision; the sweep below bounds the growth, and
+    // skips anything recent so a second live instance is never touched.
+    const QString hold_tag = QStringLiteral("dlssnr_frame_hold_%1")
+                                 .arg(QCoreApplication::applicationPid());
+    {
+        QDir temp(temp_dir);
+        const QDateTime cutoff = QDateTime::currentDateTime().addSecs(-3600);
+        const QStringList stale = temp.entryList({QStringLiteral("dlssnr_frame_hold_*.png")}, QDir::Files);
+        for (const QString &name : stale) {
+            const QFileInfo info(temp.filePath(name));
+            if (info.lastModified() < cutoff) temp.remove(name);
+        }
+    }
+    frame_hold_out_ = temp_dir + QStringLiteral("/") + hold_tag + QStringLiteral("_out.png");
 
     if (image_mode_->isChecked() || is_image(source)) {
         frame_hold_in_ = source;
     } else {
-        frame_hold_in_ = temp_dir + QStringLiteral("/dlssnr_frame_hold_in.png");
+        frame_hold_in_ = temp_dir + QStringLiteral("/") + hold_tag + QStringLiteral("_in.png");
         log_line(tr(">>> 正在从视频截取单帧..."), QColor(135, 206, 250));
         QProcess extract;
         extract.start(QStringLiteral("ffmpeg"),
