@@ -3,12 +3,12 @@
 > 在 AMD GPU（RDNA 3 / RDNA 4）上通过深度优化版 ZLUDA 满血运行 NVIDIA DLSS 5 Neural Rendering (DLSS-NR) 的图片增强与超清视频降噪工具。
 > High-performance DLSS 5 Neural Rendering image enhancement and video denoising pipeline running on AMD GPUs via ZLUDA.
 >
-> 最新发布：**v2026.09.14-v7**（v6 从未单独发布，本包一并首发其全部修复）—— v7 修掉一处**失效的修复**：v6 声称的"VFR 源改用平均帧率"实为死代码（sscanf 的 `%s` 不能在逗号处截断，`avg_frame_rate` 分支从未执行过，fps 一直取标称帧率），现已改为手工按逗号切分并固化 7 组解析断言进构建门禁；GPU 光流栅栏超时后管线退役（此前下一帧会对仍在执行中的 allocator 调 `Reset()`，属未定义行为）、CPU 运动上传的 allocator Reset 补上管线守卫、逐帧空检去掉每帧堆分配、raw 路径运动 `Map()` 失败改为硬失败。v6 修掉 CUDA 层一处静默失败（网络输出为空时曾被当作"成功"返回；现在**每帧**校验输出与输入采样，会报错并让调用方重试，同时不会把暗场误判成故障）、预热尾部不再无声卡住也不误杀慢机（连续 60 分钟无模块完成才触发，且只结束已停止消耗 CPU 的子进程）、GPU 自动识别结果写入 `%TEMP%\dlssnr_gpu_autoconfig.log`；并按全量代码审查修复了并行模式音频导致整段白做、运动上传 `Map()` 空指针崩溃、空白阈值常量笔误，以及 GUI（窗口标题版本号、RDNA 4 提示判据、对比/预览的 ffprobe 不再泄漏且同一输入只探测一次）与随包脚本（`fix_tdr.ps1` 备份带时间戳、备份失败即中止、TdrLevel=0 需确认；`diagnose_gpu.ps1` 不再把 HIP `count=0` 显示为绿色）等条目，并修掉"设备移除/栅栏超时后带病继续"（指令列表与 GPU 光流）、"混合显卡选卡不一致"（D3D12 与自动配置现在选同一张卡）、"运动矢量沿用上一帧"、`--flow-only` 诊断开关被静默吞掉、复用 feature 时吞掉创建期参数与 `frame_blit` 初始化失败泄漏着色器，显存预算被占满时不再放行 4K 双进程、基准工具不再报"假成功"，以及 RDNA4 判据自测接入构建门禁、设置改到用户可写目录、GUI 单帧对比临时文件不再互踩、单图重复次数默认值三处统一、ffmpeg 实时统计行不再被压到结束时才显示、拖入链接不再清空已填输入等条目（详见随包说明）；上一版（v5）含 MMA 配对融合提速（RX 7900 XT @640×360：单帧 87 → 67 ms）、"淡入黑场片头被误判为竞态"的判定修复、空白判定在编码 / 单图 / 处理器三处的同类补齐，以及单图明亮门槛的上调（余量 4.8% → 47%）；并修复 **RDNA4（gfx12）预热必然崩溃**的问题（详见随包说明）。
+> 最新发布：**v2026.09.14-v8** —— 修复"暗场景 + 小面积点光源"必然导致整轮转换失败的误判（用户实测：某预告片在 79% 处反复失败，六次重试全灭）：空白判定门的峰值检测与统计共用**每隔 8 像素**的稀疏采样，固定网格恰好永远扫不到警灯这类小面积高光，整个 1080p 帧被误判为空白——实测导出帧高光达空白阈值的 **29 倍**；且网格固定 + 光源位置固定 ⇒ 每次重试都在同一场景必然复现，重试机制完全无效。现峰值检测改为**全像素 FP16 位比较扫描**（亚毫秒开销），判定门移到合成**之后**（结论描述实际编码的帧），门触发时先原地恢复（强制重置 + 重评估），并新增**确定性失败检测**（连续两轮同帧失败即止损并给出明确诊断，不再白烧几十分钟）。实测故障段 106 帧 exit 0 全通过（修复前 6/6 失败）。v7 修掉一处**失效的修复**：v6 声称的"VFR 源改用平均帧率"实为死代码（sscanf 的 `%s` 不能在逗号处截断，`avg_frame_rate` 分支从未执行过，fps 一直取标称帧率），现已改为手工按逗号切分并固化 7 组解析断言进构建门禁；GPU 光流栅栏超时后管线退役（此前下一帧会对仍在执行中的 allocator 调 `Reset()`，属未定义行为）、CPU 运动上传的 allocator Reset 补上管线守卫、逐帧空检去掉每帧堆分配、raw 路径运动 `Map()` 失败改为硬失败。v6 修掉 CUDA 层一处静默失败（网络输出为空时曾被当作"成功"返回；现在**每帧**校验输出与输入采样，会报错并让调用方重试，同时不会把暗场误判成故障）、预热尾部不再无声卡住也不误杀慢机（连续 60 分钟无模块完成才触发，且只结束已停止消耗 CPU 的子进程）、GPU 自动识别结果写入 `%TEMP%\dlssnr_gpu_autoconfig.log`；并按全量代码审查修复了并行模式音频导致整段白做、运动上传 `Map()` 空指针崩溃、空白阈值常量笔误，以及 GUI（窗口标题版本号、RDNA 4 提示判据、对比/预览的 ffprobe 不再泄漏且同一输入只探测一次）与随包脚本（`fix_tdr.ps1` 备份带时间戳、备份失败即中止、TdrLevel=0 需确认；`diagnose_gpu.ps1` 不再把 HIP `count=0` 显示为绿色）等条目，并修掉"设备移除/栅栏超时后带病继续"（指令列表与 GPU 光流）、"混合显卡选卡不一致"（D3D12 与自动配置现在选同一张卡）、"运动矢量沿用上一帧"、`--flow-only` 诊断开关被静默吞掉、复用 feature 时吞掉创建期参数与 `frame_blit` 初始化失败泄漏着色器，显存预算被占满时不再放行 4K 双进程、基准工具不再报"假成功"，以及 RDNA4 判据自测接入构建门禁、设置改到用户可写目录、GUI 单帧对比临时文件不再互踩、单图重复次数默认值三处统一、ffmpeg 实时统计行不再被压到结束时才显示、拖入链接不再清空已填输入等条目（详见随包说明）；上一版（v5）含 MMA 配对融合提速（RX 7900 XT @640×360：单帧 87 → 67 ms）、"淡入黑场片头被误判为竞态"的判定修复、空白判定在编码 / 单图 / 处理器三处的同类补齐，以及单图明亮门槛的上调（余量 4.8% → 47%）；并修复 **RDNA4（gfx12）预热必然崩溃**的问题（详见随包说明）。
 
 ![Platform](https://img.shields.io/badge/platform-Windows_10%2F11-0078D4)
 ![GPU](https://img.shields.io/badge/GPU-AMD%20Radeon%20(RDNA3%20%2F%20RDNA4)-red)
 ![Acceleration](https://img.shields.io/badge/backend-ZLUDA%20%2B%20HIP%20%2B%20D3D12-orange)
-![Release](https://img.shields.io/badge/release-v2026.09.14--v7-brightgreen)
+![Release](https://img.shields.io/badge/release-v2026.09.14--v8-brightgreen)
 
 ---
 
@@ -106,7 +106,7 @@
 - **FFmpeg 支持**：视频处理需要 `ffmpeg.exe` 与 `ffprobe.exe`，请将其所在目录添加至系统环境变量 `PATH`。
 
 ### 2. 使用方法
-1. 从 [Releases 页面](https://github.com/big2cater/dlss5-visual-enhancer-zluda/releases) 下载最新的发布包（例如 `DLSSNRFilter-v2026.09.14-v7-nodlssnr.zip`）；
+1. 从 [Releases 页面](https://github.com/big2cater/dlss5-visual-enhancer-zluda/releases) 下载最新的发布包（例如 `DLSSNRFilter-v2026.09.14-v8-nodlssnr.zip`）；
 2. 解压整个文件夹（**请解压至全英文路径**，不要单独拷贝某个 DLL）；
 3. **放置专有模型文件**：将合法的 `nvngx_dlssnr.dll`（推荐 Build 310.8.0）放入解压后的根目录（与 `video_filter.exe` / `dlssnr_gui.exe` 同级目录）；
 4. 双击运行 `dlssnr_gui.exe`（Qt 6 统一现代图形界面；视频批处理与单图增强都在这一个窗口里，旧单图界面已退役）；

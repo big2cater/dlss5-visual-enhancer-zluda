@@ -2098,17 +2098,65 @@ int run_image_mode(int argc, char **argv) {
 constexpr unsigned kBlankGateInput16 = 24000; // sRGB ~93/255, ~22x the blank bar
 constexpr int kBlankGateStreak = 3;
 
+// Deterministic-failure marker helpers. The failing frame index travels from
+// run to run through a sidecar next to the output, so the retry wrapper can
+// tell a random race (fails here in one run, there in the next) from a
+// content-deterministic one (field record: a dark scene with saturated point
+// lights blanked every fresh process at the same frames). Retrying the
+// deterministic kind burns minutes per attempt for nothing -- two consecutive
+// runs failing at near-identical frames stop the loop with an explicit message
+// instead of another respawn. Every blank gate records the frame; a clean run
+// clears the marker.
+static std::wstring fail_frame_path(const std::wstring &output) {
+    return output + L".failframe";
+}
+
+static void write_fail_frame(const std::wstring &output, unsigned frame) {
+    FILE *f = _wfopen(fail_frame_path(output).c_str(), L"wb");
+    if (!f) return;
+    fprintf(f, "%u", frame);
+    fclose(f);
+}
+
+static long read_fail_frame(const std::wstring &path) {
+    FILE *f = _wfopen(path.c_str(), L"rb");
+    if (!f) return -1;
+    long value = -1;
+    if (fscanf(f, "%ld", &value) != 1) value = -1;
+    fclose(f);
+    return value;
+}
+
 // True when the frame looks blank: luma mean near zero and almost no variance.
-// Samples every 8th pixel, so a 4K frame costs a few thousand half->float
-// conversions only.
+// The maximum is taken over EVERY pixel -- positive FP16 bits order like their
+// magnitudes, so it is a branch-free integer scan with no half->float
+// conversion. The max used to ride the same every-8th-pixel stride as the
+// statistics below, and a fixed sparse grid can straddle a small highlight
+// forever: a night scene with a police light read blank on every frame of
+// every retry (the highlight sat between the sampled columns, the gate
+// condemned a perfectly good render, and the process-level retries
+// reproduced the verdict deterministically). The statistics keep the sparse
+// stride -- a mean and a variance do not need dense sampling, only a peak does.
 bool output_is_blank(const enhancer::Image &image) {
     if (image.empty()) return true;
     const uint16_t *src = image.pixels.data();
     const size_t count = (size_t)image.width * image.height;
-    const size_t step = 8;
+    uint16_t peak_bits = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const uint16_t r = src[i * 4 + 0] & 0x7fff;
+        const uint16_t g = src[i * 4 + 1] & 0x7fff;
+        const uint16_t b = src[i * 4 + 2] & 0x7fff;
+        const uint16_t mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        if (mx > peak_bits) peak_bits = mx;
+    }
+    // The masked bit pattern of a NaN survives as a large value and converts to
+    // a NaN float, which fails every comparison below -- a NaN frame is never
+    // judged blank, exactly like before.
+    const float max_channel = enhancer::half_to_float(peak_bits);
+    if (!(max_channel < 0.005f)) return false; // a real highlight exists
     double sum = 0.0, sum_sq = 0.0;
     size_t samples = 0;
-    float max_channel = 0.0f;
+    const size_t step = 8;
     for (size_t i = 0; i < count; i += step) {
         const float r = enhancer::half_to_float(src[i * 4 + 0]);
         const float g = enhancer::half_to_float(src[i * 4 + 1]);
@@ -2118,7 +2166,6 @@ bool output_is_blank(const enhancer::Image &image) {
         // and reads as blank. All channels near zero is the actual signature
         // of a failed launch.
         const float mx = (std::max)((std::max)(r, g), b);
-        if (mx > max_channel) max_channel = mx;
         sum += mx;
         sum_sq += (double)mx * mx;
         ++samples;
@@ -2126,20 +2173,22 @@ bool output_is_blank(const enhancer::Image &image) {
     if (samples == 0) return true;
     const double mean = sum / (double)samples;
     const double variance = sum_sq / (double)samples - mean * mean;
-    // A true blank output from a failed GPU launch has max_channel near zero
-    // (< 0.005) and almost zero variance (< 0.0001). A valid dark
-    // photograph/screenshot keeps at least one channel with real highlights.
-    return (max_channel < 0.005f) || (mean < 0.002 && variance < 0.0001);
+    // A true blank output from a failed GPU launch has almost zero variance
+    // (< 0.0001) around a near-zero mean (< 0.002); reaching this branch at all
+    // means the dense scan found no highlight anywhere.
+    return mean < 0.002 && variance < 0.0001;
 }
 
 // The peak value in a linear half-float image, as raw FP16 bits (positive values
 // order the same as their magnitudes, so a bit comparison is a value comparison).
+// Dense, for the same reason output_is_blank's peak is: a sparse grid misses
+// exactly the small bright highlights these verdicts are about.
 uint16_t image_peak(const enhancer::Image &image) {
     if (image.empty()) return 0;
     const uint16_t *src = image.pixels.data();
     const size_t count = (size_t)image.width * image.height;
     uint16_t peak = 0;
-    for (size_t i = 0; i < count; i += 8) {
+    for (size_t i = 0; i < count; ++i) {
         const uint16_t r = src[i * 4 + 0] & 0x7fff;
         const uint16_t g = src[i * 4 + 1] & 0x7fff;
         const uint16_t b = src[i * 4 + 2] & 0x7fff;
@@ -2937,6 +2986,7 @@ static int run_main_once(int argc, char **argv) {
                             "[FAIL] frame %u: 输出空白而输入明亮（输入峰值 %u/65535，编码阶段）"
                             "——ZLUDA 竞态，交由外层重跑\n",
                             frame->index, frame->input_max16);
+                    write_fail_frame(options.output, frame->index);
                     failed = true;
                     retryable = true;
                     abort_pipeline.store(true);
@@ -3087,6 +3137,7 @@ static int run_main_once(int argc, char **argv) {
         if (!proc_ok) {
 
             fprintf(stderr, "[FAIL] frame %u: %s\n", in_frame->index, error.c_str());
+            write_fail_frame(options.output, in_frame->index);
             if (error.find("blank image") != std::string::npos) {
                 retryable = true;
             }
@@ -3098,6 +3149,20 @@ static int run_main_once(int argc, char **argv) {
                               std::chrono::steady_clock::now() - began)
                               .count();
         elapsed_total.store(elapsed_total.load() + ms);
+
+        // Post-composite runs BEFORE the blank gate, not after it. The gate's
+        // verdict must describe the frame that will actually be encoded: with
+        // shadow-protect below 1.0 the composite substitutes input pixels in
+        // deep shadows, so a network output the raw gate would call blank can
+        // arrive at the encoder perfectly watchable. Field record: a dark
+        // night scene with saturated point lights blanked the raw output in
+        // every fresh process, and the old order (gate -> composite) scrapped
+        // the whole run for frames the composite had already rescued. A race
+        // in brighter content survives the composite untouched and is still
+        // caught here.
+        if (options.comp_opts.is_active()) {
+            apply_post_composite(in_frame->in, out_frame->out, options.comp_opts);
+        }
 
         // Guard against the ZLUDA sticky race (a launch that silently no-ops
         // and leaves the frame black) -- but a black output only counts as
@@ -3111,7 +3176,58 @@ static int run_main_once(int argc, char **argv) {
         // the opening was enough to see it; with this rule the check is safe
         // anywhere, and a race that starts late -- after a long dark opening, or
         // on a shard whose opening is dark -- is caught like any other.
-        if (output_is_blank(out_frame->out)) {
+        bool blank_output = output_is_blank(out_frame->out);
+        if (blank_output && in_frame->input_max16 > kBlankGateInput16) {
+            // In-place recovery, tried before the run is condemned. The race is
+            // not only a first-shot coin flip: some content reproduces it in
+            // every fresh process at the same frames (a dark scene with
+            // saturated point lights did -- six attempts, same spot), so the
+            // outer process-level retry -- minutes per attempt -- cannot save
+            // that run. A forced history reset plus a re-evaluation of THIS
+            // frame sometimes does; when it does, the blank frame never reaches
+            // the encoder and the run continues. When it does not, the streak
+            // logic below fails the run exactly as before -- the backstop is
+            // unchanged, and recovery is attempted once per streak episode so a
+            // hopeless episode costs three extra evaluations, not nine.
+            bool recovered = false;
+            if (blank_streak.load() == 0) {
+                constexpr int kRecoveryAttempts = 3;
+                for (int attempt = 1; attempt <= kRecoveryAttempts; ++attempt) {
+                    settings.reset_accumulation = true;
+                    const bool re_ok = in_frame->upload_buf
+                        ? processor.process_raw_rgb48(
+                              in_frame->upload_buf, model_w, model_h, out_frame->out, settings,
+                              error, gpu_motion ? nullptr : (useFlow ? &in_frame->motion : nullptr),
+                              gpu_motion, gpu_motion_pitch)
+                        : processor.process(
+                              in_frame->in, out_frame->out, settings, error,
+                              gpu_motion ? nullptr : (useFlow ? &in_frame->motion : nullptr),
+                              gpu_motion, gpu_motion_pitch);
+                    if (!re_ok) {
+                        fprintf(stderr, "[FAIL] frame %u: %s\n", in_frame->index, error.c_str());
+                        if (error.find("blank image") != std::string::npos) retryable = true;
+                        failed = true;
+                        abort_pipeline.store(true);
+                        break;
+                    }
+                    if (!output_is_blank(out_frame->out)) {
+                        fprintf(stderr,
+                                "[recover] frame %u: 原地重评估第 %d 次恢复输出（强制重置累积历史），继续处理\n",
+                                in_frame->index, attempt);
+                        recovered = true;
+                        break;
+                    }
+                }
+                if (!recovered && !failed.load()) {
+                    fprintf(stderr,
+                            "[warn] frame %u: 原地重评估 %d 次仍空白，按竞态处理\n",
+                            in_frame->index, kRecoveryAttempts);
+                }
+            }
+            if (failed.load() || abort_pipeline.load()) break;
+            blank_output = !recovered;
+        }
+        if (blank_output) {
             if (in_frame->input_max16 > kBlankGateInput16) {
                 const int streak = blank_streak.load() + 1;
                 blank_streak.store(streak);
@@ -3124,6 +3240,7 @@ static int run_main_once(int argc, char **argv) {
                     // 0 on this path, which made the field actively misleading as
                     // a way to tell whether a run came out black.
                     blank_count.store(blank_count.load() + 1);
+                    write_fail_frame(options.output, in_frame->index);
                     failed = true;
                     retryable = true;
                     abort_pipeline.store(true);
@@ -3149,10 +3266,6 @@ static int run_main_once(int argc, char **argv) {
         out_frame->ms = ms;
         out_frame->is_eos = false;
         out_frame->input_max16 = in_frame->input_max16;
-
-        if (options.comp_opts.is_active()) {
-            apply_post_composite(in_frame->in, out_frame->out, options.comp_opts);
-        }
 
         // Return input frame buffer to free pool for reuse
         free_input_pool.push(in_frame);
@@ -3225,6 +3338,11 @@ static int run_main_once(int argc, char **argv) {
         failed.store(true);
         retryable.store(true);
     }
+    if (!failed.load()) {
+        // A clean run clears the deterministic-failure marker so a later,
+        // unrelated run with the same output path starts its comparison fresh.
+        _wremove(fail_frame_path(options.output).c_str());
+    }
     // 2 = retryable failure (blank race) -> outer main() re-runs this program.
     return failed.load() ? (retryable.load() ? 2 : 1) : 0;
 }
@@ -3237,8 +3355,12 @@ static int run_main_once(int argc, char **argv) {
 // fresh process almost always recovers. Retrying INSIDE the process is
 // useless, so the runnable body reports exit code 2 on a blank outcome and
 // this wrapper re-executes it in a fresh process, up to --retries extra times
-// (default 3, i.e. up to 4 attempts in total).
+// (default 3, i.e. up to 4 attempts in total). A content-deterministic
+// failure -- two consecutive runs blanking at near-identical frames, detected
+// through the fail-frame sidecar -- stops the loop with an explicit message
+// instead of respawning, because no fresh process can clear that kind.
 // ---------------------------------------------------------------------------
+
 static int real_main(int argc, char **argv) {
     if (argc < 2 || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
         usage();
@@ -3330,8 +3452,31 @@ static int real_main(int argc, char **argv) {
         }
     }
 
+    // Read the previous run's failing frame before it gets overwritten, so two
+    // consecutive runs failing at near-identical frames can be recognized as
+    // the content-deterministic kind (see fail_frame_path above).
+    std::wstring ff_path;
+    long prev_fail = -1;
+    if (argc > 2 && strcmp(argv[1], "--image") != 0) {
+        ff_path = fail_frame_path(widen(argv[2]));
+        prev_fail = read_fail_frame(ff_path);
+    }
+
     const int rc = run_main_once(argc, argv);
     if (rc != 2 || retries <= 0) return rc;
+
+    if (!ff_path.empty()) {
+        const long now_fail = read_fail_frame(ff_path);
+        if (now_fail >= 0 && prev_fail >= 0 && std::labs(now_fail - prev_fail) <= 16) {
+            fprintf(stderr,
+                    "[FAIL] 连续两轮分别在第 %ld / %ld 帧输出空白：同帧复现的确定性失败"
+                    "（内容触发，非随机竞态），继续重试无法恢复，已停止。\n"
+                    "[hint] 该片段建议换参数单独处理（如 --reset always、降低强度），或反馈此素材。\n",
+                    prev_fail, now_fail);
+            fflush(stderr);
+            return rc;
+        }
+    }
 
     fprintf(stderr, "[warn] 本轮输出空白，以全新进程重跑（剩余 %d 次）…\n", retries);
     fflush(stderr);
