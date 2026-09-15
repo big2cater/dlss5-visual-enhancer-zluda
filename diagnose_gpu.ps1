@@ -140,7 +140,11 @@ function Show-Probe([string]$path, [string]$kind, [string]$label, [string]$overr
     $res = ($line -split '\|', 3)[2]
     $colour = "Gray"
     if ($kind -eq "zluda") { $colour = if ($res -like "*CUDA_SUCCESS*" -and $res -notlike "*count=0*") { "Green" } else { "Red" } }
-    elseif ($kind -eq "hip") { $colour = if ($res -like "*status=0*") { "Green" } else { "Red" } }
+    # Same rule as the zluda branch above. hipSuccess with count=0 is exactly what a
+    # broken HSA_OVERRIDE looks like on this card, and painting that green told the
+    # reader the HIP side was fine when the whole point of the sweep below is to find
+    # that case. The probe reports count= for both kinds.
+    elseif ($kind -eq "hip") { $colour = if ($res -like "*status=0*" -and $res -notlike "*count=0*") { "Green" } else { "Red" } }
     Write-Host ("    {0}: {1}" -f $label, $res) -ForegroundColor $colour
     return $res
 }

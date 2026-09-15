@@ -388,6 +388,11 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
     // separate from `error` because the tail of this function overwrites `error`
     // with a count, and a count is exactly what is not useful here.
     std::string straggler_detail;
+    // How many deadlines in a row have fired with children still burning CPU. Reset
+    // whenever a module finishes, so it counts the same tail surviving, not the
+    // elapsed time: a slow machine that keeps finishing modules never reaches it.
+    constexpr int kDeadlineFiringsBeforeKill = 3;
+    int deadline_firings = 0;
     int no_progress_minutes = 60;
     {
         char forced[16] = {};
@@ -511,18 +516,52 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
                         --j; // vector shrank under us
                     }
                 }
+                // The survivors are the ones still accumulating CPU time. Once
+                // is a slow machine doing real work, and the note above is right
+                // that killing it throws away a translation that only needed
+                // more time. But children that keep burning CPU while deadline
+                // after deadline passes with nothing finishing are no longer
+                // "slow", they are a tail that will never end -- and waiting for
+                // it forever is the hang this whole guard exists to prevent. So
+                // count the firings and take them down on the third. The count
+                // resets whenever a module does finish, and scales with the
+                // budget on purpose: three times sixty minutes by default, three
+                // minutes if someone overrode the budget to one.
+                std::string escalated;
+                if (!running.empty() && ++deadline_firings >= kDeadlineFiringsBeforeKill) {
+                    for (size_t j = 0; j < running.size(); ++j) {
+                        const size_t slot = j < slots.size() ? slots[j] : files.size();
+                        std::wstring leaf = slot < files.size() ? files[slot] : L"(unknown module)";
+                        const size_t slash = leaf.find_last_of(L"\\/");
+                        if (slash != std::wstring::npos) leaf = leaf.substr(slash + 1);
+                        if (!escalated.empty()) escalated += ", ";
+                        escalated += to_utf8(leaf);
+                        terminate_and_reap(running[j]);
+                        ++failures;
+                        ++progress.done;
+                    }
+                    running.clear();
+                    cpu.clear();
+                    stalled.clear();
+                    slots.clear();
+                    deadline_firings = 0;
+                }
                 if (straggler_detail.empty()) {
                     straggler_detail = "no module finished for " +
                                        std::to_string(no_progress_minutes) + " minutes";
                     if (!killed.empty())
                         straggler_detail += "; killed (no CPU progress): " + killed;
-                    if (!working.empty())
+                    if (!working.empty() && escalated.empty())
                         straggler_detail += "; still translating (left running): " + working;
+                    if (!escalated.empty())
+                        straggler_detail += "; killed after " +
+                                            std::to_string(kDeadlineFiringsBeforeKill) +
+                                            " deadlines with nothing finishing: " + escalated;
                 }
-                // The survivors get one visible warning and keep going. The
-                // deadline re-fires on every later silent slice and kills
-                // whatever has gone quiet since; a child that keeps burning
-                // CPU is never its target.
+                // A survivor that is still burning CPU gets a visible warning and
+                // keeps going, and the deadline re-fires on every later silent
+                // slice -- but only kDeadlineFiringsBeforeKill times before it is
+                // taken down as well.
                 progress.message = straggler_detail;
                 if (report) report(progress);
             }
@@ -539,6 +578,7 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
         stalled.erase(stalled.begin() + index);
         if (index < slots.size()) slots.erase(slots.begin() + index);
         last_completion = GetTickCount64();
+        deadline_firings = 0; // something finished: this is not a stuck tail
 
         ++progress.done;
         {

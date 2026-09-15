@@ -2414,7 +2414,13 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
 
     // Concat & mux audio
     std::wstring concat_cmd;
-    if (!options.audio || params.audio_codec.empty() || params.audio_codec == "none") {
+    // An empty codec means the probe did not say -- not that there is no audio.
+    // Dropping the track in that case was the same divergence as the whitelist
+    // below, one branch over: the single-process path copies when the codec is
+    // unknown (start_encoder tests `ac.empty()` for exactly this), so this one
+    // does too, through the -map 1:a? below which matches nothing when the input
+    // really has no audio.
+    if (!options.audio || params.audio_codec == "none") {
         concat_cmd = tool_cmd(false) + L" -y -nostdin -v error -f concat -safe 0 -i \"" +
                      concat_list_path + L"\" -c:v copy -an \"" + options.output + L"\"";
     } else {
@@ -2429,7 +2435,10 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
             (_wcsicmp(options.output.c_str() + options.output.size() - 4, L".mkv") == 0);
         const std::string &ac = params.audio_codec;
         const bool can_copy_in_mp4 = (ac == "aac" || ac == "mp3" || ac == "ac3" || ac == "eac3");
-        if (is_mkv_output || can_copy_in_mp4) {
+        // `ac.empty()` copies, exactly as start_encoder does: unknown is not the
+        // same as known-to-be-wrong, and a copy of an audio stream the container
+        // cannot take is the failure this whole branch exists to avoid.
+        if (is_mkv_output || can_copy_in_mp4 || ac.empty()) {
             audio_args = L"-c:a copy ";
         } else {
             fprintf(stderr, "[audio] Input audio '%s' cannot be copied into MP4; transcoding to AAC (192 kbps)\n", ac.c_str());

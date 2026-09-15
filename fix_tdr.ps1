@@ -1,5 +1,10 @@
 # Windows GPU TDR (Timeout Detection & Recovery) Fix Utility
 # Recommended for heavy AI workloads (DLSS-NR, Stable Diffusion, ComfyUI, etc.)
+#
+# -Force: proceed even though the previous values could not be written to a backup
+# file, and skip the confirmation asked for when TDR detection is currently switched
+# off. Nothing else touches the registry without a backup on disk.
+param([switch]$Force)
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
@@ -41,6 +46,17 @@ if ($null -eq $currentTdrLevel) {
         Write-Host "    [WARNING] TDR detection is currently DISABLED on this machine (TdrLevel = 0)." -ForegroundColor Red
         Write-Host "              This script will re-enable it (TdrLevel = 3). If that was deliberate," -ForegroundColor Red
         Write-Host "              stop now and set it back with the backup written below." -ForegroundColor Red
+        # Saying "stop now" is not the same as stopping: this is the one case where
+        # the script deliberately reverses a choice someone made on purpose, so it
+        # asks first. Automation passes -Force.
+        if (-not $Force) {
+            Write-Host ""
+            $answer = Read-Host "  This will re-enable TDR detection. Type YES to continue"
+            if ($answer -ne "YES") {
+                Write-Host "  Not changed: nothing was written." -ForegroundColor Yellow
+                exit 0
+            }
+        }
     }
 }
 
@@ -51,7 +67,11 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $isAdmin) {
     Write-Host "[Notice] Applying TDR registry changes requires Administrator privileges." -ForegroundColor Yellow
     Write-Host "Restarting script with Administrator elevation..." -ForegroundColor Cyan
-    Start-Process powershell -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    # Elevation starts a fresh process, so a flag given to this one does not survive
+    # on its own -- without this the elevated copy would re-ask, and refuse, forever.
+    $forward = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    if ($Force) { $forward += " -Force" }
+    Start-Process powershell -Verb RunAs -ArgumentList $forward
     exit
 }
 
@@ -60,7 +80,12 @@ Write-Host "[Applying Recommended Settings (TdrDelay = 10s, TdrDdiDelay = 10s)].
 # Record what is being replaced before replacing it. The previous values were
 # only ever overwritten, so a machine that had been tuned (a longer TdrDelay, or
 # TdrLevel = 0) had no way back to it.
-$backup = Join-Path (Split-Path -Parent $PSCommandPath) "tdr_backup_before_fix.txt"
+# Timestamped. A fixed name meant a second run overwrote the first run's file, and
+# what the second run wrote was the values the first run had already changed -- so
+# the machine's actual starting point was gone with no way back to it. One file per
+# run; the newest is always the state immediately before that run.
+$backup = Join-Path (Split-Path -Parent $PSCommandPath) `
+    ("tdr_backup_before_fix_{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 try {
     @(
         "# Windows GPU TDR settings before fix_tdr.ps1 ran, $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
@@ -74,7 +99,13 @@ try {
     ) | Set-Content -LiteralPath $backup -Encoding UTF8
     Write-Host ("  previous values backed up to: {0}" -f $backup) -ForegroundColor Gray
 } catch {
-    Write-Host ("  [WARNING] could not write the backup file: {0}" -f $_) -ForegroundColor Yellow
+    Write-Host ("  [ERROR] could not write the backup file: {0}" -f $_) -ForegroundColor Red
+    if (-not $Force) {
+        Write-Host "  Nothing has been changed. Your current values are the ones printed above;" -ForegroundColor Red
+        Write-Host "  re-run with -Force only if you accept changing them with no backup on disk." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "  [WARNING] -Force was given: continuing without a backup on disk." -ForegroundColor Yellow
 }
 
 try {

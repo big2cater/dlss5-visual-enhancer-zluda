@@ -101,7 +101,10 @@ QString settings_path() {
 } // namespace
 
 BatchWindow::BatchWindow() {
-    setWindowTitle(tr("DLSS 5 神经渲染滤镜 (AMD/ZLUDA) - v2026.09.10-multipass"));
+    // The tag is what a user quotes when they report a problem, so it has to be the
+    // version actually running. It sat at v2026.09.10-multipass through several
+    // releases, which sent every report to the wrong place.
+    setWindowTitle(tr("DLSS 5 神经渲染滤镜 (AMD/ZLUDA) - v2026.09.14-v6"));
     setAcceptDrops(true);
 
     auto *central = new QWidget;
@@ -164,10 +167,11 @@ void BatchWindow::hint_override_mismatch() {
         std::wstring lower = gpu.name;
         std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
         if (gpu.is_virtual) continue;
-        if (lower.find(L"9070") != std::wstring::npos ||
-            lower.find(L"9060") != std::wstring::npos ||
-            lower.find(L"rx 9") != std::wstring::npos ||
-            lower.find(L"radeon 9") != std::wstring::npos) {
+        // Ask the one predicate in gpu_detection.h instead of repeating the name
+        // list here. The copy that used to sit here had already drifted: it never
+        // matched the workstation Radeon AI PRO R9700 and knew nothing about the
+        // device ids, so exactly the users this hint exists for did not get it.
+        if (dlssnr::is_rdna4_gpu(lower, gpu.device_id)) {
             log_line(tr("提示：检测到 RDNA 4 显卡，但环境变量 HSA_OVERRIDE_GFX_VERSION=%1 "
                          "是旧版覆盖值（会导致模块加载失败）。本程序已自动纠正为 12.0.1；"
                          "建议删除系统环境变量里的这项手动设置。")
@@ -1039,25 +1043,9 @@ void BatchWindow::start_preview() {
     if (ok && user_fps > 0) {
         rate = user_fps;
     } else {
-        QProcess probe;
-        probe.start(QStringLiteral("ffprobe"),
-                    {QStringLiteral("-v"), QStringLiteral("error"),
-                     QStringLiteral("-select_streams"), QStringLiteral("v:0"),
-                     QStringLiteral("-show_entries"), QStringLiteral("stream=r_frame_rate"),
-                     QStringLiteral("-of"), QStringLiteral("default=noprint_wrappers=1:nokey=1"),
-                     input_->text().trimmed()});
-        if (probe.waitForFinished(2000)) {
-            const QString out = QString::fromUtf8(probe.readAllStandardOutput()).trimmed();
-            if (out.contains(QLatin1Char('/'))) {
-                const QStringList bits = out.split(QLatin1Char('/'));
-                bool n_ok = false, d_ok = false;
-                const double num = bits.value(0).toDouble(&n_ok);
-                const double den = bits.value(1).toDouble(&d_ok);
-                if (n_ok && d_ok && den > 0) rate = num / den;
-            } else {
-                rate = out.toDouble();
-            }
-        }
+        // Shared with the run path, so the same file is not read twice.
+        probe_input_once(input_->text().trimmed());
+        if (probe_rate_ > 0) rate = probe_rate_;
     }
     const double eff_fps = (rate > 0) ? rate : 30.0;
     const int preview_frames = qMax(30, (int)std::round(eff_fps * 3.0));
@@ -1122,16 +1110,29 @@ void BatchWindow::start_frame_hold_compare() {
         log_line(tr(">>> 正在从视频截取单帧..."), QColor(135, 206, 250));
         QProcess extract;
         extract.start(QStringLiteral("ffmpeg"),
-                      {QStringLiteral("-y"), QStringLiteral("-ss"), QStringLiteral("00:00:01"),
+                      {QStringLiteral("-nostdin"), QStringLiteral("-y"),
+                       QStringLiteral("-ss"), QStringLiteral("00:00:01"),
                        QStringLiteral("-i"), source,
                        QStringLiteral("-frames:v"), QStringLiteral("1"),
                        frame_hold_in_});
         if (!extract.waitForFinished(5000) || !QFileInfo::exists(frame_hold_in_)) {
+            // Qt only warns when start() is called on a process that is still
+            // running; the fallback command never ran, and a wedged first ffmpeg
+            // stayed alive in the background. Kill and reap it before retrying.
+            if (extract.state() != QProcess::NotRunning) {
+                extract.kill();
+                extract.waitForFinished(2000);
+            }
             extract.start(QStringLiteral("ffmpeg"),
-                          {QStringLiteral("-y"), QStringLiteral("-i"), source,
+                          {QStringLiteral("-nostdin"), QStringLiteral("-y"),
+                           QStringLiteral("-i"), source,
                            QStringLiteral("-frames:v"), QStringLiteral("1"),
                            frame_hold_in_});
             if (!extract.waitForFinished(5000) || !QFileInfo::exists(frame_hold_in_)) {
+                if (extract.state() != QProcess::NotRunning) {
+                    extract.kill();
+                    extract.waitForFinished(2000);
+                }
                 log_line(tr("从视频截取单帧失败，请检查视频文件与 ffmpeg。"), QColor(255, 90, 60));
                 return;
             }
@@ -1321,10 +1322,24 @@ void BatchWindow::hint_cold_cache() {
              QColor(255, 200, 90));
 }
 
-void BatchWindow::probe_total() {
-    // Off the interface thread would be better, but ffprobe only reads the
-    // container here -- it does not decode -- so it returns in well under a
-    // second even on a long video, while the run itself goes on regardless.
+void BatchWindow::probe_input_once(const QString &path) {
+    if (path.isEmpty()) return;
+    if (path == probe_path_) return; // already asked about this file in this session
+    probe_path_ = path;
+    probe_rate_ = 0;
+    probe_frames_ = 0;
+
+    // One ffprobe per input, shared by the preview and the run. Both used to spawn
+    // their own, so the same file was read twice per session and each read blocked
+    // the interface thread -- window frozen, no explanation on screen.
+    //
+    // The timeout stays generous on purpose. A slow disk legitimately needs a few
+    // seconds here, and ffprobe reads only the container, so it returns long before
+    // that in the normal case; cutting the timeout would replace a freeze with a
+    // wrong frame count for the whole run. What must not survive is the process
+    // itself: a wedged ffprobe is killed and reaped here, which is what this
+    // function did before and what the preview's own copy of it did not.
+    log_line(tr(">>> 正在读取输入信息（最长 5 秒）..."), QColor(150, 150, 150));
     QProcess probe;
     probe.start(QStringLiteral("ffprobe"),
                 {QStringLiteral("-v"), QStringLiteral("error"),
@@ -1332,22 +1347,20 @@ void BatchWindow::probe_total() {
                  QStringLiteral("-show_entries"),
                  QStringLiteral("stream=r_frame_rate:format=duration"),
                  QStringLiteral("-of"), QStringLiteral("default=noprint_wrappers=1:nokey=1"),
-                 input_->text().trimmed()});
+                 path});
     if (!probe.waitForFinished(5000)) {
-        // A wedged ffprobe must not outlive this function: without the kill the
-        // QProcess goes out of scope while it is still running, Qt warns about
-        // it, and the child lingers until the application exits.
         probe.kill();
         probe.waitForFinished(2000);
+        log_line(tr("读取输入信息超时；将使用默认帧率。"), QColor(255, 200, 90));
         return;
     }
 
-    // Line 0 is r_frame_rate, Line 1 is format=duration.
+    // Line 0 is r_frame_rate, line 1 is format=duration.
     double rate = 0;
     double duration = 0;
     const QString out = QString::fromUtf8(probe.readAllStandardOutput());
     const QStringList lines = out.split(QRegularExpression(QStringLiteral("[\r\n]+")),
-                                         Qt::SkipEmptyParts);
+                                        Qt::SkipEmptyParts);
     for (int i = 0; i < lines.size(); ++i) {
         const QString text = lines[i].trimmed();
         if (i == 0) {
@@ -1368,7 +1381,13 @@ void BatchWindow::probe_total() {
             if (ok && val > 0) duration = val;
         }
     }
-    if (rate > 0 && duration > 0) frames_total_ = (long)(rate * duration);
+    probe_rate_ = rate;
+    if (rate > 0 && duration > 0) probe_frames_ = (long long)(rate * duration);
+}
+
+void BatchWindow::probe_total() {
+    probe_input_once(input_->text().trimmed());
+    if (probe_frames_ > 0) frames_total_ = (long)probe_frames_;
 }
 
 void BatchWindow::read_error() {

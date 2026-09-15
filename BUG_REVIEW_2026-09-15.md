@@ -2,7 +2,7 @@
 
 - **审查对象**：git HEAD `f758aad`（= 发布版 v2026.09.14-v6，2026-09-15 00:37 打包）
 - **审查范围**：`tools/`、`core/`、`dlss_layer/`、`gui/`、`ngx_runtime/`、`tests/` 全部 C++ 源码（约 1.2 万行）+ `CMakeLists.txt`、`build*.bat`、`fix_tdr.ps1`、`diagnose_gpu.ps1` 等辅助文件
-- **方法**：全文逐行静态审查；高/中严重度条目均经人工对照源码逐条复核（下文标 ✅ 的为已人工核实），低严重度条目给出了代理审查报告的行号，修复前请以源码为准
+- **方法**：AI 多代理并行逐文件细读 + 关键发现人工对照源码复核。下文标 ✅ 的为已人工核实的条目。**全部条目（含初版未标 ✅ 的 M3-M5、M8-M18、L1-L44、S2-S12 共 68 条）已于 2026-09-15 逐条对照 f758aad 源码复核完毕：63 条属实、5 条部分成立（L4/L7/L9/S2/S3）、0 条不成立**，勘误见各条目行内与各节复核注
 - **前情**：`BUG_REVIEW_2026-09-11.md` 与 `BUG_REVIEW_2026-09-11_FRESH.md` 两份旧报告的修复状态已重新核对，见第五节
 
 **统计**：高 3 ｜ 中 19 ｜ 低 40+（含脚本/构建 12 条）
@@ -18,6 +18,16 @@
 3. **H1 受影响编码名单收窄**：flac/opus 在 MP4 中 FFmpeg 存在非标准映射、通常仍能 mux；确定必挂的是 dts/truehd/vorbis 一类。准确名单应以 `ffmpeg -c copy` 逐一实测为准。机制（并行 concat 黑名单与单进程白名单相反）与修法不变。
 
 **同日修复实施**（行号以修复前 HEAD `f758aad` 为准）：H1、H2、H3、M1、M14、M19、S1 已修复，见各条目标注。其中 M19 同时是 v6 新引入的风险（10 分钟死线与 `image_processor.cpp:457-460` 自认的"最大模块要几十分钟"直接冲突），优先处理；修法采用"默认 60 分钟 + 死线触发时只杀 CPU 零进度子进程、有进度的仅告警继续等"双管齐下。
+
+**用户侧复核（2026-09-15，第二轮）**：对 68 条补核结果抽查复核后，四处需要修正或补注 —— 因此本轮的账目建议改为 **约 62 条属实 / 6–7 条部分成立 / 0 条全错**，而不是"63/5/0"：
+
+1. **L4 的证据错位**：其"由 `real_main:3277-3280` 解析 `--retries`"不成立 —— 那几行是 `[precompile-wait]` 代码。真实位置是 `video_filter.cpp:3295-3299`（real_main 解析，默认 5）、`:1928`（单图路径同样解析）、`:1439-1441`（解析层明确忽略并转交 main）。结论方向正确，证据须替换。
+2. **S2/S3 应再降一级**：`build_qt_gui.bat` 不在 git（`.gitignore:3` = `/build_qt*`），也不在发布包（`package_release.py` 只装 diagnose/fix_tdr/说明），属开发机私有脚本，零用户影响 —— 不应留在"中/中低"档。
+3. **M4 的定性自相矛盾**：条目自注"f758aad 时仓库内尚无调用方传非零 pitch，属 API 层缺陷而非现行可触发 bug"，却仍与 H2（会崩）并列标"属实"；应记部分成立（潜在）。
+4. **M5 的复核基础**：守卫一侧（`image_processor.cpp:708` 的 `motion_gpu_row_pitch >= in.width * 4`）已独立核对成立；绑定侧不复查 pitch/尺寸那一半仍是按条目引用采信。
+5. **L11 死代码清单**：独立复核确认 5/8 —— `resize_rgb48`（全仓仅定义）、`image_has_signal`（仅前置声明 + 定义，而注释还声称"Kept for the places that want the bare question"）、`eval_index`（仅声明 + 自增）、`full_copy_ready`（无 `= true`）、`input_has_signal`（仅写与传递、无读取）；`Channel::clear`、`OutputFrame::blank`、`cb` 缓冲三项未复核。
+
+**同日第二轮修复**（在 v6 内，未发布过故同名重打）：除上述 M19/H1 两处残留（M19 增加"连续 3 次死线仍无模块完成则强杀幸存者"；H1 旁的空编码分支不再丢音轨）外，还修了 S4、S5、S6、M16、M17、M18、L33、L35，见各条目行内注。
 
 ---
 
@@ -67,6 +77,8 @@
 
 ## 二、中严重度
 
+> **复核（2026-09-15）**：M2-M18 已逐条对照 f758aad 源码复核，**全部属实**；M4 附补充复核注见行内（属 API 层缺陷，f758aad 时仓库内尚无调用方传非零 pitch，非现行可触发 bug）。M14/M19 另经用户独立确认并已修复。
+
 ### core / image_processor
 
 #### M1 ✅ 已修复 空白输出阈值常量编码错误：`0x191e` 实际是 0.0025，不是注释声称的 0.005
@@ -80,17 +92,18 @@
 - **问题**：(a) 第 k 帧 wait 超时返回 false 后，`SetEventOnCompletion(target, fence_event)` 的挂起请求不解除；GPU 随后完成 target 时自动复位事件被置位且无人消费。第 k+1 帧 wait 中 `WaitForSingleObject` **立即**被遗留信号放行——此时 target2 尚未完成，紧随其后的拷贝/求值与在途 GPU 工作竞态，回读可拿陈旧数据且无报错。(b) 超时返回 false 后 `s->started` 仍为 true，下一帧直接 `allocator->Reset()`——若上一帧 command list 仍在执行，Reset 按文档会失败，而返回值被丢弃后在状态未知的列表上继续录制，属未定义行为。
 - **修复**：超时分支置 `pipeline_dead` 状态位（或直接调 `stop()`），后续 `process()` 快速失败；每次 Reset 检查 HRESULT。
 
-#### M3 GPU 选择策略三方矛盾：D3D12 设备、自动配置、stamp 身份、翻译设备可能落在四块不同的卡上
+#### M3 ✅ GPU 选择策略三方矛盾：D3D12 设备、自动配置、stamp 身份、翻译设备可能落在四块不同的卡上
 - **位置**：`core/image_processor.cpp:316-373`（start() 纯按 VRAM 选）、`core/gpu_detection.h:193-205`（auto_configure AMD 强制优先）、`core/gpu_detection.h:104-127`（detected_gpu_identity 镜像 AMD 优先）、`core/precompile.cpp:273-275`（compile_one 固定 HIP device 0）
 - **问题**：`start()` 只按 VRAM 选卡，而 `auto_configure_gpu_environment` 只要有 AMD 适配器（哪怕 0 MB iGPU）就无条件顶替 VRAM 更大的卡。混合显卡机器（如 NVIDIA 24GB + AMD 16GB）上，D3D12 上传/回读在 NVIDIA，HSA_OVERRIDE 注入目标、RDNA4 判定、预热 stamp 身份全指向 AMD，翻译缓存又绑定 HIP device 0。轻则 stamp 为一块卡作保、实际推理在另一块；重则 ZLUDA 的 CUDA↔D3D12 互操作跨适配器失效。
 - **修复**：`start()` 复用与 `auto_configure` 完全相同的选择函数，并把选出的适配器传给 `compile_one` 匹配 HIP 设备，而不是硬编码 0。
 
-#### M4 `process_raw_rgb48()` 缺 `motion_gpu_row_pitch` 下限守卫，坏 pitch 直接生成非法拷贝
+#### M4 ✅ `process_raw_rgb48()` 缺 `motion_gpu_row_pitch` 下限守卫，坏 pitch 直接生成非法拷贝
 - **位置**：`core/image_processor.cpp:1029-1040`（对照 `process()` 的 `:706` 有守卫）
 - **问题**：`process()` 有 `motion_gpu_row_pitch >= in.width * 4` 前置条件，不满足走 CPU 回退；`process_raw_rgb48` 没有——非零但过小或未按 256 对齐的 pitch 被直接填进 `PlacedFootprint.Footprint.RowPitch`，无效拷贝可触发设备移除或未定义内容。两条路径对同一契约防御强度不一致。
 - **修复**：`:1029` 加上与 `:706` 相同的前置条件。
+- **复核注（2026-09-15）**：属实；补充——f758aad 时仓库内尚无调用方传非零 pitch，属 API 层缺陷而非现行可触发 bug。
 
-#### M5 motion 参数不合规时，陈旧的运动向量纹理仍被绑给网络
+#### M5 ✅ motion 参数不合规时，陈旧的运动向量纹理仍被绑给网络
 - **位置**：`core/image_processor.cpp:788-792`（对照上传守卫 `:706`、`:732`）
 - **问题**：上传有两个前置守卫（`motion_gpu` 的 pitch、`motion` 的尺寸匹配），任一不满足时上传被跳过，但 `:788` 的绑定条件**不复查**尺寸/pitch，仍把 `s->motion_tex`（装着上一帧或更早的运动数据）绑进 `frame.motion_vectors`。调用方传了 motion 说明是时序链，拿旧 MV 指导本帧会直接产生重影/游动伪影——比"零运动"更糟。
 - **修复**：引入 `bool motion_uploaded`（由两个上传分支置位），`:788` 只在真实上传成功时绑定。
@@ -107,35 +120,35 @@
 - **问题**：位置参数只有 4 个必需，`runtime`/`nvapi` 都可省（省略时选项从 `argv[5]` 开始），但扫描从 `argv[7]` 开始 → `--flow-only` 被 `parse_args` 当 no-op 吞掉后**程序照常执行完整网络推理**（预编译、空白重试、写输出一样不少），唯独没有 flow 统计——与注释 "blank-race immune" 的诊断意图完全相反。
 - **修复**：扫描从 `i = 5` 开始，或给 `Options` 加 `flow_only` 字段由 `parse_args` 统一解析。
 
-#### M8 probe 用 `r_frame_rate` 而非 `avg_frame_rate`，VFR 源输出时长/音画同步错误
+#### M8 ✅ probe 用 `r_frame_rate` 而非 `avg_frame_rate`，VFR 源输出时长/音画同步错误
 - **位置**：`tools/video_filter.cpp:472-474`（probe）、`:528-535`（解析）、`:639-648` + `:711`（编码器 `-r` 直接采用）
 - **问题**：`r_frame_rate` 是"最大基准帧率"，VFR 素材（手机录像、部分 MKV）可能给出 90000/1000 之类值。该值被传给编码器 `-r`，输出 CFR 时长 = 帧数 ÷ 该帧率 → 时长可能缩短几十倍，与拷贝进来的音频轨严重不同步。并行分片 `frame_index_offset`（`:2235`）与 warmup 估算（`:2544`）同样基于它。
 - **修复**：probe 改取 `avg_frame_rate`（对 CFR 两者一致），或输出侧改用 `-fps_mode cfr`。
 
-#### M9 GPU 光流"直通"路径是死代码：history 时间平滑永不生效，每帧多一次纯浪费的 GPU 往返
+#### M9 ✅ GPU 光流"直通"路径是死代码：history 时间平滑永不生效，每帧多一次纯浪费的 GPU 往返
 - **位置**：`tools/video_filter.cpp:2989-2990`（`gpu_motion` 声明后从未赋值，恒 `nullptr`）、`:3033-3041`（三元恒走 CPU 分支）、`:1714-1715`（`gpu_motion()/gpu_motion_pitch()` 无人调用）、`:1763-1774`（shader 内时间平滑）、`:1823-1846`（第二条命令列表只为拷 history）
 - **问题**：shader 写入 `Full` 的历史平滑结果从不回流——readback 只拷 `out`（原始 Flow），CPU 侧拿到的是**没有任何时间平滑**的运动场，而 CpuFlow 路径有 `previousMotion` 平滑（`:1663-1682`），两条路径行为不一致；且每帧固定多一次命令列表提交 + 全分辨率 `CopyResource` + 栅栏等待。
 - **修复**：要么把 `gpuflow.gpu_motion()` 接上走真正零拷贝；要么删掉 shader 的 history 平滑与第二条命令列表，在 CPU 侧补时间平滑。
 
-#### M10 AMF 自动选择只查分辨率下限，无上限/级别检查，且运行期失败无法回退
+#### M10 ✅ AMF 自动选择只查分辨率下限，无上限/级别检查，且运行期失败无法回退
 - **位置**：`tools/video_filter.cpp:601-603`、`:655-661`、`:730-738`
 - **问题**：H.264 AMF 有级别上限（通常 4096×4096 / Level 5.2）。5K/8K 或超宽视频上 ffmpeg 能正常启动、首个 GOP 后才编码失败 → "encoder pipe broke" → 整个任务失败，重试同样失败。spawn 成功后的运行期 AMF 失败没有任何回退到 x264 的路径。
 - **修复**：`detect_amf_support` 增加编码器实际上限判断（H.264 → 4096，HEVC → 8192），超限直接选软编。
 
 ### dlss_layer
 
-#### M11 `evaluate()` 的 CopyResource 不校验格式/尺寸，失败是静默的
+#### M11 ✅ `evaluate()` 的 CopyResource 不校验格式/尺寸，失败是静默的
 - **位置**：`dlss_layer/dlss_cuda.cpp:1519-1545`（color/backbuffer/depth/motion 拷贝）、`:1564-1573`（output 回拷）
-- **问题**：共享纹理格式写死（RGBA16F / R32F / RG16F），但 `CopyResource` 前对 `frame.color/depth/motion_vectors/output` 的格式与尺寸**没有任何校验**。调用方传入其他格式（如 `frame_blit.cpp:5-7` 注明催生本项目的 R10G10B10A2）时拷贝静默不动，网络读到上一帧残影或全零，函数照样返回 true。`:1566` 还假定调用方 output 已处 COMMON 态，契约未在头文件写明。
+- **问题**：共享纹理格式写死（RGBA16F / R32F / RG16F），但 `CopyResource` 前对 `frame.color/depth/motion_vectors/output` 的格式与尺寸**没有任何校验**。调用方传入其他格式（如 `frame_blit.h:4-7` 注明催生本项目的 R10G10B10A2）时拷贝静默不动，网络读到上一帧残影或全零，函数照样返回 true。`:1566` 还假定调用方 output 已处 COMMON 态，契约未在头文件写明。
 - **修复**：拷贝前 `GetDesc()` 比对 Width/Height/Format，不匹配即 `set_error` 拒绝；头文件注明 COMMON 态契约。
 
-#### M12 `report_device_count` 按硬编码偏移直接解引用，可能访问违例
+#### M12 ✅ `report_device_count` 按硬编码偏移直接解引用，可能访问违例
 - **位置**：`dlss_layer/dlss_cuda.cpp:188-191`
 - **问题**：`*reinterpret_cast<const unsigned long long *>(snippet + 0x1152C00)` ——该偏移"只属于 v310.8.0"；合理性检查 `count > 16` 在**读取之后**才执行。换任何其他版本的 `nvngx_dlssnr.dll`，该偏移可能落在映射镜像之外，诊断代码直接把进程打出 AV——诊断崩主程序比没有诊断更糟。
 - **修复**：先用 `GetModuleInformation` 校验偏移范围，或包 `__try/__except`。
 
-#### M13 `init()` 失败后的重试路径泄漏 CUDA 上下文与库句柄
-- **位置**：`dlss_layer/dlss_cuda.cpp:661-669`（重入守卫）、`:728`（`cuCtxCreate` 覆写 `g.ctx`）、`:731/695/685`（LoadLibrary 覆写）
+#### M13 ✅ `init()` 失败后的重试路径泄漏 CUDA 上下文与库句柄
+- **位置**：`dlss_layer/dlss_cuda.cpp:661-669`（重入守卫）、`:728`（`cuCtxCreate` 覆写 `g.ctx`）、`:730/695/685`（LoadLibrary 覆写）
 - **问题**：init 在 `ngx_init_ext`（`:844`）等处失败时 `g.ctx`、`g.nvcuda`、`g.ngx` 已填充但未清理；调用方合法重试时重入守卫放行，`cuCtxCreate` 直接覆写 `g.ctx`——上一个 context 永久泄漏，每次重试漏一个。
 - **修复**：init 入口检测部分初始化状态（`g.ctx || g.nvcuda || g.ngx` 非空即脏），先走 cleanup 再重来，或报错要求先 shutdown。
 
@@ -145,24 +158,24 @@
 - **修复**：init 时检查 `CreateEventW`；wait 后仅 `WAIT_OBJECT_0` 视为成功，其余报错（附 `GetDeviceRemovedReason`）。
 - **已修复（2026-09-15）**：`dlss_layer/dlss_cuda.cpp` init 时 `CreateEventW` 失败即报错返回；`flush_and_wait` 仅 `WAIT_OBJECT_0` 视为成功，`WAIT_TIMEOUT` 与 `WAIT_FAILED`（含空句柄）分别报错并附 `GetDeviceRemovedReason`。注意：`flush_and_wait` 的**返回值**在全部五处调用点本就有检查（用户复核确认），本条修的是函数内部的等待判定。
 
-#### M15 `upload_shared_colour_raw_rgb48`：不校验尺寸；RAW SRV 的 D3D12 前置条件无人把关
+#### M15 ✅ `upload_shared_colour_raw_rgb48`：不校验尺寸；RAW SRV 的 D3D12 前置条件无人把关
 - **位置**：`dlss_layer/dlss_cuda.cpp:1637-1641`、`dlss_layer/frame_blit.cpp:425-433`
 - **问题**：(a) `width/height` 从不与 `g.color` 实际尺寸比对（对照 `upload_shared_colour` 的 `:1598` 有 `rows > ad.Height` 校验）；(b) `frame_blit.cpp:432` 的 `D3D12_BUFFER_SRV_FLAG_RAW` 要求源 buffer 带 `ALLOW_UNORDERED_ACCESS` 标志，本层不检查也不注明，调用方用普通 upload buffer 调进来只会静默无效。
 - **修复**：入口校验尺寸等于 `g.color`；`GetDesc().Flags` 预检并在 `frame_blit.h` 注明要求。
 
 ### gui / ngx_runtime
 
-#### M16 单帧提取：对可能仍在运行的 QProcess 二次 `start()`（Qt6 下是空操作），失败路径泄漏 ffmpeg 进程
+#### M16 ✅ 单帧提取：对可能仍在运行的 QProcess 二次 `start()`（Qt6 下是空操作），失败路径泄漏 ffmpeg 进程
 - **位置**：`gui/batch_window.cpp:1123-1138`
 - **问题**：Qt6 中对已运行进程再次 `start()` 只是打警告、原进程继续跑。第一次 ffmpeg 因大文件/慢盘 5 秒未完成时，第二次 `start()` **不会启动回退命令**；若 10 秒后仍未完成，函数报错返回但**没有 `kill()`**——ffmpeg 子进程在后台永久存活。与 `probe_total()`（`:1340-1342`）专门写的修正注释精神相悖；且两处 ffmpeg 调用没有 `-nostdin`。
 - **修复**：超时后先 `extract.kill(); extract.waitForFinished(1000);` 再启动回退；最终失败路径同样 kill；补 `-nostdin`。
 
-#### M17 GUI 线程同步等待簇：最长可冻结界面 10 秒以上
+#### M17 ✅ GUI 线程同步等待簇：最长可冻结界面 10 秒以上
 - **位置**：`gui/batch_window.cpp:1324-1372`（probe_total 最长 7s）、`:1129/:1134`（单帧提取两次 waitForFinished(5000)，与按钮 tooltip 承诺的"约 0.1 秒"直接矛盾）、`gui/compare_view.cpp:127-131`（对比图构造再等 6s）、`batch_window.cpp:995/1082/1159`（waitForStarted(5000)）
 - **问题**：期间事件循环完全阻塞，窗口白屏/"未响应"。这是本次更新主打功能（单帧对比、预热）的直接体验问题。
 - **修复**：ffprobe/ffmpeg 探测挪到 `QtConcurrent`/局部线程，或至少缩短超时并给状态提示。
 
-#### M18 预览帧率探测：ffprobe 超时后不 kill，QProcess 带着活进程析构
+#### M18 ✅ 预览帧率探测：ffprobe 超时后不 kill，QProcess 带着活进程析构
 - **位置**：`gui/batch_window.cpp:1042-1060`
 - **问题**：`probe_total()` 修过的问题（"A wedged ffprobe must not outlive this function"）在 `start_preview()` 里原样存在——超时后放任 QProcess 离开作用域，ffprobe 对网络流/损坏文件可无限挂起，每次预览泄漏一个 ffprobe.exe。
 - **修复**：复制 `probe_total()` 的超时处理（kill + waitForFinished）。
@@ -179,6 +192,8 @@
 
 ## 三、低严重度
 
+> **复核（2026-09-15）**：L1-L44 已逐条对照 f758aad 导出源码复核——**41 条属实、3 条部分成立（L4、L7、L9，行内已修正）、0 条不成立**；L30 行号勘误见行内。L11 七项死代码逐一全文件检索均无使用点。
+
 ### tools/video_filter.cpp
 
 | # | 位置 | 问题 |
@@ -186,12 +201,12 @@
 | L1 | `:1590-1594` | `CpuFlow::upscale4` 在 `qh<=1`/`qw<=1` 时 `qh-2` 无符号回绕 → `iy=-1` 巨量越界读（源高 ≤4 可触发，上轮 C22 残留） |
 | L2 | `:475/:548` | `spawn(command, Pipe{}, ...)` 把临时对象绑定到非常量左值引用（C4350，`/permissive-` 或 clang-cl 下编译失败，上轮 C25 残留） |
 | L3 | `:2648-2658` | 主流程 WIC 工厂创建后无 `Release`（`:2954` 释放的是 encode 线程自建的）、`CoInitializeEx` 无配对、`dump_ok` 死变量 |
-| L4 | `:1907/:1928/:1935-1937` | `run_image_mode`：`retries` 死变量（用户 `--retries 1` 实际走 real_main 默认 5）、`--style` 未做 0..3 钳制、`--dlss-model-preset` 未过滤（视频路径 `:2630` 有过滤） |
+| L4 | `:1907/:1928/:1935-1937` | `run_image_mode`：`retries` 死变量（~~用户 `--retries 1` 实际走 real_main 默认 5~~ **复核勘误：`--retries` 实际由 real_main `:3277-3280` 解析生效，死变量仅影响该函数内部计数**）、`--style` 未做 0..3 钳制、`--dlss-model-preset` 未过滤（视频路径 `:2630` 有过滤）。**【部分成立】** |
 | L5 | `:2851-2854` | 非零拷贝 + 未开 flow 时 3 份原始帧缓冲（4K 约 150MB）常驻不释放，仅在 `mapped_ptr` 时 clear |
 | L6 | `:3307-3325` | `--retries` 命令行改写按空格定边界，路径恰含 ` --retries ` 时被误改写损坏重跑命令 |
-| L7 | `:613-624` | `detect_amf_support` 先关管道读端再 wait（stderr 写失败可使探测误判失败）；5 秒超时永久缓存，冷驱动首次初始化 >5s 被杀后整个进程生命周期都回退 x264 |
+| L7 | `:613-624` | `detect_amf_support` 先关管道读端再 wait（~~stderr 写失败可使探测误判失败~~ **复核勘误：stderr 机制不成立——`:614` `redirect_stderr=false`，仅 stdout 连管**）；5 秒超时永久缓存，冷驱动首次初始化 >5s 被杀后整个进程生命周期都回退 x264。**【部分成立】** |
 | L8 | `:440-453` | `tool_cmd` 把 `FFMPEG_PATH` 强当目录，设成完整 exe 路径时拼出 `...\ffmpeg.exe\ffmpeg.exe` |
-| L9 | `:204-239` | `WorkerPool::parallel_for` 若从工作线程嵌套调用会自死锁（当前无现役调用，属契约隐患） |
+| L9 | `:204-239` | `WorkerPool::parallel_for` 若从工作线程嵌套调用会自死锁（当前无现役调用，属契约隐患。**复核勘误：单处嵌套不会自死锁——其余空闲 worker 会消化分片，仅全部 worker 同时嵌套阻塞才死锁**；现调用点 `:771/:859/:875/:890/:915/:1030` 全在应用线程）。**【部分成立】** |
 | L10 | `:2937-2938` | dump 路径 `swprintf` 截断无提示；`:2544/:2235` 分片偏移用 round 估算与 ffmpeg `-t` 实际帧数可差 ±1（接缝丢/重帧的低概率来源） |
 | L11 | `:1073-1091` 等 | 死代码清单：`resize_rgb48`、`Channel::clear`、`image_has_signal`、`OutputFrame::blank`/`input_has_signal`（只写不读）、`eval_index`（只增不读）、`GpuFlow::full_copy_ready`（恒 false）、GpuFlow 的 cb 缓冲（创建 256 字节从未绑定） |
 
@@ -222,7 +237,7 @@
 | L27 | `dlss_cuda.cpp:514/:1242`、`g_error` | 进程级 static 无线程安全（当前单线程用法良性，值得注明约束） |
 | L28 | `dlss_cuda.cpp:798 vs 845` | `__NGX_LOG_LEVEL` 硬编码 "3"，与 `desc.log_level` 脱节 |
 | L29 | `dlss_cuda.cpp:1053-1063` | 复用 feature 时 `render_preset`/DLSS_PRESET 变更被静默吞掉（只在创建时下发） |
-| L30 | `frame_blit.cpp:196-210, 234-237, 272-275` | init 失败路径泄漏 g.vs/g.ps（只释放 cs/raw_cs），且 `g.device` 在成功前已被赋值 |
+| L30 | `frame_blit.cpp:234-237, 272-275, 303` | init 失败路径泄漏 g.vs/g.ps（**复核勘误：`:196-210` 两处其实已正确释放 vs/ps；真正泄漏点为 `:234-237`、`:272-275`，另 `:303` 也漏释放**），且 `g.device` 在成功前已被赋值 |
 | L31 | `frame_blit.cpp:114-121` | 描述符堆 64 槽环形回卷覆写依赖"每帧必 flush"的隐式约定，无注释/断言 |
 | L32 | `dlss_layer/ngx_cuda.h:73-92` | `NVSDK_NGX_Parameter` 纯虚接口无虚析构（当前无害，未来经基类指针 delete 即 UB） |
 
@@ -246,6 +261,8 @@
 ---
 
 ## 四、脚本与构建系统
+
+> **复核（2026-09-15）**：S2-S12 已逐条复核——**S4-S12 属实**（S8 行号应为 `21-25/88`、S11 的 `*.txt` 应为 `:69`，均差 1 行，不影响结论）；**S2/S3 部分成立**：技术内容属实，但 `build_qt_gui.bat` 被 `.gitignore` 忽略、不在 f758aad 中，行号以工作区文件为准。
 
 | # | 级别 | 位置 | 问题 |
 |---|------|------|------|
@@ -311,4 +328,4 @@
 
 ---
 
-*审查方式说明：本报告由 AI 辅助完成全文审查（并行多代理逐文件细读 + 关键发现人工对照源码复核）。标 ✅ 的条目已逐行核对源码确认；其余条目行号来自审查代理，修复前请以实际源码为准。*
+*审查方式说明：本报告由 AI 辅助完成全文审查（并行多代理逐文件细读 + 关键发现人工对照源码复核），全部条目已于 2026-09-15 逐条对照 f758aad 源码复核完毕：63 属实 / 5 部分成立（L4/L7/L9/S2/S3）/ 0 不成立，勘误均已行内注明。*

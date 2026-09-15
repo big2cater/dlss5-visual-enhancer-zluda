@@ -73,6 +73,10 @@ private:
     void stop_run();
     void open_compare();
     void probe_total();
+    // One ffprobe per input: the preview and the run both need the frame rate and
+    // each used to spawn its own, blocking the interface thread twice for the same
+    // answer. The implementation says why the timeout is deliberately not shortened.
+    void probe_input_once(const QString &path);
     void read_error();
     void on_finished(int code, QProcess::ExitStatus status);
     void on_second_tick();
@@ -188,6 +192,10 @@ private:
     long frames_total_ = -1;
     int seconds_ = 0;
     QString last_frame_detail_;
+    // Cached answer from probe_input_once; an empty path means "not asked yet".
+    QString probe_path_;
+    double probe_rate_ = 0;
+    long long probe_frames_ = 0;
     // The output path was derived from the input, so it follows it until the
     // user types one of their own.
     bool auto_output_ = true;
