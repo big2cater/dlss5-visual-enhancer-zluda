@@ -201,6 +201,17 @@ bool init(ID3D12Device *device) {
         return false;
     }
 
+    // Every failure path from here on has to give back what has already been created.
+    // Three of them did not: the compiled shaders were leaked, and the raw pass leaked
+    // its root signature with them. That matters on a machine where init fails and the
+    // process stays alive -- a retry then pays for the leak as well.
+    auto release_partial = [&]() {
+        if (g.vs) { g.vs->Release(); g.vs = nullptr; }
+        if (g.ps) { g.ps->Release(); g.ps = nullptr; }
+        if (g.compute_root) { g.compute_root->Release(); g.compute_root = nullptr; }
+        if (g.raw_compute_root) { g.raw_compute_root->Release(); g.raw_compute_root = nullptr; }
+    };
+
     ID3DBlob *raw_cs = nullptr;
     if (!compile(kRawComputeSource, sizeof kRawComputeSource - 1, "main", "cs_5_0", &raw_cs)) {
         cs->Release();
@@ -234,6 +245,7 @@ bool init(ID3D12Device *device) {
     if (!make_root_signature(compute_desc, &g.compute_root)) {
         cs->Release();
         raw_cs->Release();
+        release_partial();
         return false;
     }
 
@@ -271,6 +283,7 @@ bool init(ID3D12Device *device) {
     raw_desc.pParameters = raw_params;
     if (!make_root_signature(raw_desc, &g.raw_compute_root)) {
         raw_cs->Release();
+        release_partial();
         return false;
     }
 
@@ -300,7 +313,10 @@ bool init(ID3D12Device *device) {
     graphics_desc.NumParameters = 1;
     graphics_desc.pParameters = &graphics_param;
     graphics_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-    if (!make_root_signature(graphics_desc, &g.graphics_root)) return false;
+    if (!make_root_signature(graphics_desc, &g.graphics_root)) {
+        release_partial();
+        return false;
+    }
 
     // View heap with 64 slots for circular allocation across multiple dispatches
     D3D12_DESCRIPTOR_HEAP_DESC view_heap{};

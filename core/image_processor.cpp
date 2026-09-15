@@ -232,6 +232,10 @@ struct Processor::State {
     unsigned width = 0, height = 0, out_width = 0, out_height = 0;
 
     bool started = false;
+    // Set when a fence wait fails or a command list Reset fails: the pipeline is then
+    // in a state nobody can describe, and every later submission fails fast instead
+    // of racing work that is still in flight.
+    bool pipeline_dead = false;
     // Whether start() has ever run, successfully or not.
     bool attempted = false;
     double last_ms = 0.0;
@@ -239,7 +243,22 @@ struct Processor::State {
     bool dll_directory_set = false;
     Paths paths;
 
+    // D3D12 leaves both the allocator and the list in an unknown state when Reset
+    // fails -- which is what happens when the GPU is still executing the previous
+    // list. Recording into a list in an unknown state is undefined behaviour, so a
+    // failed Reset retires the pipeline: later frames fail with a message instead.
+    bool begin_command_list() {
+        if (pipeline_dead) return false;
+        if (!allocator || !cmd) return false;
+        if (FAILED(allocator->Reset()) || FAILED(cmd->Reset(allocator, nullptr))) {
+            pipeline_dead = true;
+            return false;
+        }
+        return true;
+    }
+
     bool wait() {
+        if (pipeline_dead) return false;
         if (!queue || !fence) return false;
         const UINT64 target = ++fence_value;
         if (FAILED(queue->Signal(fence, target))) {
@@ -252,6 +271,10 @@ struct Processor::State {
             }
             const DWORD wr = WaitForSingleObject(fence_event, 10000);
             if (wr == WAIT_TIMEOUT || wr == WAIT_FAILED) {
+                // The queue has not drained. Everything the caller does next -- reset
+                // the allocator, record a new list, read the staging buffer -- assumes
+                // it has, so retire the pipeline instead of losing the race quietly.
+                pipeline_dead = true;
                 if (device) {
                     const HRESULT hr = device->GetDeviceRemovedReason();
                     char msg[128];
@@ -314,6 +337,18 @@ bool Processor::start(const Paths &paths, std::string &error,
     // Ensure environment is correctly configured for GPU architecture (e.g. RDNA 4 self-healing)
     dlssnr::auto_configure_gpu_environment();
 
+    // Which card that chose, so D3D12 agrees with it. The shared textures the CUDA
+    // layer copies through cannot cross adapters, and on a machine with an AMD card
+    // plus a larger non-AMD one the VRAM-only rule below picked the other card.
+    // Empty means the selection could not be made; the VRAM rule then stands alone.
+    std::wstring preferred_gpu;
+    {
+        const auto gpus = dlssnr::enumerate_gpus();
+        if (const dlssnr::DetectedGpu *chosen = dlssnr::select_primary_gpu(gpus)) {
+            preferred_gpu = chosen->name;
+        }
+    }
+
     // Select the best discrete high-performance GPU:
     // 1. Enumerate all adapters, filtering out software and virtual adapters (GameViewer, ToDesk, etc.).
     // 2. Prioritize discrete GPUs with the largest dedicated VRAM that support D3D12 FL 12_0.
@@ -327,6 +362,9 @@ bool Processor::start(const Paths &paths, std::string &error,
     IDXGIAdapter1 *best_adapter = nullptr;
     DXGI_ADAPTER_DESC1 best_desc{};
     size_t best_vram = 0;
+    // Once the adapter the auto-configuration named has been taken, a larger one
+    // later in the enumeration must not displace it again.
+    bool took_preferred = false;
 
     IDXGIAdapter1 *adapter = nullptr;
     // Only S_OK keeps the walk going: any other result leaves the out pointer
@@ -341,12 +379,15 @@ bool Processor::start(const Paths &paths, std::string &error,
                 if (SUCCEEDED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&test_device)))) {
                     test_device->Release();
                     size_t vram = (size_t)(desc.DedicatedVideoMemory / (1024 * 1024));
-                    if (!best_adapter || vram > best_vram) {
+                    const bool is_preferred = !preferred_gpu.empty() &&
+                        _wcsicmp(desc.Description, preferred_gpu.c_str()) == 0;
+                    if (is_preferred || (!took_preferred && (!best_adapter || vram > best_vram))) {
                         if (best_adapter) best_adapter->Release();
                         best_adapter = adapter;
                         best_adapter->AddRef();
                         best_desc = desc;
                         best_vram = vram;
+                        if (is_preferred) took_preferred = true;
                     }
                 }
             }
@@ -687,8 +728,11 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-        s->allocator->Reset();
-        s->cmd->Reset(s->allocator, nullptr);
+        if (!s->begin_command_list()) {
+            error = "the command list could not be reset: the GPU has not released it";
+            out.pixels.clear();
+            return false;
+        }
         s->cmd->ResourceBarrier(1, &barrier);
         s->cmd->CopyTextureRegion(&into, 0, 0, 0, &from, nullptr);
         std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
@@ -705,6 +749,9 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
 
     // Optional motion-vector guidance (video): either copy a GPU-produced
     // packed R16G16_FLOAT buffer directly, or use the compatibility CPU map.
+    // Whether an upload actually happened, so the binding below can refuse to hand
+    // the network a texture that still holds the previous frame's vectors.
+    bool motion_uploaded = false;
     if (motion_gpu && motion_gpu_row_pitch >= in.width * 4 && s->motion_tex) {
         D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = s->motion_tex;
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -720,7 +767,11 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         mb.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
         mb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         mb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        s->allocator->Reset(); s->cmd->Reset(s->allocator, nullptr);
+        if (!s->begin_command_list()) {
+            error = "the command list could not be reset: the GPU has not released it";
+            out.pixels.clear();
+            return false;
+        }
         s->cmd->ResourceBarrier(1, &mb);
         s->cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         std::swap(mb.Transition.StateBefore, mb.Transition.StateAfter);
@@ -731,6 +782,7 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
             out.pixels.clear();
             return false;
         }
+        motion_uploaded = true;
     } else if (motion && !motion->empty() && motion->width == in.width &&
         motion->height == in.height && s->motion_tex && s->motion_up) {
         const UINT mPitch = aligned_pitch((UINT)in.width * 4);
@@ -778,8 +830,11 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         mb.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
         mb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         mb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        s->allocator->Reset();
-        s->cmd->Reset(s->allocator, nullptr);
+        if (!s->begin_command_list()) {
+            error = "the command list could not be reset: the GPU has not released it";
+            out.pixels.clear();
+            return false;
+        }
         s->cmd->ResourceBarrier(1, &mb);
         s->cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         std::swap(mb.Transition.StateBefore, mb.Transition.StateAfter);
@@ -792,6 +847,7 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
             out.pixels.clear();
             return false;
         }
+        motion_uploaded = true;
     }
 
     dlss_cuda::FrameDesc frame{};
@@ -799,7 +855,12 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
     frame.color_is_shared = direct_upload;
     frame.output = s->result;
     const auto after_upload = std::chrono::steady_clock::now();
-    if ((motion_gpu || (motion && !motion->empty())) && s->motion_tex) {
+    // Only when an upload actually succeeded. The old condition asked whether motion
+    // was *passed in*, so a frame whose upload was skipped -- wrong pitch, wrong
+    // dimensions -- still bound the texture, which held the previous frame's vectors.
+    // Stale motion guidance is worse than none: it drags the temporal filter toward
+    // a frame that is no longer there.
+    if (motion_uploaded && s->motion_tex) {
         frame.motion_vectors = s->motion_tex;
         frame.mv_scale_x = -1.0f / (float)in.width;
         frame.mv_scale_y = -1.0f / (float)in.height;
@@ -905,8 +966,11 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         target.PlacedFootprint.Footprint.Depth = 1;
         target.PlacedFootprint.Footprint.RowPitch = out_padded;
 
-        s->allocator->Reset();
-        s->cmd->Reset(s->allocator, nullptr);
+        if (!s->begin_command_list()) {
+            error = "the command list could not be reset: the GPU has not released it";
+            out.pixels.clear();
+            return false;
+        }
         s->cmd->ResourceBarrier(1, &back);
         s->cmd->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
         std::swap(back.Transition.StateBefore, back.Transition.StateAfter);
@@ -1040,7 +1104,15 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
     }
 
     // Motion vector handling if present
-    if (motion_gpu && s->motion_tex) {
+    // Same contract as process(): a pitch that cannot hold one row must not be handed
+    // to the copy as a footprint. Zero means "not specified", which is the case the
+    // in-repo callers use, and it keeps working through the fallback below.
+    const UINT motion_gpu_pitch = motion_gpu_row_pitch ? motion_gpu_row_pitch
+                                                       : aligned_pitch((UINT)width * 4);
+    // Only a successful upload may hand the network a motion texture; see the same
+    // flag in process() for why a stale one is worse than none.
+    bool motion_uploaded = false;
+    if (motion_gpu && motion_gpu_pitch >= width * 4 && s->motion_tex) {
         D3D12_TEXTURE_COPY_LOCATION into{};
         into.pResource = s->motion_tex;
         into.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -1051,7 +1123,7 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
         from.PlacedFootprint.Footprint.Width = width;
         from.PlacedFootprint.Footprint.Height = height;
         from.PlacedFootprint.Footprint.Depth = 1;
-        from.PlacedFootprint.Footprint.RowPitch = motion_gpu_row_pitch ? motion_gpu_row_pitch : aligned_pitch((UINT)width * 4);
+        from.PlacedFootprint.Footprint.RowPitch = motion_gpu_pitch;
 
         D3D12_RESOURCE_BARRIER mb{};
         mb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1060,8 +1132,11 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
         mb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         mb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-        s->allocator->Reset();
-        s->cmd->Reset(s->allocator, nullptr);
+        if (!s->begin_command_list()) {
+            error = "the command list could not be reset: the GPU has not released it";
+            out.pixels.clear();
+            return false;
+        }
         s->cmd->ResourceBarrier(1, &mb);
         s->cmd->CopyTextureRegion(&into, 0, 0, 0, &from, nullptr);
         std::swap(mb.Transition.StateBefore, mb.Transition.StateAfter);
@@ -1074,6 +1149,7 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
             out.pixels.clear();
             return false;
         }
+        motion_uploaded = true;
     } else if (motion && !motion->empty() && motion->width == width &&
                motion->height == height && s->motion_tex && s->motion_up) {
         const UINT motion_pitch = aligned_pitch((UINT)width * 4);
@@ -1119,6 +1195,7 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
                 out.pixels.clear();
                 return false;
             }
+            motion_uploaded = true;
         }
     }
 
@@ -1126,7 +1203,7 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
     frame.color = nullptr;
     frame.color_is_shared = true;
     frame.output = s->result;
-    if ((motion_gpu || (motion && !motion->empty())) && s->motion_tex) {
+    if (motion_uploaded && s->motion_tex) {
         frame.motion_vectors = s->motion_tex;
         frame.mv_scale_x = -1.0f / (float)width;
         frame.mv_scale_y = -1.0f / (float)height;
@@ -1214,8 +1291,11 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
         target.PlacedFootprint.Footprint.Depth = 1;
         target.PlacedFootprint.Footprint.RowPitch = out_padded;
 
-        s->allocator->Reset();
-        s->cmd->Reset(s->allocator, nullptr);
+        if (!s->begin_command_list()) {
+            error = "the command list could not be reset: the GPU has not released it";
+            out.pixels.clear();
+            return false;
+        }
         s->cmd->ResourceBarrier(1, &back);
         s->cmd->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
         std::swap(back.Transition.StateBefore, back.Transition.StateAfter);

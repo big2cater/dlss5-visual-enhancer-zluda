@@ -166,15 +166,20 @@ inline bool is_rdna4_gpu(const std::wstring &name_lower, UINT device_id) {
             (device_id >= 0x7590 && device_id <= 0x759F));
 }
 
-inline void auto_configure_gpu_environment() {
-    // 1. Enumerate GPUs via DXGI
-    auto gpus = enumerate_gpus();
-    if (gpus.empty()) {
-        report_auto_config("[GPU-AutoConfig] Warning: CreateDXGIFactory1 failed\n");
-        return;
-    }
-
-    // 2. Find primary discrete GPU (highest VRAM, non-virtual)
+// The one place that decides which GPU this process means.
+//
+// It used to be decided in three, and they disagreed. Here: the largest AMD card if
+// there is one, otherwise the largest card. In image_processor::start(): the largest
+// card, with no vendor preference at all. In the precompile: HIP device index 0. On
+// a machine with an AMD card and a larger non-AMD one, D3D12 therefore uploaded and
+// read back on the other card while every ZLUDA-side choice named the AMD one -- and
+// the CUDA/D3D12 shared textures the layer works through cannot cross adapters.
+//
+// D3D12 and the auto-configuration both call this now. The precompile keeps index 0,
+// which is the same card: ZLUDA exposes exactly the adapter this returns, so on the
+// driver the index counts from zero *this* is device zero -- not "whatever was first
+// in some other enumeration".
+inline const DetectedGpu *select_primary_gpu(const std::vector<DetectedGpu> &gpus) {
     const DetectedGpu *best_gpu = nullptr;
     for (const auto &gpu : gpus) {
         if (gpu.is_virtual) continue;
@@ -188,9 +193,8 @@ inline void auto_configure_gpu_environment() {
             if (!gpu.is_software) { best_gpu = &gpu; break; }
         }
     }
-    if (!best_gpu) return;
+    if (!best_gpu) return nullptr;
 
-    // 3. Inspect if primary or any discrete GPU is AMD (0x1002), prioritizing largest AMD discrete VRAM
     const DetectedGpu *best_amd_gpu = nullptr;
     for (const auto &gpu : gpus) {
         if (!gpu.is_virtual && gpu.vendor_id == 0x1002) {
@@ -199,10 +203,27 @@ inline void auto_configure_gpu_environment() {
             }
         }
     }
-    bool is_amd = (best_amd_gpu != nullptr) || (best_gpu->vendor_id == 0x1002);
-    if (best_amd_gpu && (best_gpu->vendor_id != 0x1002 || best_amd_gpu->dedicated_vram_mb > best_gpu->dedicated_vram_mb)) {
+    if (best_amd_gpu && (best_gpu->vendor_id != 0x1002 ||
+                         best_amd_gpu->dedicated_vram_mb > best_gpu->dedicated_vram_mb)) {
         best_gpu = best_amd_gpu;
     }
+    return best_gpu;
+}
+
+inline void auto_configure_gpu_environment() {
+    // 1. Enumerate GPUs via DXGI
+    auto gpus = enumerate_gpus();
+    if (gpus.empty()) {
+        report_auto_config("[GPU-AutoConfig] Warning: CreateDXGIFactory1 failed\n");
+        return;
+    }
+
+    // 2. The one selection, shared with the D3D12 side (see select_primary_gpu above
+    // for why it must not be decided twice). It prefers an AMD card, so "the chosen
+    // one is AMD" and "an AMD card exists" are the same question here.
+    const DetectedGpu *best_gpu = select_primary_gpu(gpus);
+    if (!best_gpu) return;
+    const bool is_amd = (best_gpu->vendor_id == 0x1002);
 
     if (is_amd) {
         std::wstring name_lower = best_gpu->name;

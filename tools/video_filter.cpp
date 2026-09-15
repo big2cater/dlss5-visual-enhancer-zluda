@@ -1706,7 +1706,7 @@ struct GpuFlow {
     ID3D12Resource *prev = nullptr, *cur = nullptr, *out = nullptr, *full_out = nullptr, *history = nullptr, *readback = nullptr, *cb = nullptr;
     unsigned fw = 0, fh = 0, qw = 0, qh = 0;
     std::vector<unsigned> prev_luma;
-    bool ready = false, has_prev = false, full_copy_ready = false;
+    bool ready = false, has_prev = false;
 
     template<class T> static void rel(T *&p) { if (p) { p->Release(); p = nullptr; } }
     ~GpuFlow() { stop(); }
@@ -1721,7 +1721,7 @@ struct GpuFlow {
         rel(prev); rel(cur); rel(out); rel(full_out); rel(history); rel(readback); rel(cb); rel(heap); rel(pso); rel(root);
         rel(cmd); rel(allocator); rel(fence); rel(queue); rel(device);
         if (fence_event) { CloseHandle(fence_event); fence_event = nullptr; }
-        ready = false; has_prev = false; full_copy_ready = false; prev_luma.clear();
+        ready = false; has_prev = false; prev_luma.clear();
     }
     bool init(unsigned W, unsigned H, ID3D12Device *external_device = nullptr,
               ID3D12CommandQueue *external_queue = nullptr) {
@@ -1795,6 +1795,19 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
         UINT64 n=(UINT64)qw*qh*4; if(FAILED(buffer(n,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,&prev)) || FAILED(buffer(n,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,&cur)) || FAILED(buffer((UINT64)qw*qh*8,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,&out)) || FAILED(buffer((UINT64)fw*fh*4,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,&full_out)) || FAILED(buffer((UINT64)fw*fh*4,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,&history)) || FAILED(buffer((UINT64)qw*qh*8,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST,&readback)) || FAILED(buffer(256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,&cb))) return false;
         return true;
     }
+    // Signal the fence and wait for it. A timeout means the GPU has not drained, and
+    // the readback below would then be reading a buffer nothing has written yet --
+    // which is how a garbage flow field used to be handed to the network as a
+    // success. Returns false so the caller can fall back to the CPU flow path
+    // instead of pretending.
+    bool sync() {
+        const UINT64 target = ++fence_value;
+        queue->Signal(fence, target);
+        if (fence->GetCompletedValue() >= target) return true;
+        if (FAILED(fence->SetEventOnCompletion(target, fence_event))) return false;
+        return WaitForSingleObject(fence_event, 5000) == WAIT_OBJECT_0;
+    }
+
     bool compute(const std::vector<unsigned> &cur_luma, std::vector<short> &flow) {
         if(!ready || cur_luma.size()!=(size_t)qw*qh) return false;
         if(!has_prev) { prev_luma=cur_luma; has_prev=true; flow.assign((size_t)qw*qh*2,0); return true; }
@@ -1819,7 +1832,7 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
         device->CreateUnorderedAccessView(out,nullptr,&uv,{base.ptr+cpu*3});
         D3D12_UNORDERED_ACCESS_VIEW_DESC fv{}; fv.ViewDimension=D3D12_UAV_DIMENSION_BUFFER; fv.Format=DXGI_FORMAT_UNKNOWN; fv.Buffer.NumElements=fw*fh; fv.Buffer.StructureByteStride=4;
         device->CreateUnorderedAccessView(full_out,nullptr,&fv,{base.ptr+cpu*4});
-        allocator->Reset(); cmd->Reset(allocator,pso); ID3D12DescriptorHeap *hs[]={heap}; cmd->SetDescriptorHeaps(1,hs); cmd->SetComputeRootSignature(root); cmd->SetComputeRoot32BitConstants(0,4,constants,0); auto gpu=heap->GetGPUDescriptorHandleForHeapStart(); cmd->SetComputeRootDescriptorTable(1,gpu); cmd->SetComputeRootDescriptorTable(2,{gpu.ptr+cpu*3}); cmd->Dispatch((qw+7)/8,(qh+7)/8,1); D3D12_RESOURCE_BARRIER b[3]{}; b[0].Type=D3D12_RESOURCE_BARRIER_TYPE_UAV; b[0].UAV.pResource=out; b[1].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[1].Transition.pResource=out; b[1].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[1].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[1].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b[2].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[2].Transition.pResource=full_out; b[2].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[2].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[2].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; cmd->ResourceBarrier(3,b); cmd->CopyResource(readback,out); cmd->Close(); ID3D12CommandList *ls[]={cmd}; queue->ExecuteCommandLists(1,ls); queue->Signal(fence,++fence_value); if(fence->GetCompletedValue()<fence_value){fence->SetEventOnCompletion(fence_value,fence_event);WaitForSingleObject(fence_event,5000);}
+        allocator->Reset(); cmd->Reset(allocator,pso); ID3D12DescriptorHeap *hs[]={heap}; cmd->SetDescriptorHeaps(1,hs); cmd->SetComputeRootSignature(root); cmd->SetComputeRoot32BitConstants(0,4,constants,0); auto gpu=heap->GetGPUDescriptorHandleForHeapStart(); cmd->SetComputeRootDescriptorTable(1,gpu); cmd->SetComputeRootDescriptorTable(2,{gpu.ptr+cpu*3}); cmd->Dispatch((qw+7)/8,(qh+7)/8,1); D3D12_RESOURCE_BARRIER b[3]{}; b[0].Type=D3D12_RESOURCE_BARRIER_TYPE_UAV; b[0].UAV.pResource=out; b[1].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[1].Transition.pResource=out; b[1].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[1].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[1].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b[2].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[2].Transition.pResource=full_out; b[2].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[2].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[2].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; cmd->ResourceBarrier(3,b); cmd->CopyResource(readback,out); cmd->Close(); ID3D12CommandList *ls[]={cmd}; queue->ExecuteCommandLists(1,ls); if(!sync()) return false;
         allocator->Reset(); cmd->Reset(allocator,nullptr);
         D3D12_RESOURCE_BARRIER hb[3]{};
         hb[0].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1843,12 +1856,11 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
         hb[2].Transition.StateAfter=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         hb[2].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         cmd->ResourceBarrier(1,&hb[2]);
-        cmd->Close(); ID3D12CommandList *hls[]={cmd}; queue->ExecuteCommandLists(1,hls); queue->Signal(fence,++fence_value); if(fence->GetCompletedValue()<fence_value){fence->SetEventOnCompletion(fence_value,fence_event);WaitForSingleObject(fence_event,5000);}
+        cmd->Close(); ID3D12CommandList *hls[]={cmd}; queue->ExecuteCommandLists(1,hls); if(!sync()) return false;
         int *r=nullptr; D3D12_RANGE rr{0,(SIZE_T)qw*qh*8}; if(FAILED(readback->Map(0,&rr,(void**)&r))) return false; flow.resize((size_t)qw*qh*2); for(size_t i=0;i<(size_t)qw*qh;i++){flow[i*2]=(short)r[i*2];flow[i*2+1]=(short)r[i*2+1];} readback->Unmap(0,nullptr); prev_luma=cur_luma; return true;
     }
 };
 bool output_is_blank(const enhancer::Image &); // defined below the mode
-bool image_has_signal(const enhancer::Image &); // defined below the mode
 uint16_t image_peak(const enhancer::Image &);  // defined below the mode
 // The still path gets a higher bar than the video gate: a still is judged on one
 // frame, with no run of frames to tell a dark scene from a failed launch, so it
@@ -2134,11 +2146,8 @@ uint16_t image_peak(const enhancer::Image &image) {
 }
 
 // True when the input picture carries visible content (any sampled RGB
-// above sRGB ~27/255, linear ~0.008, binary16 0x2000). Kept for the places that
-// want the bare question; the blank verdicts below use the brighter bar.
-bool image_has_signal(const enhancer::Image &image) {
-    return image_peak(image) > 0x2000;
-}
+// above sRGB ~27/255, linear ~0.008, binary16 0x2000) -- the blank verdicts below
+// all use the brighter bar, and nothing was left that wanted the bare question.
 
 static int run_parallel_orchestrator(int argc, char **argv, const Options &options,
                                      const VideoParams &params,
@@ -2980,7 +2989,6 @@ static int run_main_once(int argc, char **argv) {
     });
 
     // Stage 2: GPU inference (Main thread)
-    unsigned eval_index = 0;
     while (!abort_pipeline.load()) {
         std::shared_ptr<InputFrame> in_frame;
         if (!ready_input_channel.pop(in_frame)) break;
@@ -3134,7 +3142,6 @@ static int run_main_once(int argc, char **argv) {
 
         // Send output frame to encoder
         ready_output_channel.push(out_frame);
-        ++eval_index;
 
         // TDR Prevention & DWM responsiveness:
         // High resolution (1080p, 1440p, 4K) or multipass keeps the GPU hardware queue heavily loaded.

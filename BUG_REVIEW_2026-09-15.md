@@ -29,6 +29,8 @@
 
 **同日第二轮修复**（在 v6 内，未发布过故同名重打）：除上述 M19/H1 两处残留（M19 增加"连续 3 次死线仍无模块完成则强杀幸存者"；H1 旁的空编码分支不再丢音轨）外，还修了 S4、S5、S6、M16、M17、M18、L33、L35，见各条目行内注。
 
+**同日第三轮修复**（"安排修"档，同一 v6 内）：M2（`State::wait()` 超时/Reset 失败后管线置死态快速失败；7 处 `Reset` 检查返回值）、M3（选卡收成 `core/gpu_detection.h` 的 `select_primary_gpu()`，`image_processor::start()` 优先采纳同一张卡并在采纳后不被更大卡顶掉；precompile 的 HIP device 0 经确认与之一致）、M4（`process_raw_rgb48` 补 pitch 下限守卫，0 仍按"未指定"处理）、M5（只有真正上传成功才绑定 motion 纹理，两处绑定都已改）、M6（GpuFlow 新增 `sync()`，仅 `WAIT_OBJECT_0` 算成功，超时落回 CPU 光流路径）、L12（子进程消失也刷新死线基准）、L13（`WaitForMultipleObjects` 失败详情改为同时写入 `straggler_detail`，不再被末尾计数覆盖）、L30（`frame_blit.cpp` 三处失败路径统一 `release_partial()`，不再漏放 vs/ps 与根签名）、L11 的一部分（`eval_index`、`full_copy_ready`、`image_has_signal` 已删；`resize_rgb48`、`Channel::clear`、`OutputFrame::blank`/`input_has_signal`、GpuFlow 的 `cb` 缓冲经核对同样无使用点，留待专门清理）。
+
 ---
 
 ## 一、高严重度（建议立即修复）

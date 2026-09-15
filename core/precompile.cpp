@@ -432,7 +432,11 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
                                                    60000);
         if (which == WAIT_FAILED) {
             DWORD err = GetLastError();
-            error = "WaitForMultipleObjects failed with error " + std::to_string(err);
+            // Kept in straggler_detail as well: the tail of this function overwrites
+            // `error` with a count, which is exactly what made this detail vanish from
+            // the message a user gets to read.
+            straggler_detail = "WaitForMultipleObjects failed with error " + std::to_string(err);
+            error = straggler_detail;
             for (HANDLE h : running) terminate_and_reap(h);
             failures += (unsigned)running.size() + (unsigned)(files.size() - next);
             running.clear();
@@ -445,10 +449,16 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
             for (size_t j = 0; j < running.size(); ++j) {
                 DWORD exit_code = STILL_ACTIVE;
                 if (!GetExitCodeProcess(running[j], &exit_code) || exit_code != STILL_ACTIVE) {
-                    // Child exited or vanished during this wait slice
+                    // Child exited or vanished during this wait slice. Either way the
+                    // tail changed, so the deadline counts from here: without this a
+                    // vanished child left last_completion stale and the deadline could
+                    // fire on the strength of a child that no longer exists. A handle
+                    // whose exit code could not be read leaves STILL_ACTIVE in place,
+                    // which is deliberately counted as a failure.
                     if (exit_code != 0) {
                         ++failures;
                     }
+                    last_completion = GetTickCount64();
                     ++progress.done;
                     CloseHandle(running[j]);
                     running.erase(running.begin() + j);
