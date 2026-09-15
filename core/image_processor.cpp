@@ -1155,7 +1155,20 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
         const UINT motion_pitch = aligned_pitch((UINT)width * 4);
         unsigned char *mapped = nullptr;
         D3D12_RANGE nothing{0, 0};
-        if (SUCCEEDED(s->motion_up->Map(0, &nothing, (void **)&mapped)) && mapped) {
+        const HRESULT map_hr = s->motion_up->Map(0, &nothing, (void **)&mapped);
+        if (FAILED(map_hr) || !mapped) {
+            // Same guard as process(): Map on the UPLOAD heap fails when the
+            // device is removed, and silently dropping the motion vectors
+            // would hide that hard failure behind a "no guidance" frame.
+            HRESULT reason = s->device ? s->device->GetDeviceRemovedReason() : E_FAIL;
+            char buf[128];
+            snprintf(buf, sizeof(buf), "motion upload Map failed (hr=0x%08X, reason=0x%08X)",
+                     (unsigned)map_hr, (unsigned)reason);
+            error = buf;
+            out.pixels.clear();
+            return false;
+        }
+        {
             const unsigned char *src = (const unsigned char *)motion->pixels.data();
             const UINT row_b = (UINT)width * 4;
             for (unsigned y = 0; y < height; ++y)
@@ -1181,8 +1194,14 @@ bool Processor::process_raw_rgb48(ID3D12Resource *raw_rgb48_buffer, unsigned wid
             mb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
             mb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-            s->allocator->Reset();
-            s->cmd->Reset(s->allocator, nullptr);
+            // Same guard as every other recording entry in this file: a raw
+            // allocator Reset on a pipeline whose fence wait already timed out
+            // is undefined, and the HRESULT must not be dropped either.
+            if (!s->begin_command_list()) {
+                error = "the command list could not be reset: the GPU has not released it";
+                out.pixels.clear();
+                return false;
+            }
             s->cmd->ResourceBarrier(1, &mb);
             s->cmd->CopyTextureRegion(&into, 0, 0, 0, &from, nullptr);
             std::swap(mb.Transition.StateBefore, mb.Transition.StateAfter);

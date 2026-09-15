@@ -123,6 +123,10 @@ struct State {
     SharedTexture color, depth, motion, output, backbuffer;
     dlss_cuda::FeatureDesc current{};
     bool initialized = false;
+    // Reusable staging row for sample_nonzero_bytes: it runs on every frame
+    // (twice on a blank-output verdict), and a per-call heap allocation there
+    // is a steady tax on the already synchronous evaluation path.
+    std::vector<unsigned char> sample_host;
 };
 
 State g;
@@ -1230,7 +1234,8 @@ static size_t sample_nonzero_bytes(CUarray array, bool *any_row_read = nullptr) 
     // Up to 24 rows spread over the image, so content confined to a band or to the
     // middle of a mostly dark frame is still seen.
     const size_t samples = rows < 24 ? rows : 24;
-    std::vector<unsigned char> host(row_bytes, 0);
+    if (g.sample_host.size() < row_bytes) g.sample_host.resize(row_bytes);
+    unsigned char *host = g.sample_host.data();
     size_t total = 0;
     for (size_t i = 0; i < samples; ++i) {
         const size_t row = samples == 1 ? 0 : (i * (rows - 1)) / (samples - 1);
@@ -1239,7 +1244,7 @@ static size_t sample_nonzero_bytes(CUarray array, bool *any_row_read = nullptr) 
         copy.srcArray = array;
         copy.srcY = row;
         copy.dstMemoryType = CU_MEMORYTYPE_HOST;
-        copy.dstHost = host.data();
+        copy.dstHost = host;
         copy.dstPitch = row_bytes;
         copy.WidthInBytes = row_bytes;
         copy.Height = 1;

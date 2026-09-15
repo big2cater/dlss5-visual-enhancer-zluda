@@ -78,6 +78,7 @@
 #include "../core/gpu_detection.h"
 #include "half_float.h"
 #include "hardware_budget.h"
+#include "probe_parse.h"
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "windowscodecs.lib")
@@ -522,42 +523,14 @@ bool probe_video(const std::wstring &input, VideoParams &params, std::string &er
     }
     child.close();
 
-    unsigned w = 0, h = 0;
-    char rate[64] = {};
-    char rate_avg[64] = {};
-    double dur = 0.0;
-    // avg_frame_rate is preferred over r_frame_rate: on a variable-frame-rate source
-    // the latter is the nominal rate while the average is what the timeline actually
-    // adds up to, and every frame-to-time conversion in this file (seek offsets, the
-    // encoder's -r, the duration arithmetic) is built from params.fps. Taking the
-    // nominal rate made the stream and the container disagree, which shows up as
-    // drift on VFR sources.
-    auto rate_of = [](const char *value, double &out) {
-        unsigned num = 0, den = 1;
-        if (sscanf(value, "%u/%u", &num, &den) == 2 && num && den) out = (double)num / den;
-        else if (sscanf(value, "%u", &num) == 1 && num) out = (double)num;
-    };
-    if (sscanf(text.c_str(), "%u,%u,%63s,%63s\n%lf", &w, &h, rate, rate_avg, &dur) >= 4 && w && h) {
-        params.width = w;
-        params.height = h;
-        params.duration = dur;
-        if (rate_avg[0]) rate_of(rate_avg, params.fps);
-        if (params.fps <= 0) rate_of(rate, params.fps);
-    } else if (sscanf(text.c_str(), "%u,%u,%63s,%63s", &w, &h, rate, rate_avg) == 4 && w && h) {
-        params.width = w;
-        params.height = h;
-        if (rate_avg[0]) rate_of(rate_avg, params.fps);
-        if (params.fps <= 0) rate_of(rate, params.fps);
-    } else if (sscanf(text.c_str(), "%u,%u,%63s\n%lf", &w, &h, rate, &dur) >= 3 && w && h) {
-        // An ffprobe too old to report avg_frame_rate: the nominal rate is all there is.
-        params.width = w;
-        params.height = h;
-        params.duration = dur;
-        rate_of(rate, params.fps);
-    } else {
-        error = "could not parse ffprobe output: " + text;
-        return false;
-    }
+    // The stream line is split and avg_frame_rate preferred in probe_parse.h;
+    // tests/probe_parse.cpp asserts the behaviour (the VFR case included).
+    ProbeVideoParams parsed;
+    if (!parse_probe_csv(text, parsed, error)) return false;
+    params.width = parsed.width;
+    params.height = parsed.height;
+    params.duration = parsed.duration;
+    params.fps = parsed.fps;
 
     // Probe primary audio stream codec
     Pipe apipe;
@@ -1719,6 +1692,11 @@ struct GpuFlow {
     unsigned fw = 0, fh = 0, qw = 0, qh = 0;
     std::vector<unsigned> prev_luma;
     bool ready = false, has_prev = false;
+    // Set when a fence wait fails or an allocator/list Reset fails: the GPU may
+    // still be executing the lists this allocator backs, so resetting it again
+    // is undefined. Once dead, compute() fails fast and every frame stays on
+    // the CPU estimator instead of racing in-flight work.
+    bool pipeline_dead = false;
 
     template<class T> static void rel(T *&p) { if (p) { p->Release(); p = nullptr; } }
     ~GpuFlow() { stop(); }
@@ -1799,7 +1777,7 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
         bool ok=SUCCEEDED(device->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pso))); cs->Release(); if(!ok) { fprintf(stderr, "[flow] CreateComputePipelineState failed\n"); rel(adapter); factory->Release(); stop(); return false; }
         D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors=5; hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if(FAILED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap)))) { fprintf(stderr, "[flow] CreateDescriptorHeap failed\n"); rel(adapter); factory->Release(); stop(); return false; }
-        rel(adapter); factory->Release(); ready=true; return resize();
+        rel(adapter); factory->Release(); ready=true; pipeline_dead=false; return resize();
     }
     bool resize() {
         rel(prev); rel(cur); rel(out); rel(readback);
@@ -1811,17 +1789,32 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
     // the readback below would then be reading a buffer nothing has written yet --
     // which is how a garbage flow field used to be handed to the network as a
     // success. Returns false so the caller can fall back to the CPU flow path
-    // instead of pretending.
+    // instead of pretending. Any failure also retires the pipeline: the next
+    // frame must not reset the allocator while this frame's lists may still be
+    // executing (same semantics as Processor::State::wait in image_processor.cpp).
     bool sync() {
         const UINT64 target = ++fence_value;
-        queue->Signal(fence, target);
+        if (FAILED(queue->Signal(fence, target))) { pipeline_dead = true; return false; }
         if (fence->GetCompletedValue() >= target) return true;
-        if (FAILED(fence->SetEventOnCompletion(target, fence_event))) return false;
-        return WaitForSingleObject(fence_event, 5000) == WAIT_OBJECT_0;
+        if (FAILED(fence->SetEventOnCompletion(target, fence_event))) { pipeline_dead = true; return false; }
+        if (WaitForSingleObject(fence_event, 5000) != WAIT_OBJECT_0) { pipeline_dead = true; return false; }
+        return true;
+    }
+
+    // Same guard as Processor::State::begin_command_list: a failed Reset leaves
+    // the allocator and the list in a state nobody can describe, so recording
+    // further is undefined and the pipeline is retired instead.
+    bool begin_command_list(ID3D12PipelineState *initial = nullptr) {
+        if (pipeline_dead) return false;
+        if (FAILED(allocator->Reset()) || FAILED(cmd->Reset(allocator, initial))) {
+            pipeline_dead = true;
+            return false;
+        }
+        return true;
     }
 
     bool compute(const std::vector<unsigned> &cur_luma, std::vector<short> &flow) {
-        if(!ready || cur_luma.size()!=(size_t)qw*qh) return false;
+        if(!ready || pipeline_dead || cur_luma.size()!=(size_t)qw*qh) return false;
         if(!has_prev) { prev_luma=cur_luma; has_prev=true; flow.assign((size_t)qw*qh*2,0); return true; }
         if (!prev || !cur) return false;
         unsigned *p = nullptr;
@@ -1844,8 +1837,8 @@ uint sample(ByteAddressBuffer b, uint i) { return b.Load(i * 4); }
         device->CreateUnorderedAccessView(out,nullptr,&uv,{base.ptr+cpu*3});
         D3D12_UNORDERED_ACCESS_VIEW_DESC fv{}; fv.ViewDimension=D3D12_UAV_DIMENSION_BUFFER; fv.Format=DXGI_FORMAT_UNKNOWN; fv.Buffer.NumElements=fw*fh; fv.Buffer.StructureByteStride=4;
         device->CreateUnorderedAccessView(full_out,nullptr,&fv,{base.ptr+cpu*4});
-        allocator->Reset(); cmd->Reset(allocator,pso); ID3D12DescriptorHeap *hs[]={heap}; cmd->SetDescriptorHeaps(1,hs); cmd->SetComputeRootSignature(root); cmd->SetComputeRoot32BitConstants(0,4,constants,0); auto gpu=heap->GetGPUDescriptorHandleForHeapStart(); cmd->SetComputeRootDescriptorTable(1,gpu); cmd->SetComputeRootDescriptorTable(2,{gpu.ptr+cpu*3}); cmd->Dispatch((qw+7)/8,(qh+7)/8,1); D3D12_RESOURCE_BARRIER b[3]{}; b[0].Type=D3D12_RESOURCE_BARRIER_TYPE_UAV; b[0].UAV.pResource=out; b[1].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[1].Transition.pResource=out; b[1].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[1].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[1].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b[2].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[2].Transition.pResource=full_out; b[2].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[2].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[2].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; cmd->ResourceBarrier(3,b); cmd->CopyResource(readback,out); cmd->Close(); ID3D12CommandList *ls[]={cmd}; queue->ExecuteCommandLists(1,ls); if(!sync()) return false;
-        allocator->Reset(); cmd->Reset(allocator,nullptr);
+        if(!begin_command_list(pso)) return false; ID3D12DescriptorHeap *hs[]={heap}; cmd->SetDescriptorHeaps(1,hs); cmd->SetComputeRootSignature(root); cmd->SetComputeRoot32BitConstants(0,4,constants,0); auto gpu=heap->GetGPUDescriptorHandleForHeapStart(); cmd->SetComputeRootDescriptorTable(1,gpu); cmd->SetComputeRootDescriptorTable(2,{gpu.ptr+cpu*3}); cmd->Dispatch((qw+7)/8,(qh+7)/8,1); D3D12_RESOURCE_BARRIER b[3]{}; b[0].Type=D3D12_RESOURCE_BARRIER_TYPE_UAV; b[0].UAV.pResource=out; b[1].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[1].Transition.pResource=out; b[1].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[1].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[1].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; b[2].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b[2].Transition.pResource=full_out; b[2].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[2].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; b[2].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; cmd->ResourceBarrier(3,b); cmd->CopyResource(readback,out); cmd->Close(); ID3D12CommandList *ls[]={cmd}; queue->ExecuteCommandLists(1,ls); if(!sync()) return false;
+        if(!begin_command_list()) return false;
         D3D12_RESOURCE_BARRIER hb[3]{};
         hb[0].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         hb[0].Transition.pResource=history;

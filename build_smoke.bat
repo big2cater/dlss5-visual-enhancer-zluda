@@ -37,4 +37,16 @@ cl /nologo /std:c++17 /EHsc /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX /DUNICO
 if errorlevel 1 exit /b 1
 del "%OUT%\*.obj" >nul 2>&1
 echo Built %OUT%\processor_smoke.exe
+
+REM The ffprobe parser assertions: quick, no GPU, and the one regression that
+REM used to hide as dead code (the avg_frame_rate branch).
+cl /nologo /std:c++17 /EHsc /O2 /W3 /D_CRT_SECURE_NO_WARNINGS /utf-8 ^
+   /I "%ROOT%tools" ^
+   "%ROOT%tests\probe_parse.cpp" ^
+   /Fo:"%OUT%\\" /Fe:"%OUT%\probe_parse.exe"
+if errorlevel 1 exit /b 1
+"%OUT%\probe_parse.exe"
+if errorlevel 1 exit /b 1
+del "%OUT%\*.obj" >nul 2>&1
+echo probe_parse assertions passed
 exit /b 0
