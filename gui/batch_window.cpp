@@ -121,7 +121,7 @@ BatchWindow::BatchWindow() {
     // The tag is what a user quotes when they report a problem, so it has to be the
     // version actually running. It sat at v2026.09.10-multipass through several
     // releases, which sent every report to the wrong place.
-    setWindowTitle(tr("DLSS 5 神经渲染滤镜 (AMD/ZLUDA) - v2026.09.14-v6"));
+    setWindowTitle(tr("DLSS 5 神经渲染滤镜 (AMD/ZLUDA) - v2026.09.14-v7"));
     setAcceptDrops(true);
 
     auto *central = new QWidget;
