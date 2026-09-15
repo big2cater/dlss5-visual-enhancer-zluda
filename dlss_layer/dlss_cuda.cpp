@@ -567,9 +567,17 @@ bool flush_and_wait() {
             return false;
         }
         const DWORD wr = WaitForSingleObject(g.fence_event, 10000);
-        if (wr == WAIT_TIMEOUT) {
+        if (wr != WAIT_OBJECT_0) {
+            // Only the signal counts as success. WAIT_TIMEOUT means the GPU
+            // has not drained; WAIT_FAILED means the wait never happened at
+            // all (a null event handle lands here) -- returning true for
+            // either would let the CUDA read below race the D3D12 copy.
             const HRESULT hr = g.device ? g.device->GetDeviceRemovedReason() : E_FAIL;
-            set_error("flush_and_wait timed out after 10s (device removed: 0x%08lX)", hr);
+            if (wr == WAIT_TIMEOUT)
+                set_error("flush_and_wait timed out after 10s (device removed: 0x%08lX)", hr);
+            else
+                set_error("flush_and_wait failed to wait on the fence event (wait returned %lu, "
+                          "device removed: 0x%08lX)", wr, hr);
             return false;
         }
     }
@@ -880,6 +888,12 @@ bool init(const InitDesc &desc) {
         return false;
     }
     g.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g.fence_event) {
+        // A null event makes every later wait fail with WAIT_FAILED; fail here
+        // where the reason is still the truth.
+        set_error("CreateEventW failed for the fence event (error %lu)", GetLastError());
+        return false;
+    }
 
     if (FAILED(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                 IID_PPV_ARGS(&g.allocator))) ||
@@ -1185,8 +1199,11 @@ bool create_feature(const FeatureDesc &desc) {
 // Non-zero bytes in a sparse sample of an array's rows. This asks the one question
 // that decides whether an empty output is a fault or just a dark frame: did the
 // image handed to the network have any content? Sampling rows instead of reading the
-// whole image keeps it cheap enough to run on a frame.
-static size_t sample_nonzero_bytes(CUarray array) {
+// whole image keeps it cheap enough to run on a frame. Reports through `any_row_read`
+// whether at least one row was actually read, so a failed read is not mistaken for a
+// read of an all-zero image.
+static size_t sample_nonzero_bytes(CUarray array, bool *any_row_read = nullptr) {
+    if (any_row_read) *any_row_read = false;
     if (!array || !g.cu.cuArrayGetDescriptor || !g.cu.cuMemcpy2D) return 0;
     CUDA_ARRAY_DESCRIPTOR ad{};
     if (g.cu.cuArrayGetDescriptor(&ad, array) != CUDA_SUCCESS) return 0;
@@ -1213,6 +1230,7 @@ static size_t sample_nonzero_bytes(CUarray array) {
         copy.WidthInBytes = row_bytes;
         copy.Height = 1;
         if (g.cu.cuMemcpy2D(&copy) != CUDA_SUCCESS) continue;
+        if (any_row_read) *any_row_read = true;
         for (size_t b = 0; b < row_bytes; ++b)
             if (host[b]) ++total;
     }
@@ -1235,10 +1253,43 @@ static bool finish_evaluation() {
     // return codes above say the calls were accepted; only the pixels say the
     // network ran.
     //
-    // Once, not once a frame: reading rows back costs real time and the answer
-    // does not change between frames. What it separates is a network that
-    // produced nothing from a result produced and then lost on its way to the
-    // screen.
+    // The empty-output verdict runs on EVERY evaluation. The race recorded in
+    // dlss_cuda.h -- the same parameters giving a good frame one run in two --
+    // does not confine itself to the first frame, so a check that retires after
+    // one successful read turns every later empty output back into a silent
+    // one. Sampling rows keeps the per-frame cost bounded; the once-per-process
+    // full read further down stays for what a row sample cannot see (a
+    // PARTIALLY written output, top band written and the rest zero). A read
+    // that fails is "unknown, keep looking", never evidence: that is why
+    // `any_row_read` gates the verdict instead of a zero count alone.
+    if (g.cu.cuMemcpy2D && g.cu.cuArrayGetDescriptor && g.output.level0) {
+        bool output_read = false;
+        const size_t output_nonzero = sample_nonzero_bytes(g.output.level0, &output_read);
+        if (output_read && output_nonzero == 0) {
+            bool input_read = false;
+            const size_t input_nonzero = sample_nonzero_bytes(g.color.level0, &input_read);
+            if (input_read && input_nonzero > 0) {
+                char line[384];
+                snprintf(line, sizeof line,
+                         "[dlss-cuda] network output: every sampled row is zero, while the "
+                         "input sample has %zu non-zero bytes: the evaluation did nothing\n",
+                         input_nonzero);
+                fputs(line, stderr);
+                if (g_reshade_log) g_reshade_log(line);
+                set_error("the network produced an empty output: every sampled row is zero, "
+                          "while the input sample holds %zu non-zero bytes -- the evaluation "
+                          "was accepted but did nothing",
+                          input_nonzero);
+                fflush(stderr);
+                return false;
+            }
+        }
+    }
+
+    // The once-per-process deep look: full height, not a sample, so it can see
+    // a partially written output and report where the output's content lives.
+    // Its all-zero verdict is redundant with the gate above when both reads
+    // work; it stays as the backstop for a frame whose sampled read failed.
     static bool reported = false;
     if (!reported && g.cu.cuMemcpy2D && g.output.level0) {
         CUDA_ARRAY_DESCRIPTOR ad{};

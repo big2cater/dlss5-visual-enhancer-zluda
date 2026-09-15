@@ -2419,12 +2419,21 @@ static int run_parallel_orchestrator(int argc, char **argv, const Options &optio
                      concat_list_path + L"\" -c:v copy -an \"" + options.output + L"\"";
     } else {
         std::wstring audio_args;
-        if (params.audio_codec == "wmapro" || params.audio_codec == "wmav2" ||
-            params.audio_codec == "wmavoice" || params.audio_codec == "pcm_s16le" ||
-            params.audio_codec == "pcm_s24le" || params.audio_codec == "alac") {
-            audio_args = L"-c:a aac -b:a 192k ";
-        } else {
+        // Same rule as the single-process path in start_encoder: MP4 has no
+        // standard mapping for most audio codecs, so anything outside the copy
+        // whitelist is transcoded to AAC. The blacklist this replaces was a
+        // copy-time divergence: a codec absent from it reached `-c:a copy`,
+        // ffmpeg rejected the concat -- and every shard had already been
+        // translated by then, so the whole GPU run was thrown away.
+        const bool is_mkv_output = options.output.size() >= 4 &&
+            (_wcsicmp(options.output.c_str() + options.output.size() - 4, L".mkv") == 0);
+        const std::string &ac = params.audio_codec;
+        const bool can_copy_in_mp4 = (ac == "aac" || ac == "mp3" || ac == "ac3" || ac == "eac3");
+        if (is_mkv_output || can_copy_in_mp4) {
             audio_args = L"-c:a copy ";
+        } else {
+            fprintf(stderr, "[audio] Input audio '%s' cannot be copied into MP4; transcoding to AAC (192 kbps)\n", ac.c_str());
+            audio_args = L"-c:a aac -b:a 192k ";
         }
         concat_cmd = tool_cmd(false) + L" -y -nostdin -v error -f concat -safe 0 -i \"" +
                      concat_list_path + L"\" -i \"" + options.input +

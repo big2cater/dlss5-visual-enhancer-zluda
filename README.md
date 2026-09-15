@@ -3,7 +3,7 @@
 > 在 AMD GPU（RDNA 3 / RDNA 4）上通过深度优化版 ZLUDA 满血运行 NVIDIA DLSS 5 Neural Rendering (DLSS-NR) 的图片增强与超清视频降噪工具。
 > High-performance DLSS 5 Neural Rendering image enhancement and video denoising pipeline running on AMD GPUs via ZLUDA.
 >
-> 最新发布：**v2026.09.14-v6** —— 修掉 CUDA 层一处静默失败（网络输出为空时曾被当作"成功"返回，现在会报错并让调用方重试，同时不会把暗场误判成故障）、预热尾部不再无声卡住（连续 10 分钟无模块完成即判定停滞并指名卡住的模块）、GPU 自动识别结果写入 `%TEMP%\dlssnr_gpu_autoconfig.log`；上一版（v5）含 MMA 配对融合提速（RX 7900 XT @640×360：单帧 87 → 67 ms）、"淡入黑场片头被误判为竞态"的判定修复、空白判定在编码 / 单图 / 处理器三处的同类补齐，以及单图明亮门槛的上调（余量 4.8% → 47%）；并修复 **RDNA4（gfx12）预热必然崩溃**的问题（详见随包说明）。
+> 最新发布：**v2026.09.14-v6** —— 修掉 CUDA 层一处静默失败（网络输出为空时曾被当作"成功"返回；现在**每帧**校验输出与输入采样，会报错并让调用方重试，同时不会把暗场误判成故障）、预热尾部不再无声卡住也不误杀慢机（连续 60 分钟无模块完成才触发，且只结束已停止消耗 CPU 的子进程）、GPU 自动识别结果写入 `%TEMP%\dlssnr_gpu_autoconfig.log`；并按全量代码审查修复了并行模式音频导致整段白做、运动上传 `Map()` 空指针崩溃、空白阈值常量笔误等条目（详见随包说明）；上一版（v5）含 MMA 配对融合提速（RX 7900 XT @640×360：单帧 87 → 67 ms）、"淡入黑场片头被误判为竞态"的判定修复、空白判定在编码 / 单图 / 处理器三处的同类补齐，以及单图明亮门槛的上调（余量 4.8% → 47%）；并修复 **RDNA4（gfx12）预热必然崩溃**的问题（详见随包说明）。
 
 ![Platform](https://img.shields.io/badge/platform-Windows_10%2F11-0078D4)
 ![GPU](https://img.shields.io/badge/GPU-AMD%20Radeon%20(RDNA3%20%2F%20RDNA4)-red)

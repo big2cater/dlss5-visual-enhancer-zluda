@@ -377,13 +377,18 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
     // fourteen modules in seconds and was still waiting on the fifteenth after three
     // minutes, and the parent would have waited indefinitely, GUI included.
     //
-    // So there is also a deadline on "nothing has finished at all". It has to be
-    // generous: a slow machine finishes modules one at a time and never reaches it,
-    // while a stuck tail does. Overridable for a machine that needs longer.
-    // Kept separate from `error` because the tail of this function overwrites
-    // `error` with a count, and a count is exactly what is not useful here.
+    // So there is also a deadline on "nothing has finished at all". When it fires,
+    // the CPU monitor's own verdict splits the children: one that has stopped
+    // accumulating CPU time is killed and counted as failed; one that is still
+    // burning CPU is left running and only named in a warning. The split exists
+    // because the largest module legitimately takes tens of minutes on a slow
+    // machine (see the comment in image_processor.cpp) -- a budget short enough to
+    // kill that one murders a healthy translation exactly where the machine is
+    // slowest. Overridable for a machine that needs a different budget. Kept
+    // separate from `error` because the tail of this function overwrites `error`
+    // with a count, and a count is exactly what is not useful here.
     std::string straggler_detail;
-    int no_progress_minutes = 10;
+    int no_progress_minutes = 60;
     {
         char forced[16] = {};
         if (GetEnvironmentVariableA("DLSSNR_PRECOMPILE_NO_PROGRESS_MINUTES", forced, sizeof forced) > 0 &&
@@ -473,33 +478,53 @@ bool precompile(const std::wstring &library_in, const std::wstring &driver_in, u
                     }
                 }
             }
-            // Nothing has finished for the whole budget while children are still
-            // running: the tail is not making visible progress. Name what is
-            // outstanding before killing it -- the progress line counts finished
-            // modules and never says which one is missing, which is what turned
-            // localising the straggler into a log archaeology pass.
+            // Nothing has finished for the whole budget while children are
+            // still running: the tail is not making visible progress. Name the
+            // outstanding modules -- the progress line counts finished modules
+            // and never says which one is missing, which is what turned
+            // localising the straggler into a log archaeology pass. Then split
+            // them the way the CPU monitor above already does: a child with no
+            // CPU progress is parked and killed; one still accumulating CPU
+            // time is a slow machine doing real work, and killing it discards
+            // a translation that only needed more time than the budget.
             if (!running.empty() &&
                 GetTickCount64() - last_completion > (ULONGLONG)no_progress_minutes * 60000ull) {
-                std::string names;
-                for (size_t j = 0; j < slots.size() && j < running.size(); ++j) {
-                    if (slots[j] >= files.size()) continue;
-                    std::wstring leaf = files[slots[j]];
+                std::string working, killed;
+                for (size_t j = 0; j < running.size(); ++j) {
+                    const size_t slot = j < slots.size() ? slots[j] : files.size();
+                    std::wstring leaf = slot < files.size() ? files[slot] : L"(unknown module)";
                     const size_t slash = leaf.find_last_of(L"\\/");
                     if (slash != std::wstring::npos) leaf = leaf.substr(slash + 1);
-                    if (!names.empty()) names += ", ";
-                    names += to_utf8(leaf);
+                    std::string &sink = (j < stalled.size() && stalled[j] > 0) ? killed : working;
+                    if (!sink.empty()) sink += ", ";
+                    sink += to_utf8(leaf);
                 }
-                straggler_detail = "no module finished for " + std::to_string(no_progress_minutes) +
-                                   " minutes; killed " + std::to_string(running.size()) +
-                                   " child(ren) still working on " + names;
-                error = straggler_detail;
-                for (HANDLE h : running) terminate_and_reap(h);
-                failures += (unsigned)running.size() + (unsigned)(files.size() - next);
-                running.clear();
-                cpu.clear();
-                stalled.clear();
-                slots.clear();
-                break;
+                for (size_t j = 0; j < running.size(); ++j) {
+                    if (j < stalled.size() && stalled[j] > 0) {
+                        terminate_and_reap(running[j]);
+                        ++failures;
+                        ++progress.done;
+                        running.erase(running.begin() + j);
+                        cpu.erase(cpu.begin() + j);
+                        stalled.erase(stalled.begin() + j);
+                        slots.erase(slots.begin() + j);
+                        --j; // vector shrank under us
+                    }
+                }
+                if (straggler_detail.empty()) {
+                    straggler_detail = "no module finished for " +
+                                       std::to_string(no_progress_minutes) + " minutes";
+                    if (!killed.empty())
+                        straggler_detail += "; killed (no CPU progress): " + killed;
+                    if (!working.empty())
+                        straggler_detail += "; still translating (left running): " + working;
+                }
+                // The survivors get one visible warning and keep going. The
+                // deadline re-fires on every later silent slice and kills
+                // whatever has gone quiet since; a child that keeps burning
+                // CPU is never its target.
+                progress.message = straggler_detail;
+                if (report) report(progress);
             }
             continue; // keep waiting on the survivors
         }

@@ -164,8 +164,10 @@ bool looks_like_blank_result(const Image &in, const Image &out) {
     if (in.empty() || out.empty()) return false;
     // Bright input threshold: linear 0.35 -> 0x359A in FP16.
     constexpr uint16_t signal = 0x359A;
-    // Blank output threshold: 0.005 in linear FP16 is 0x191e.
-    constexpr uint16_t blank = 0x191e;
+    // Blank output threshold: 0.005 in linear FP16 is 0x1D1F. (0x191e is
+    // 0.0025 -- half the intended bar, which let frames peaking in
+    // (0.0025, 0.005] pass as blank.)
+    constexpr uint16_t blank = 0x1D1F;
     bool input_has_signal = false;
     const size_t in_pixels = in.pixels.size() / 4;
     for (size_t p = 0; p < in_pixels; ++p) {
@@ -735,7 +737,19 @@ bool Processor::process(const Image &in, Image &out, const Settings &settings,
         {
             unsigned char *mapped = nullptr;
             D3D12_RANGE nothing{0, 0};
-            s->motion_up->Map(0, &nothing, (void **)&mapped);
+            const HRESULT map_hr = s->motion_up->Map(0, &nothing, (void **)&mapped);
+            if (FAILED(map_hr) || !mapped) {
+                // Same guard as the colour upload above: Map on the UPLOAD heap
+                // fails when the device is removed, and memcpy(nullptr) is not
+                // a way to report that.
+                HRESULT reason = s->device ? s->device->GetDeviceRemovedReason() : E_FAIL;
+                char buf[128];
+                snprintf(buf, sizeof(buf), "motion upload Map failed (hr=0x%08X, reason=0x%08X)",
+                         (unsigned)map_hr, (unsigned)reason);
+                error = buf;
+                out.pixels.clear();
+                return false;
+            }
             const unsigned char *source = (const unsigned char *)motion->pixels.data();
             const size_t row_bytes_motion = (size_t)in.width * 4;
             if (mPitch == row_bytes_motion) {

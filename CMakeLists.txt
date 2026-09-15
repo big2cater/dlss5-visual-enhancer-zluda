@@ -56,6 +56,11 @@ if(Qt6_FOUND)
     target_include_directories(dlssnr_gui PRIVATE core)
     target_link_libraries(dlssnr_gui PRIVATE Qt6::Widgets dxgi)
     target_compile_definitions(dlssnr_gui PRIVATE UNICODE _UNICODE NOMINMAX)
+    # Same as video_filter/processor_smoke below: the sources carry non-ASCII
+    # string literals, and the build must not leave their encoding to the
+    # machine's active code page. (Factory exes shipped correct UTF-8 so far,
+    # but that was luck of the build machine, not a guarantee.)
+    target_compile_options(dlssnr_gui PRIVATE /utf-8)
 endif()
 
 # Console tools, no Qt. Built whenever the CMake generator can build them;
