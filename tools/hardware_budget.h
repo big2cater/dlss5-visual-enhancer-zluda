@@ -54,16 +54,25 @@ inline HardwareInfo detect_hardware_budget(double video_duration_sec = 0.0, int 
                 size_t vram_mb = (size_t)(desc.DedicatedVideoMemory / (1024 * 1024));
                 if (vram_mb > info.total_vram_mb) {
                     info.total_vram_mb = vram_mb;
-                    info.avail_vram_mb = vram_mb / 2; // conservative fallback if QueryVideoMemoryInfo unavailable
+                    // Only used when the DXGI 1.4 query below is unavailable (very old
+                    // runtimes). Half of a large card is not a small number, so it is a
+                    // guess, not a conservative estimate -- see Gate 5.
+                    info.avail_vram_mb = vram_mb / 2;
 
                     // Check for DXGI 1.4 memory info
                     IDXGIAdapter3 *adapter3 = nullptr;
                     if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void **)&adapter3)) && adapter3) {
                         DXGI_QUERY_VIDEO_MEMORY_INFO qinfo{};
                         if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &qinfo))) {
-                            if (qinfo.Budget > qinfo.CurrentUsage) {
-                                info.avail_vram_mb = (size_t)((qinfo.Budget - qinfo.CurrentUsage) / (1024 * 1024));
-                            }
+                            // When the budget is already spent, the query *is* the
+                            // answer: nothing is available. Keeping the vram/2 default
+                            // there claimed 12 GB free on a 24 GB card whose VRAM is
+                            // fully committed -- precisely the state Gate 5 exists to
+                            // catch -- so a 4K job was waved into the dual-process run
+                            // and left to run out of memory instead.
+                            info.avail_vram_mb = qinfo.Budget > qinfo.CurrentUsage
+                                                     ? (size_t)((qinfo.Budget - qinfo.CurrentUsage) / (1024 * 1024))
+                                                     : 0;
                         }
                         adapter3->Release();
                     }

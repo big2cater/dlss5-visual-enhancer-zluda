@@ -70,6 +70,11 @@ struct NVSDK_NGX_Handle {
 struct ID3D11Resource;
 struct ID3D12Resource;
 
+// Deliberately no virtual destructor, and this is not an oversight to fix: the vtable
+// order below is NVIDIA's, and a destructor would occupy a slot that its ABI does not
+// have -- every entry after it would point one slot too far. This mirrors an object
+// owned by nvngx.dll, is never deleted through (nothing here owns it), and adding the
+// destructor to satisfy a linter would break the only thing that matters about it.
 class NVSDK_NGX_Parameter {
 public:
     virtual void Set(const char *InName, unsigned long long InValue) = 0;

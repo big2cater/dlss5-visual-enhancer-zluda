@@ -111,7 +111,18 @@ struct State {
 
 State g;
 
+// Circular allocation in a 64-slot heap. Wrapping overwrites the oldest descriptors,
+// and that is only safe because every caller flushes and waits before it returns --
+// by the time the cursor comes round, the GPU is finished with the previous slot.
+// The contract was never written down anywhere, and a request larger than the heap
+// would wrap into itself, so both are stated here: the comment above, and the
+// 0xFFFFFFFF return below, which the callers turn into a failure.
 inline UINT allocate_view_slots(UINT count) {
+    if (count > State::kViewHeapCapacity) {
+        set_error("allocate_view_slots: %u slots requested, the heap holds %u",
+                  count, State::kViewHeapCapacity);
+        return 0xFFFFFFFFu;
+    }
     if (g.view_cursor + count > State::kViewHeapCapacity) {
         g.view_cursor = 0;
     }
@@ -352,6 +363,7 @@ bool to_shared(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src, ID3D12Resour
     }
 
     UINT slot = allocate_view_slots(2);
+    if (slot == 0xFFFFFFFFu) return false;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g.view_heap->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += (size_t)slot * g.view_stride;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -390,6 +402,7 @@ bool to_backbuffer(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src, ID3D12Re
     if (!pso) return false;
 
     UINT slot = allocate_view_slots(1);
+    if (slot == 0xFFFFFFFFu) return false;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g.view_heap->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += (size_t)slot * g.view_stride;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -436,6 +449,7 @@ bool raw_rgb48_to_shared(ID3D12GraphicsCommandList *cmd, ID3D12Resource *src_buf
     }
 
     UINT slot = allocate_view_slots(3);
+    if (slot == 0xFFFFFFFFu) return false;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g.view_heap->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += (size_t)slot * g.view_stride;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};

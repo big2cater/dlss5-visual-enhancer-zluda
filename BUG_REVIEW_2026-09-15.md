@@ -31,6 +31,12 @@
 
 **同日第四轮修复**（中低档精选，同一 v6 内）：M7（`--flow-only` 改为解析层字段，实测四位置参数下诊断路径生效、完整管线输出为 0 行）、M8（探测同时取 `avg_frame_rate`，优先使用；CFR 回归无变化）、L3（删掉主流程中未使用也未释放的 WIC 工厂与其 COM 初始化；`--dump-frames 30` 实测仍产出 30 张）、L29（复用守卫改为比较全部建期参数：style / render_preset / use_auto_mask / intensity / 各 tone 与 structure 强度）、M15（`upload_shared_colour_raw_rgb48` 补"上传范围须等于色彩纹理尺寸"的校验）。
 
+**同日第五轮修复**（低档收尾，同一 v6 内）：L1（`upscale4` 的 `qh-2`/`qw-2` 无符号回绕，加提前返回；该分支会被编译器消除，价值在于参数变为变量时仍安全）、L2（补 `Pipe&&` 重载，不再依赖 MSVC 把临时量绑给非 const 左值引用的扩展）、L31（描述符堆环回的"每帧必 flush"契约写进注释，越界请求返回失败）、S7（`Budget ≤ CurrentUsage` 时 avail 如实置 0，不再用 `vram_mb/2` 放行 4K 双进程）、S8（framebench 改 `wmain`、拒绝 `frames<=0`；`tests/processor_smoke.cpp` 同款转换）、S9（launchbench 检查 PTX 打开与每次 `cuLaunchKernel` 返回值）。实测：`frames=0` ⇒ exit 2；中文路径越过读取阶段；缺失 `.ptx` ⇒ "cannot open"、exit 1。
+
+> **复核者对 L32 的否决**：报告建议给 `NVSDK_NGX_Parameter` 补虚析构。**不采纳** —— 该结构体镜像 NVIDIA 的 vtable 顺序（文件顶部 [LAYOUT] 注释已写明"nothing here may be reordered"），加虚析构会插入一个槽位并使其后每个入口错位。已改为在类上方写明**为什么不能加**，这才是该条的正确处置。
+
+> **复核者更正自己的一处误判**：我曾称 S8/S9 引用的 `rv_framebench.cpp` / `rv_launchbench.cpp` "在本仓不存在、路径漂移" —— **错在我**：报告的路径是 `tools/framebench.cpp` / `tools/launchbench.cpp`，两个文件都在，是我的检索模式串错了前缀。报告该处无误。
+
 > **复核者补充勘误（第四轮）**：M15 的原表述"RAW SRV 要求源 buffer 带 `ALLOW_UNORDERED_ACCESS`"**不成立** —— 该要求针对 raw **UAV**；照此实现的检查让视频路径在第一帧整体失败（`upload_shared_colour_raw_rgb48: the source buffer needs ALLOW_UNORDERED_ACCESS…`），已撤回，仅保留尺寸校验。结论：注释义务那一半成立（该前置条件确实没人写明），但具体要求写错了。
 
 **同日第三轮修复**（"安排修"档，同一 v6 内）：M2（`State::wait()` 超时/Reset 失败后管线置死态快速失败；7 处 `Reset` 检查返回值）、M3（选卡收成 `core/gpu_detection.h` 的 `select_primary_gpu()`，`image_processor::start()` 优先采纳同一张卡并在采纳后不被更大卡顶掉；precompile 的 HIP device 0 经确认与之一致）、M4（`process_raw_rgb48` 补 pitch 下限守卫，0 仍按"未指定"处理）、M5（只有真正上传成功才绑定 motion 纹理，两处绑定都已改）、M6（GpuFlow 新增 `sync()`，仅 `WAIT_OBJECT_0` 算成功，超时落回 CPU 光流路径）、L12（子进程消失也刷新死线基准）、L13（`WaitForMultipleObjects` 失败详情改为同时写入 `straggler_detail`，不再被末尾计数覆盖）、L30（`frame_blit.cpp` 三处失败路径统一 `release_partial()`，不再漏放 vs/ps 与根签名）、L11 的一部分（`eval_index`、`full_copy_ready`、`image_has_signal` 已删；`resize_rgb48`、`Channel::clear`、`OutputFrame::blank`/`input_has_signal`、GpuFlow 的 `cb` 缓冲经核对同样无使用点，留待专门清理）。

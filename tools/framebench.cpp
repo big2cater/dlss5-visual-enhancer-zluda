@@ -16,12 +16,11 @@
 
 namespace {
 
-std::wstring widen(const char *narrow) {
-    wchar_t buffer[1024] = {};
-    MultiByteToWideChar(CP_UTF8, 0, narrow, -1, buffer, 1024);
-    return buffer;
-}
-
+// Nothing to convert here any more. This used MultiByteToWideChar(CP_UTF8) on the
+// bytes main() received, and on a CP936 machine those bytes are GBK for any path
+// containing Chinese -- decoding GBK as UTF-8 cannot produce a name that opens, and
+// the tool reported "[FAIL] input unreadable" as though the file were corrupt.
+// wmain hands over the real wide command line, the same way launchbench does.
 bool load(IWICImagingFactory *wic, const wchar_t *path, enhancer::Image &image) {
     IWICBitmapDecoder *decoder = nullptr;
     if (FAILED(wic->CreateDecoderFromFilename(path, nullptr, GENERIC_READ,
@@ -49,9 +48,17 @@ bool load(IWICImagingFactory *wic, const wchar_t *path, enhancer::Image &image) 
 
 } // namespace
 
-int main(int argc, char **argv) {
+int wmain(int argc, wchar_t **argv) {
     if (argc < 5) {
         printf("usage: framebench <input> <frames> <snippet> <driver> [runtime] [nvapi]\n");
+        return 2;
+    }
+    // A frame count of zero -- atoi("abc"), or a typo -- used to run no frames at all,
+    // print "steady-state avg 0.0 ms over 0 frames" and exit 0. That reads exactly
+    // like a successful measurement of an extremely fast build. Refuse it instead.
+    const int frames = _wtoi(argv[2]);
+    if (frames <= 0) {
+        printf("[FAIL] frames must be a positive integer (got \"%ls\")\n", argv[2]);
         return 2;
     }
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -62,17 +69,15 @@ int main(int argc, char **argv) {
         return 1;
     }
     enhancer::Image in;
-    if (!load(wic, widen(argv[1]).c_str(), in)) {
+    if (!load(wic, argv[1], in)) {
         printf("[FAIL] input unreadable\n");
         return 1;
     }
-    const int frames = atoi(argv[2]);
-
     enhancer::Paths paths;
-    paths.snippet = widen(argv[3]);
-    paths.cuda_driver = widen(argv[4]);
-    paths.ngx_runtime = argc > 5 ? widen(argv[5]) : L"nvngx.dll";
-    paths.nvapi = argc > 6 ? widen(argv[6]) : L"nvapi64.dll";
+    paths.snippet = argv[3];
+    paths.cuda_driver = argv[4];
+    paths.ngx_runtime = argc > 5 ? std::wstring(argv[5]) : std::wstring(L"nvngx.dll");
+    paths.nvapi = argc > 6 ? std::wstring(argv[6]) : std::wstring(L"nvapi64.dll");
 
     enhancer::Processor processor;
     std::string error;

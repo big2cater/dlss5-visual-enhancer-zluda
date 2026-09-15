@@ -19,11 +19,11 @@
 
 namespace {
 
-std::wstring widen(const char *narrow) {
-    wchar_t buffer[1024] = {};
-    MultiByteToWideChar(CP_UTF8, 0, narrow, -1, buffer, 1024);
-    return buffer;
-}
+// No narrow-to-wide conversion any more: this used MultiByteToWideChar(CP_UTF8) on the
+// bytes main() received, and on a CP936 machine those are GBK for any path containing
+// Chinese -- decoded as UTF-8 they cannot be opened, and the tool blamed the input file
+// ("[FAIL] the input image could not be read"). wmain supplies the real wide command
+// line, as launchbench already did.
 
 bool load(IWICImagingFactory *wic, const wchar_t *path, enhancer::Image &image) {
     IWICBitmapDecoder *decoder = nullptr;
@@ -86,7 +86,7 @@ bool save(IWICImagingFactory *wic, const wchar_t *path, const enhancer::Image &i
 
 } // namespace
 
-int main(int argc, char **argv) {
+int wmain(int argc, wchar_t **argv) {
     if (argc < 5) {
         printf("usage: processor_smoke <input> <output.png> <snippet> <driver> "
                "[runtime] [nvapi]\n");
@@ -101,17 +101,17 @@ int main(int argc, char **argv) {
     }
 
     enhancer::Image in;
-    if (!load(wic, widen(argv[1]).c_str(), in)) {
+    if (!load(wic, argv[1], in)) {
         printf("[FAIL] the input image could not be read\n");
         return 1;
     }
     printf("       input %ux%u\n", in.width, in.height);
 
     enhancer::Paths paths;
-    paths.snippet = widen(argv[3]);
-    paths.cuda_driver = widen(argv[4]);
-    paths.ngx_runtime = argc > 5 ? widen(argv[5]) : L"nvngx.dll";
-    paths.nvapi = argc > 6 ? widen(argv[6]) : L"nvapi64.dll";
+    paths.snippet = argv[3];
+    paths.cuda_driver = argv[4];
+    paths.ngx_runtime = argc > 5 ? std::wstring(argv[5]) : std::wstring(L"nvngx.dll");
+    paths.nvapi = argc > 6 ? std::wstring(argv[6]) : std::wstring(L"nvapi64.dll");
 
     enhancer::Processor processor;
     std::string error;
@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
     }
     printf("[ OK ] processed in %.0f ms\n", processor.last_ms());
 
-    if (!save(wic, widen(argv[2]).c_str(), out)) {
+    if (!save(wic, argv[2], out)) {
         printf("[FAIL] the result could not be written\n");
         return 1;
     }

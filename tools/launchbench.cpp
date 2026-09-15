@@ -49,6 +49,13 @@ int wmain(int argc, wchar_t **argv) {
     }
 
     std::ifstream file(argv[2], std::ios::binary);
+    if (!file) {
+        // Without this check a path that does not exist produced an empty buffer, the
+        // module load failed, and the tool reported "[FAIL] module load" -- pointing
+        // the reader at the kernel rather than at the path they mistyped.
+        wprintf(L"[FAIL] cannot open %ls\n", argv[2]);
+        return 1;
+    }
     std::vector<unsigned char> ptx((std::istreambuf_iterator<char>(file)),
                                    std::istreambuf_iterator<char>());
     ptx.push_back(0);
@@ -88,15 +95,27 @@ int wmain(int argc, wchar_t **argv) {
 
     const int warmup = 100;
     const int launches = 2000;
-    for (int i = 0; i < warmup; ++i)
-        cuLaunchKernel(kernel, 1, 1, 1, 8, 8, 1, 0, nullptr, kernel_params, nullptr);
+    int first_error = 0;
+    for (int i = 0; i < warmup; ++i) {
+        const int rc = cuLaunchKernel(kernel, 1, 1, 1, 8, 8, 1, 0, nullptr, kernel_params, nullptr);
+        if (rc != 0 && !first_error) first_error = rc;
+    }
     cuCtxSynchronize();
 
     auto t0 = Clock::now();
-    for (int i = 0; i < launches; ++i)
-        cuLaunchKernel(kernel, 1, 1, 1, 8, 8, 1, 0, nullptr, kernel_params, nullptr);
+    for (int i = 0; i < launches; ++i) {
+        const int rc = cuLaunchKernel(kernel, 1, 1, 1, 8, 8, 1, 0, nullptr, kernel_params, nullptr);
+        if (rc != 0 && !first_error) first_error = rc;
+    }
     const double launch_ms = ms_since(t0);
     cuCtxSynchronize();
+    // A refused launch still costs time, so a run where every launch failed printed a
+    // perfectly plausible "0.6 us per launch" -- a benchmark of the failure path,
+    // quoted into docs/perf_bottleneck_analysis_2026-09-12.md as a real number.
+    if (first_error) {
+        wprintf(L"[FAIL] cuLaunchKernel returned %d: this is not a launch timing\n", first_error);
+        return 1;
+    }
     wprintf(L"[ OK ] %d launches: %.1f ms total, %.1f us per launch\n", launches, launch_ms,
             launch_ms * 1000.0 / launches);
 

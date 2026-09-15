@@ -404,6 +404,16 @@ bool spawn(const std::wstring &command, Pipe &feed /*child stdin*/, Pipe &collec
     return spawn(command, &feed, &collect, out, redirect_stderr);
 }
 
+// The calls that pass Pipe{} for the feed -- a child that reads nothing -- were binding
+// a temporary to a non-const lvalue reference, which only compiles as an MSVC
+// extension. The behaviour is what those calls want: the throwaway Pipe holds the
+// child's end of a pipe nobody reads, and closing it when the call ends is correct.
+// Spelled out here so it does not depend on an extension.
+bool spawn(const std::wstring &command, Pipe &&feed /*child stdin*/, Pipe &collect /*child stdout*/,
+           ChildProcess &out, bool redirect_stderr = false) {
+    return spawn(command, &feed, &collect, out, redirect_stderr);
+}
+
 bool wait_exit(HANDLE process, DWORD timeout_ms, DWORD &code) {
     if (!process) { code = 1; return false; }
     DWORD wr = WaitForSingleObject(process, timeout_ms);
@@ -1607,6 +1617,12 @@ struct CpuFlow {
     // Upsample the 1/4-scale flow to full resolution, scaling vectors by 4.
     static void upscale4(const std::vector<short> &f, unsigned qw, unsigned qh,
                          unsigned W, unsigned H, std::vector<uint16_t> &out) {
+        // The clamps below are unsigned arithmetic: `qh - 2` at qh == 1 wraps to a
+        // value near 4 billion, which then indexes f through (size_t)iy * qw -- an
+        // out-of-bounds read, not a clamp. qh == 1 needs a model size of four pixels,
+        // so this is not reachable with a real model, but one branch turns "not
+        // reachable" from a bet into a fact.
+        if (qw < 2 || qh < 2 || W == 0 || H == 0) return;
         for (unsigned y = 0; y < H; ++y) {
             float fy = ((float)y + 0.5f) * (float)qh / (float)H - 0.5f;
             int iy = (int)floorf(fy); if (iy < 0) iy = 0; if (iy >= (int)qh - 1) iy = qh - 2;
